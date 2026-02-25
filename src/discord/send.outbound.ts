@@ -516,12 +516,12 @@ export async function sendVoiceMessageDiscord(
 
     // Send the voice message
     const result = await sendDiscordVoiceMessage(
-      rest,
       channelId,
       audioBuffer,
       metadata,
       opts.replyTo,
       request,
+      token,
       opts.silent,
     );
 
