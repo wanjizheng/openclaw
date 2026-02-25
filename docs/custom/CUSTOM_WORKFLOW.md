@@ -40,17 +40,3 @@ This will:
 
 If conflicts happen, resolve once and continue rebase.
 `rerere` is enabled, so repeated conflicts are auto-resolved in future updates.
-
-## Automatic upstream sync
-
-This repo also includes `.github/workflows/sync-upstream.yml`.
-
-- It runs daily and on manual trigger.
-- It fetches `openclaw/openclaw` (`upstream/main`).
-- It opens/updates a PR into `custom-main` instead of pushing directly.
-
-Why PR instead of direct push:
-- You can review upstream changes before taking them.
-- If there is a merge conflict, the workflow stops cleanly and does not rewrite history.
-
-After merging the sync PR, continue custom development on `custom-main` as usual.
