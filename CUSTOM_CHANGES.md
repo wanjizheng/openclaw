@@ -24,3 +24,15 @@ Each entry should explain:
   - `CUSTOM_CHANGES.md`
 - User-visible behavior:
   - You can now update upstream and reapply custom commits predictably.
+
+### Add automated upstream sync PR workflow
+- What changed:
+  - Added a scheduled GitHub Action to fetch `openclaw/openclaw` and create/update a sync PR into `custom-main`.
+  - Extended workflow documentation with auto-sync behavior and conflict expectations.
+- Why:
+  - Keep fork current automatically while preserving review control and custom commit history.
+- Files:
+  - `.github/workflows/sync-upstream.yml`
+  - `docs/custom/CUSTOM_WORKFLOW.md`
+- User-visible behavior:
+  - Upstream updates appear as PRs automatically; you merge when ready.
