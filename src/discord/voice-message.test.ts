@@ -1,146 +1,80 @@
-import type { ChildProcess, ExecFileOptions } from "node:child_process";
-import { promisify } from "node:util";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { RetryRunner } from "../infra/retry-policy.js";
+import { sendDiscordVoiceMessage } from "./voice-message.js";
 
-type ExecCallback = (
-  error: NodeJS.ErrnoException | null,
-  stdout: string | Buffer,
-  stderr: string | Buffer,
-) => void;
+const runWithoutRetry: RetryRunner = async <T>(fn: () => Promise<T>) => fn();
 
-type ExecCall = {
-  command: string;
-  args: string[];
-  options?: ExecFileOptions;
-};
-
-type MockExecResult = {
-  stdout?: string;
-  stderr?: string;
-  error?: NodeJS.ErrnoException;
-};
-
-const execCalls: ExecCall[] = [];
-const mockExecResults: MockExecResult[] = [];
-
-vi.mock("node:child_process", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:child_process")>();
-  const execFileImpl = (
-    file: string,
-    args?: readonly string[] | null,
-    optionsOrCallback?: ExecFileOptions | ExecCallback | null,
-    callbackMaybe?: ExecCallback,
-  ) => {
-    const normalizedArgs = Array.isArray(args) ? [...args] : [];
-    const callback =
-      typeof optionsOrCallback === "function" ? optionsOrCallback : (callbackMaybe ?? undefined);
-    const options =
-      typeof optionsOrCallback === "function" ? undefined : (optionsOrCallback ?? undefined);
-
-    execCalls.push({
-      command: file,
-      args: normalizedArgs,
-      options,
-    });
-
-    const next = mockExecResults.shift() ?? { stdout: "", stderr: "" };
-    queueMicrotask(() => {
-      callback?.(next.error ?? null, next.stdout ?? "", next.stderr ?? "");
-    });
-    return {} as ChildProcess;
-  };
-  const execFileWithCustomPromisify = execFileImpl as unknown as typeof actual.execFile & {
-    [promisify.custom]?: (
-      file: string,
-      args?: readonly string[] | null,
-      options?: ExecFileOptions | null,
-    ) => Promise<{ stdout: string | Buffer; stderr: string | Buffer }>;
-  };
-  execFileWithCustomPromisify[promisify.custom] = (
-    file: string,
-    args?: readonly string[] | null,
-    options?: ExecFileOptions | null,
-  ) =>
-    new Promise<{ stdout: string | Buffer; stderr: string | Buffer }>((resolve, reject) => {
-      execFileImpl(file, args, options, (error, stdout, stderr) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve({ stdout, stderr });
-      });
-    });
-
-  return {
-    ...actual,
-    execFile: execFileWithCustomPromisify,
-  };
-});
-
-vi.mock("../infra/tmp-openclaw-dir.js", () => ({
-  resolvePreferredOpenClawTmpDir: () => "/tmp",
-}));
-
-const { ensureOggOpus } = await import("./voice-message.js");
-
-describe("ensureOggOpus", () => {
-  beforeEach(() => {
-    execCalls.length = 0;
-    mockExecResults.length = 0;
-  });
-
+describe("sendDiscordVoiceMessage", () => {
   afterEach(() => {
-    execCalls.length = 0;
-    mockExecResults.length = 0;
+    vi.unstubAllGlobals();
   });
 
-  it("rejects URL/protocol input paths", async () => {
-    await expect(ensureOggOpus("https://example.com/audio.ogg")).rejects.toThrow(
-      /local file path/i,
+  it("sends native voice message using multipart form payload", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      json: async () => ({ id: "m1", channel_id: "c1" }),
+      text: async () => "",
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await sendDiscordVoiceMessage(
+      "123",
+      Buffer.from([1, 2, 3]),
+      { durationSecs: 3.2, waveform: "AQID" },
+      undefined,
+      runWithoutRetry,
+      "test-token",
     );
-    expect(execCalls).toHaveLength(0);
+
+    expect(result).toEqual({ id: "m1", channel_id: "c1" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://discord.com/api/v10/channels/123/messages");
+    expect(init.method).toBe("POST");
+    expect(init.headers).toEqual({ Authorization: "Bot test-token" });
+    expect(init.body).toBeInstanceOf(FormData);
+
+    const form = init.body as FormData;
+    const payloadRaw = form.get("payload_json");
+    expect(typeof payloadRaw).toBe("string");
+    expect(JSON.parse(payloadRaw as string)).toEqual({
+      flags: 8192,
+      attachments: [
+        {
+          id: "0",
+          filename: "voice-message.ogg",
+          duration_secs: 3.2,
+          waveform: "AQID",
+        },
+      ],
+    });
+    expect(form.get("files[0]")).toBeTruthy();
   });
 
-  it("keeps .ogg only when codec is opus and sample rate is 48kHz", async () => {
-    mockExecResults.push({ stdout: "opus,48000\n" });
+  it("includes discord response body in send errors", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: false,
+      status: 400,
+      statusText: "Bad Request",
+      json: async () => ({}),
+      text: async () => "{\"message\":\"bad request\"}",
+    }));
+    vi.stubGlobal("fetch", fetchMock);
 
-    const result = await ensureOggOpus("/tmp/input.ogg");
-
-    expect(result).toEqual({ path: "/tmp/input.ogg", cleanup: false });
-    expect(execCalls).toHaveLength(1);
-    expect(execCalls[0].command).toBe("ffprobe");
-    expect(execCalls[0].args).toContain("stream=codec_name,sample_rate");
-    expect(execCalls[0].options?.timeout).toBe(10_000);
-  });
-
-  it("re-encodes .ogg opus when sample rate is not 48kHz", async () => {
-    mockExecResults.push({ stdout: "opus,24000\n" });
-    mockExecResults.push({ stdout: "" });
-
-    const result = await ensureOggOpus("/tmp/input.ogg");
-    const ffmpegCall = execCalls.find((call) => call.command === "ffmpeg");
-
-    expect(result.cleanup).toBe(true);
-    expect(result.path).toMatch(/^\/tmp\/voice-.*\.ogg$/);
-    expect(ffmpegCall).toBeDefined();
-    expect(ffmpegCall?.args).toContain("-t");
-    expect(ffmpegCall?.args).toContain("1200");
-    expect(ffmpegCall?.args).toContain("-ar");
-    expect(ffmpegCall?.args).toContain("48000");
-    expect(ffmpegCall?.options?.timeout).toBe(45_000);
-  });
-
-  it("re-encodes non-ogg input with bounded ffmpeg execution", async () => {
-    mockExecResults.push({ stdout: "" });
-
-    const result = await ensureOggOpus("/tmp/input.mp3");
-    const ffprobeCalls = execCalls.filter((call) => call.command === "ffprobe");
-    const ffmpegCalls = execCalls.filter((call) => call.command === "ffmpeg");
-
-    expect(result.cleanup).toBe(true);
-    expect(ffprobeCalls).toHaveLength(0);
-    expect(ffmpegCalls).toHaveLength(1);
-    expect(ffmpegCalls[0].options?.timeout).toBe(45_000);
-    expect(ffmpegCalls[0].args).toEqual(expect.arrayContaining(["-vn", "-sn", "-dn"]));
+    await expect(
+      sendDiscordVoiceMessage(
+        "123",
+        Buffer.from([1, 2, 3]),
+        { durationSecs: 1, waveform: "AQID" },
+        "456",
+        runWithoutRetry,
+        "test-token",
+        true,
+      ),
+    ).rejects.toThrow(
+      "Failed to send voice message: 400 Bad Request - {\"message\":\"bad request\"}",
+    );
   });
 });
