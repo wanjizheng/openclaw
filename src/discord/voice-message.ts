@@ -15,7 +15,6 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { RequestClient } from "@buape/carbon";
 import type { RetryRunner } from "../infra/retry-policy.js";
 import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
 
@@ -211,72 +210,22 @@ export async function getVoiceMessageMetadata(filePath: string): Promise<VoiceMe
   return { durationSecs, waveform };
 }
 
-type UploadUrlResponse = {
-  attachments: Array<{
-    id: number;
-    upload_url: string;
-    upload_filename: string;
-  }>;
-};
-
 /**
  * Send a voice message to Discord
  *
- * This follows Discord's voice message protocol:
- * 1. Request upload URL from Discord
- * 2. Upload the OGG file to the provided URL
- * 3. Send the message with flag 8192 and attachment metadata
+ * Sends as multipart/form-data directly to channel messages endpoint.
+ * This avoids the attachments upload-URL flow, which can fail for bot tokens.
  */
 export async function sendDiscordVoiceMessage(
-  rest: RequestClient,
   channelId: string,
   audioBuffer: Buffer,
   metadata: VoiceMessageMetadata,
   replyTo: string | undefined,
   request: RetryRunner,
+  token: string,
   silent?: boolean,
 ): Promise<{ id: string; channel_id: string }> {
   const filename = "voice-message.ogg";
-  const fileSize = audioBuffer.byteLength;
-
-  // Step 1: Request upload URL from Discord
-  const uploadUrlResponse = await request(
-    () =>
-      rest.post(`/channels/${channelId}/attachments`, {
-        body: {
-          files: [
-            {
-              filename,
-              file_size: fileSize,
-              id: "0",
-            },
-          ],
-        },
-      }) as Promise<UploadUrlResponse>,
-    "voice-upload-url",
-  );
-
-  if (!uploadUrlResponse.attachments?.[0]) {
-    throw new Error("Failed to get upload URL for voice message");
-  }
-
-  const { upload_url, upload_filename } = uploadUrlResponse.attachments[0];
-
-  // Step 2: Upload the file to Discord's CDN
-  // Note: Not wrapped in retry runner - upload URLs are single-use and CDN behavior differs
-  const uploadResponse = await fetch(upload_url, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "audio/ogg",
-    },
-    body: new Uint8Array(audioBuffer),
-  });
-
-  if (!uploadResponse.ok) {
-    throw new Error(`Failed to upload voice message: ${uploadResponse.status}`);
-  }
-
-  // Step 3: Send the message with voice message flag and metadata
   const flags = silent
     ? DISCORD_VOICE_MESSAGE_FLAG | SUPPRESS_NOTIFICATIONS_FLAG
     : DISCORD_VOICE_MESSAGE_FLAG;
@@ -285,7 +234,6 @@ export async function sendDiscordVoiceMessage(
     attachments: Array<{
       id: string;
       filename: string;
-      uploaded_filename: string;
       duration_secs: number;
       waveform: string;
     }>;
@@ -296,7 +244,6 @@ export async function sendDiscordVoiceMessage(
       {
         id: "0",
         filename,
-        uploaded_filename: upload_filename,
         duration_secs: metadata.durationSecs,
         waveform: metadata.waveform,
       },
@@ -311,13 +258,41 @@ export async function sendDiscordVoiceMessage(
     };
   }
 
-  const res = (await request(
-    () =>
-      rest.post(`/channels/${channelId}/messages`, {
-        body: messagePayload,
-      }) as Promise<{ id: string; channel_id: string }>,
-    "voice-message",
-  )) as { id: string; channel_id: string };
+  const form = new FormData();
+  form.append("payload_json", JSON.stringify(messagePayload));
+  form.append("files[0]", new Blob([audioBuffer], { type: "audio/ogg" }), filename);
+
+  const res = await request(async () => {
+    const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bot ${token}`,
+      },
+      body: form,
+    });
+
+    if (!response.ok) {
+      let detail = "";
+      try {
+        detail = await response.text();
+      } catch {
+        detail = "";
+      }
+      const suffix = detail ? ` - ${detail.slice(0, 1000)}` : "";
+      throw new Error(
+        `Failed to send voice message: ${response.status} ${response.statusText}${suffix}`,
+      );
+    }
+
+    const body = (await response.json()) as { id?: unknown; channel_id?: unknown };
+    if (!body?.id || !body?.channel_id) {
+      throw new Error("Voice message send succeeded but response payload was missing id/channel_id");
+    }
+    return {
+      id: String(body.id),
+      channel_id: String(body.channel_id),
+    };
+  }, "voice-message-multipart");
 
   return res;
 }
