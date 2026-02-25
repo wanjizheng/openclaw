@@ -10,20 +10,19 @@
  * - No other content (text, embeds, etc.)
  */
 
+import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { RateLimitError, type RequestClient } from "@buape/carbon";
+import { promisify } from "node:util";
 import type { RetryRunner } from "../infra/retry-policy.js";
 import { resolvePreferredOpenClawTmpDir } from "../infra/tmp-openclaw-dir.js";
-import { parseFfprobeCodecAndSampleRate, runFfmpeg, runFfprobe } from "../media/ffmpeg-exec.js";
-import { MEDIA_FFMPEG_MAX_AUDIO_DURATION_SECS } from "../media/ffmpeg-limits.js";
-import { unlinkIfExists } from "../media/temp-files.js";
+
+const execFileAsync = promisify(execFile);
 
 const DISCORD_VOICE_MESSAGE_FLAG = 1 << 13;
 const SUPPRESS_NOTIFICATIONS_FLAG = 1 << 12;
 const WAVEFORM_SAMPLES = 256;
-const DISCORD_OPUS_SAMPLE_RATE_HZ = 48_000;
 
 export type VoiceMessageMetadata = {
   durationSecs: number;
@@ -35,7 +34,7 @@ export type VoiceMessageMetadata = {
  */
 export async function getAudioDuration(filePath: string): Promise<number> {
   try {
-    const stdout = await runFfprobe([
+    const { stdout } = await execFileAsync("ffprobe", [
       "-v",
       "error",
       "-show_entries",
@@ -78,15 +77,10 @@ async function generateWaveformFromPcm(filePath: string): Promise<string> {
 
   try {
     // Convert to raw 16-bit signed PCM, mono, 8kHz
-    await runFfmpeg([
+    await execFileAsync("ffmpeg", [
       "-y",
       "-i",
       filePath,
-      "-vn",
-      "-sn",
-      "-dn",
-      "-t",
-      String(MEDIA_FFMPEG_MAX_AUDIO_DURATION_SECS),
       "-f",
       "s16le",
       "-acodec",
@@ -126,7 +120,12 @@ async function generateWaveformFromPcm(filePath: string): Promise<string> {
 
     return Buffer.from(waveform).toString("base64");
   } finally {
-    await unlinkIfExists(tempPcm);
+    // Clean up temp file
+    try {
+      await fs.unlink(tempPcm);
+    } catch {
+      // Ignore cleanup errors
+    }
   }
 }
 
@@ -160,21 +159,20 @@ export async function ensureOggOpus(filePath: string): Promise<{ path: string; c
 
   // Check if already OGG
   if (ext === ".ogg") {
-    // Fast-path only when the file is Opus at Discord's expected 48kHz.
+    // Verify it's Opus codec, not Vorbis (Vorbis won't play on mobile)
     try {
-      const stdout = await runFfprobe([
+      const { stdout } = await execFileAsync("ffprobe", [
         "-v",
         "error",
         "-select_streams",
         "a:0",
         "-show_entries",
-        "stream=codec_name,sample_rate",
+        "stream=codec_name",
         "-of",
         "csv=p=0",
         filePath,
       ]);
-      const { codec, sampleRateHz } = parseFfprobeCodecAndSampleRate(stdout);
-      if (codec === "opus" && sampleRateHz === DISCORD_OPUS_SAMPLE_RATE_HZ) {
+      if (stdout.trim().toLowerCase() === "opus") {
         return { path: filePath, cleanup: false };
       }
     } catch {
@@ -183,22 +181,13 @@ export async function ensureOggOpus(filePath: string): Promise<{ path: string; c
   }
 
   // Convert to OGG/Opus
-  // Always resample to 48kHz to ensure Discord voice messages play at correct speed
-  // (Discord expects 48kHz; lower sample rates like 24kHz from some TTS providers cause 0.5x playback)
   const tempDir = resolvePreferredOpenClawTmpDir();
   const outputPath = path.join(tempDir, `voice-${crypto.randomUUID()}.ogg`);
 
-  await runFfmpeg([
+  await execFileAsync("ffmpeg", [
     "-y",
     "-i",
     filePath,
-    "-vn",
-    "-sn",
-    "-dn",
-    "-t",
-    String(MEDIA_FFMPEG_MAX_AUDIO_DURATION_SECS),
-    "-ar",
-    String(DISCORD_OPUS_SAMPLE_RATE_HZ),
     "-c:a",
     "libopus",
     "-b:a",
@@ -221,103 +210,22 @@ export async function getVoiceMessageMetadata(filePath: string): Promise<VoiceMe
   return { durationSecs, waveform };
 }
 
-type UploadUrlResponse = {
-  attachments: Array<{
-    id: number;
-    upload_url: string;
-    upload_filename: string;
-  }>;
-};
-
 /**
  * Send a voice message to Discord
  *
- * This follows Discord's voice message protocol:
- * 1. Request upload URL from Discord
- * 2. Upload the OGG file to the provided URL
- * 3. Send the message with flag 8192 and attachment metadata
+ * Sends as multipart/form-data directly to channel messages endpoint.
+ * This avoids the attachments upload-URL flow, which can fail for bot tokens.
  */
 export async function sendDiscordVoiceMessage(
-  rest: RequestClient,
   channelId: string,
   audioBuffer: Buffer,
   metadata: VoiceMessageMetadata,
   replyTo: string | undefined,
   request: RetryRunner,
+  token: string,
   silent?: boolean,
-  token?: string,
 ): Promise<{ id: string; channel_id: string }> {
   const filename = "voice-message.ogg";
-  const fileSize = audioBuffer.byteLength;
-
-  // Step 1: Request upload URL from Discord
-  // Must use fetch() directly instead of rest.post() because @buape/carbon's
-  // RequestClient auto-converts requests to multipart/form-data when the body
-  // contains a "files" key. Discord's /attachments endpoint expects JSON, so
-  // the auto-conversion causes HTTP 400 "Expected Content-Type application/json".
-  const botToken = token;
-  if (!botToken) {
-    throw new Error("Discord bot token is required for voice message upload");
-  }
-  const uploadUrlResponse = await request(async () => {
-    const url = `${rest.options?.baseUrl ?? "https://discord.com/api"}/channels/${channelId}/attachments`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bot ${botToken}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        files: [{ filename, file_size: fileSize, id: "0" }],
-      }),
-    });
-    if (!res.ok) {
-      if (res.status === 429) {
-        const retryData = (await res.json().catch(() => ({}))) as {
-          message?: string;
-          retry_after?: number;
-          global?: boolean;
-        };
-        throw new RateLimitError(res, {
-          message: retryData.message ?? "You are being rate limited.",
-          retry_after: retryData.retry_after ?? 1,
-          global: retryData.global ?? false,
-        });
-      }
-      const errorBody = (await res.json().catch(() => null)) as {
-        code?: number;
-        message?: string;
-      } | null;
-      const err = new Error(`Upload URL request failed: ${res.status} ${errorBody?.message ?? ""}`);
-      if (errorBody?.code !== undefined) {
-        (err as Error & { code: number }).code = errorBody.code;
-      }
-      throw err;
-    }
-    return (await res.json()) as UploadUrlResponse;
-  }, "voice-upload-url");
-
-  if (!uploadUrlResponse.attachments?.[0]) {
-    throw new Error("Failed to get upload URL for voice message");
-  }
-
-  const { upload_url, upload_filename } = uploadUrlResponse.attachments[0];
-
-  // Step 2: Upload the file to Discord's CDN
-  // Note: Not wrapped in retry runner - upload URLs are single-use and CDN behavior differs
-  const uploadResponse = await fetch(upload_url, {
-    method: "PUT",
-    headers: {
-      "Content-Type": "audio/ogg",
-    },
-    body: new Uint8Array(audioBuffer),
-  });
-
-  if (!uploadResponse.ok) {
-    throw new Error(`Failed to upload voice message: ${uploadResponse.status}`);
-  }
-
-  // Step 3: Send the message with voice message flag and metadata
   const flags = silent
     ? DISCORD_VOICE_MESSAGE_FLAG | SUPPRESS_NOTIFICATIONS_FLAG
     : DISCORD_VOICE_MESSAGE_FLAG;
@@ -326,7 +234,6 @@ export async function sendDiscordVoiceMessage(
     attachments: Array<{
       id: string;
       filename: string;
-      uploaded_filename: string;
       duration_secs: number;
       waveform: string;
     }>;
@@ -337,7 +244,6 @@ export async function sendDiscordVoiceMessage(
       {
         id: "0",
         filename,
-        uploaded_filename: upload_filename,
         duration_secs: metadata.durationSecs,
         waveform: metadata.waveform,
       },
@@ -352,13 +258,41 @@ export async function sendDiscordVoiceMessage(
     };
   }
 
-  const res = (await request(
-    () =>
-      rest.post(`/channels/${channelId}/messages`, {
-        body: messagePayload,
-      }) as Promise<{ id: string; channel_id: string }>,
-    "voice-message",
-  )) as { id: string; channel_id: string };
+  const form = new FormData();
+  form.append("payload_json", JSON.stringify(messagePayload));
+  form.append("files[0]", new Blob([audioBuffer], { type: "audio/ogg" }), filename);
+
+  const res = await request(async () => {
+    const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bot ${token}`,
+      },
+      body: form,
+    });
+
+    if (!response.ok) {
+      let detail = "";
+      try {
+        detail = await response.text();
+      } catch {
+        detail = "";
+      }
+      const suffix = detail ? ` - ${detail.slice(0, 1000)}` : "";
+      throw new Error(
+        `Failed to send voice message: ${response.status} ${response.statusText}${suffix}`,
+      );
+    }
+
+    const body = (await response.json()) as { id?: unknown; channel_id?: unknown };
+    if (!body?.id || !body?.channel_id) {
+      throw new Error("Voice message send succeeded but response payload was missing id/channel_id");
+    }
+    return {
+      id: String(body.id),
+      channel_id: String(body.channel_id),
+    };
+  }, "voice-message-multipart");
 
   return res;
 }
