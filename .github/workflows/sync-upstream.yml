@@ -1,0 +1,64 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout custom-main
+        uses: actions/checkout@v4
+        with:
+          ref: custom-main
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/openclaw/openclaw.git
+          git fetch upstream main
+
+      - name: Merge upstream/main into sync branch
+        id: merge
+        run: |
+          BRANCH="sync/upstream-main"
+          git checkout -B "$BRANCH" custom-main
+          if git merge --no-edit upstream/main; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort || true
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create pull request
+        if: steps.merge.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(sync): merge upstream/main into custom-main"
+          branch: sync/upstream-main
+          base: custom-main
+          title: "chore(sync): merge upstream/main into custom-main"
+          body: |
+            Automated upstream sync PR.
+
+            - Source: `upstream/main` (`openclaw/openclaw`)
+            - Target: `custom-main`
+            - Merge strategy: merge commit
+
+            Merge this PR, then run your normal tests before deploy.
+          labels: |
+            dependencies
+
