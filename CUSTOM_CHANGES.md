@@ -2,6 +2,7 @@
 
 Track every custom behavior you add.
 Each entry should explain:
+
 - What changed
 - Why it was needed
 - Which files were touched
@@ -10,6 +11,7 @@ Each entry should explain:
 ## 2026-02-25
 
 ### Bootstrap: custom-fork maintenance workflow
+
 - What changed:
   - Added persistent custom workflow docs and scripts.
   - Created `custom-main` branch on top of upstream.
@@ -26,6 +28,7 @@ Each entry should explain:
   - You can now update upstream and reapply custom commits predictably.
 
 ### Add automated upstream sync PR workflow
+
 - What changed:
   - Added a scheduled GitHub Action to fetch `openclaw/openclaw` and create/update a sync PR into `custom-main`.
   - Extended workflow documentation with auto-sync behavior and conflict expectations.
@@ -36,3 +39,37 @@ Each entry should explain:
   - `docs/custom/CUSTOM_WORKFLOW.md`
 - User-visible behavior:
   - Upstream updates appear as PRs automatically; you merge when ready.
+
+## 2026-02-26
+
+### Fix: strip DeepSeek `<think>` blocks from user-facing replies
+
+- What changed:
+  - Added `deepseek` to `isReasoningTagProvider()` so any provider whose id
+    contains `"deepseek"` is treated as a tag-based reasoning provider.
+- Why:
+  - DeepSeek V3 (`deepseek-chat`) sometimes wraps its internal chain-of-thought
+    in `<think>…</think>` tags inside the plain-text content stream (it does NOT
+    use the native `reasoning_content` field like the Reasoner model does).
+  - Without this flag, `stripBlockTags` never ran for DeepSeek providers, so the
+    raw `<think>` monologue leaked into Discord/WhatsApp replies — very jarring
+    in personal/roleplay conversations.
+  - `deepseek-reasoner` is unaffected in practice (its thinking lives in
+    `reasoning_content`, never in the text stream), but flagging the whole
+    `deepseek` namespace is safe and future-proof.
+- Files:
+  - `src/utils/provider-utils.ts` — add `deepseek` branch in
+    `isReasoningTagProvider()`
+- When merging from upstream:
+  - Open `src/utils/provider-utils.ts`, find `isReasoningTagProvider`.
+  - After the `minimax` block (or wherever the last `return true` block is),
+    add:
+    ```ts
+    // DeepSeek chat (V3) may emit <think>...</think> blocks in its text stream.
+    if (normalized.includes("deepseek")) {
+      return true;
+    }
+    ```
+- User-visible behavior:
+  - `<think>…</think>` thinking blocks from DeepSeek models are silently
+    stripped; users only see the final reply text.
