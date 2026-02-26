@@ -260,7 +260,9 @@ export async function sendDiscordVoiceMessage(
 
   const form = new FormData();
   form.append("payload_json", JSON.stringify(messagePayload));
-  form.append("files[0]", new Blob([audioBuffer], { type: "audio/ogg" }), filename);
+  const audioArrayBuffer = new ArrayBuffer(audioBuffer.byteLength);
+  new Uint8Array(audioArrayBuffer).set(audioBuffer);
+  form.append("files[0]", new Blob([audioArrayBuffer], { type: "audio/ogg" }), filename);
 
   const res = await request(async () => {
     const response = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
@@ -286,11 +288,21 @@ export async function sendDiscordVoiceMessage(
 
     const body = (await response.json()) as { id?: unknown; channel_id?: unknown };
     if (!body?.id || !body?.channel_id) {
-      throw new Error("Voice message send succeeded but response payload was missing id/channel_id");
+      throw new Error(
+        "Voice message send succeeded but response payload was missing id/channel_id",
+      );
+    }
+    const responseId = body.id;
+    const responseChannelId = body.channel_id;
+    if (
+      (typeof responseId !== "string" && typeof responseId !== "number") ||
+      (typeof responseChannelId !== "string" && typeof responseChannelId !== "number")
+    ) {
+      throw new Error("Voice message send succeeded but response id/channel_id had invalid types");
     }
     return {
-      id: String(body.id),
-      channel_id: String(body.channel_id),
+      id: `${responseId}`,
+      channel_id: `${responseChannelId}`,
     };
   }, "voice-message-multipart");
 
