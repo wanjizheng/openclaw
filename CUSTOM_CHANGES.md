@@ -73,3 +73,45 @@ Each entry should explain:
 - User-visible behavior:
   - `<think>…</think>` thinking blocks from DeepSeek models are silently
     stripped; users only see the final reply text.
+
+### Follow-up: Discord voice multipart Blob type-compat fix
+
+- What changed:
+  - Updated Discord voice upload payload construction in
+    `sendDiscordVoiceMessage()` to avoid passing Node `Buffer` directly into
+    `Blob`.
+  - Replaced `new Blob([audioBuffer])` with explicit `ArrayBuffer` copy:
+    ```ts
+    const audioArrayBuffer = new ArrayBuffer(audioBuffer.byteLength);
+    new Uint8Array(audioArrayBuffer).set(audioBuffer);
+    form.append("files[0]", new Blob([audioArrayBuffer], { type: "audio/ogg" }), filename);
+    ```
+- Why:
+  - After upstream type updates, `Buffer`/`Uint8Array<ArrayBufferLike>` can fail
+    TypeScript checks for `BlobPart` in `build:plugin-sdk:dts`.
+  - This keeps Discord voice multipart upload behavior unchanged while restoring
+    build compatibility.
+- Files:
+  - `src/discord/voice-message.ts`
+- User-visible behavior:
+  - No behavior change in successful sends; prevents regression where build
+    fails and patched runtime cannot be produced/deployed.
+
+### Operator note: next-time direct patch flow
+
+- For future requests like “read and modify my latest fork changes directly”,
+  use this sequence:
+  1. Inspect fork delta:
+     - `git diff -- src/discord/voice-message.ts`
+  2. Build and verify:
+     - `pnpm vitest run src/discord/voice-message.test.ts`
+     - `pnpm build`
+  3. Deploy to active global runtime:
+     - Backup `/home/linuxbrew/.linuxbrew/lib/node_modules/openclaw`
+     - Sync `dist/`, `openclaw.mjs`, `package.json`
+  4. Restart services:
+     - `openclaw gateway restart`
+     - `openclaw node restart`
+  5. Validate bundle markers:
+     - search `send-*.js` for `audioArrayBuffer`, `files[0]`, and
+       `/channels/${channelId}/messages`.
