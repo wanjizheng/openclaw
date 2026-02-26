@@ -31,5 +31,10 @@ export function isReasoningTagProvider(provider: string | undefined | null): boo
     return true;
   }
 
+  // DeepSeek chat (V3) may emit <think>...</think> blocks in its text stream.
+  if (normalized.includes("deepseek")) {
+    return true;
+  }
+
   return false;
 }
