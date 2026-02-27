@@ -114,6 +114,44 @@ auto_commit_and_push_if_dirty() {
   fi
 }
 
+cherry_pick_is_empty_after_resolution() {
+  git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1 \
+    && [[ -z "$(git diff --name-only --diff-filter=U)" ]] \
+    && git diff --quiet \
+    && git diff --cached --quiet
+}
+
+continue_cherry_pick_with_fallback() {
+  local commit="$1"
+
+  if git cherry-pick --continue >&2; then
+    return 0
+  fi
+
+  if cherry_pick_is_empty_after_resolution; then
+    log "[warn] $commit becomes empty after auto-resolve; skipping"
+    git cherry-pick --skip >&2
+    return 0
+  fi
+
+  if [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
+    return 1
+  fi
+
+  log "[warn] cherry-pick --continue failed on $commit; retrying with hooks disabled"
+  if HUSKY=0 LEFTHOOK=0 git -c core.hooksPath=/dev/null cherry-pick --continue >&2; then
+    return 0
+  fi
+
+  if cherry_pick_is_empty_after_resolution; then
+    log "[warn] $commit already empty after conflict resolution; skipping"
+    git cherry-pick --skip >&2
+    return 0
+  fi
+
+  return 1
+}
+
 log "[step] parse custom commits from CUSTOM_CHANGES.md"
 if [[ -x "./tools/custom/extract-commits-from-log.sh" ]]; then
   mapfile -t COMMITS < <(./tools/custom/extract-commits-from-log.sh)
@@ -165,23 +203,12 @@ for commit in "${COMMITS[@]}"; do
           git checkout --theirs -- "$conflicted_file" >&2
           git add "$conflicted_file" >&2
         done </tmp/openclaw-conflict-files.txt
-        if ! git cherry-pick --continue >&2; then
-          if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1 \
-            && [[ -z "$(git diff --name-only --diff-filter=U)" ]] \
-            && git diff --quiet \
-            && git diff --cached --quiet; then
-            log "[warn] $commit becomes empty after auto-resolve; skipping"
-            git cherry-pick --skip >&2
-          else
-            echo "[error] auto-resolve failed while continuing cherry-pick for $commit" >&2
-            exit 4
-          fi
+        if ! continue_cherry_pick_with_fallback "$commit"; then
+          echo "[error] auto-resolve failed while continuing cherry-pick for $commit" >&2
+          exit 4
         fi
       else
-        if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1 \
-          && [[ -z "$(git diff --name-only --diff-filter=U)" ]] \
-          && git diff --quiet \
-          && git diff --cached --quiet; then
+        if cherry_pick_is_empty_after_resolution; then
           log "[warn] $commit already empty after conflict resolution; skipping"
           git cherry-pick --skip >&2
         else
