@@ -8,8 +8,6 @@ JSON_MODE="false"
 PUSH_BRANCH="true"
 SKIP_INSTALL="false"
 CONFLICT_STRATEGY="prefer-custom"
-STASHED="false"
-STASH_REF=""
 
 log() {
   echo "$*" >&2
@@ -77,18 +75,44 @@ if [[ "$CONFLICT_STRATEGY" != "prefer-custom" && "$CONFLICT_STRATEGY" != "stop" 
   exit 1
 fi
 
-restore_stash() {
-  if [[ "$STASHED" == "true" ]]; then
-    git checkout custom-main >/dev/null 2>&1 || true
-    if [[ -n "$STASH_REF" ]]; then
-      git stash pop "$STASH_REF" >/dev/null 2>&1 || true
-    else
-      git stash pop >/dev/null 2>&1 || true
+auto_commit_and_push_if_dirty() {
+  if [[ -z "$(git status --porcelain)" ]]; then
+    return 0
+  fi
+
+  local current_branch
+  current_branch="$(git rev-parse --abbrev-ref HEAD)"
+  if [[ "$current_branch" == "HEAD" ]]; then
+    echo "[error] dirty worktree on detached HEAD; cannot auto-commit safely" >&2
+    exit 6
+  fi
+
+  log "[step] dirty worktree detected; auto-commit and push before integration"
+  git add -A >&2
+
+  if [[ -z "$(git diff --cached --name-only)" ]]; then
+    log "[warn] dirty worktree had no stageable changes; continuing"
+    return 0
+  fi
+
+  git commit -m "chore(auto-update): snapshot fork changes before release integrate ($(date -u +%Y-%m-%dT%H:%M:%SZ))" >&2
+
+  if git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+    local upstream_ref remote_name branch_name
+    upstream_ref="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')"
+    remote_name="${upstream_ref%%/*}"
+    branch_name="${upstream_ref#*/}"
+
+    if ! git push "$remote_name" "$branch_name" >&2; then
+      log "[warn] push rejected for ${remote_name}/${branch_name}; trying pull --rebase then push"
+      git pull --rebase "$remote_name" "$branch_name" >&2
+      git push "$remote_name" "$branch_name" >&2
     fi
+  else
+    log "[warn] no upstream set on ${current_branch}; pushing to origin/${current_branch}"
+    git push -u origin "$current_branch" >&2
   fi
 }
-
-trap restore_stash EXIT
 
 log "[step] parse custom commits from CUSTOM_CHANGES.md"
 if [[ -x "./tools/custom/extract-commits-from-log.sh" ]]; then
@@ -107,14 +131,7 @@ if (( ${#COMMITS[@]} == 0 )) || [[ -z "${COMMITS[0]}" ]]; then
   exit 5
 fi
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  log "[warn] dirty worktree detected, stashing local changes temporarily"
-  stash_out="$(git stash push -u -m "auto-update-temp-$(date +%s)")"
-  if [[ "$stash_out" != "No local changes to save"* ]]; then
-    STASHED="true"
-    STASH_REF="stash@{0}"
-  fi
-fi
+auto_commit_and_push_if_dirty
 
 log "[step] sync custom-main with upstream/main"
 ./tools/custom/update-upstream.sh >/tmp/openclaw-update-upstream.log
@@ -149,12 +166,28 @@ for commit in "${COMMITS[@]}"; do
           git add "$conflicted_file" >&2
         done </tmp/openclaw-conflict-files.txt
         if ! git cherry-pick --continue >&2; then
-          echo "[error] auto-resolve failed while continuing cherry-pick for $commit" >&2
-          exit 4
+          if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1 \
+            && [[ -z "$(git diff --name-only --diff-filter=U)" ]] \
+            && git diff --quiet \
+            && git diff --cached --quiet; then
+            log "[warn] $commit becomes empty after auto-resolve; skipping"
+            git cherry-pick --skip >&2
+          else
+            echo "[error] auto-resolve failed while continuing cherry-pick for $commit" >&2
+            exit 4
+          fi
         fi
       else
-        echo "[error] conflict detected but no unmerged files listed" >&2
-        exit 4
+        if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null 2>&1 \
+          && [[ -z "$(git diff --name-only --diff-filter=U)" ]] \
+          && git diff --quiet \
+          && git diff --cached --quiet; then
+          log "[warn] $commit already empty after conflict resolution; skipping"
+          git cherry-pick --skip >&2
+        else
+          echo "[error] conflict detected but no unmerged files listed" >&2
+          exit 4
+        fi
       fi
     else
       echo "[error] cherry-pick conflict on $commit" >&2
@@ -188,6 +221,3 @@ else
   log "[ok] release integration complete"
   log "[info] tag=$LATEST_TAG branch=$TARGET_BRANCH head=$HEAD_SHA"
 fi
-
-restore_stash
-trap - EXIT
