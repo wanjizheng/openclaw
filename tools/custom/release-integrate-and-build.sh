@@ -239,6 +239,24 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   [[ -d "$DEPLOY_TARGET/skills" ]]     && rsync -a --delete skills/ "$DEPLOY_TARGET/skills/"
   log "artifacts synced"
 
+  # ── Normalize systemd unit metadata (avoid hardcoded version strings) ──
+  UNIT_FILE="$HOME/.config/systemd/user/$SERVICE_NAME"
+  if [[ -f "$UNIT_FILE" ]]; then
+    UNIT_CHANGED=0
+    if grep -qE '^Description=OpenClaw Gateway \(v[^)]*\)$' "$UNIT_FILE"; then
+      sed -i -E 's/^Description=OpenClaw Gateway \(v[^)]*\)$/Description=OpenClaw Gateway/' "$UNIT_FILE"
+      UNIT_CHANGED=1
+    fi
+    if grep -q '^Environment=OPENCLAW_SERVICE_VERSION=' "$UNIT_FILE"; then
+      sed -i '/^Environment=OPENCLAW_SERVICE_VERSION=/d' "$UNIT_FILE"
+      UNIT_CHANGED=1
+    fi
+    if [[ "$UNIT_CHANGED" -eq 1 ]]; then
+      log "systemd unit metadata normalized (removed hardcoded version fields)"
+      systemctl --user daemon-reload
+    fi
+  fi
+
   # ── Restart gateway service ──
   step "restart $SERVICE_NAME"
   if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
