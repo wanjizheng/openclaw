@@ -22,6 +22,7 @@ class FakeProvider implements VoiceCallProvider {
   readonly hangupCalls: HangupCallInput[] = [];
   readonly startListeningCalls: StartListeningInput[] = [];
   readonly stopListeningCalls: StopListeningInput[] = [];
+  playTtsError: Error | null = null;
 
   constructor(name: "plivo" | "twilio" = "plivo") {
     this.name = name;
@@ -40,6 +41,9 @@ class FakeProvider implements VoiceCallProvider {
     this.hangupCalls.push(input);
   }
   async playTts(input: PlayTtsInput): Promise<void> {
+    if (this.playTtsError) {
+      throw this.playTtsError;
+    }
     this.playTtsCalls.push(input);
   }
   async startListening(input: StartListeningInput): Promise<void> {
@@ -463,5 +467,29 @@ describe("CallManager", () => {
     expect(metadata.turnCount).toBe(5);
     expect(provider.startListeningCalls).toHaveLength(5);
     expect(provider.stopListeningCalls).toHaveLength(5);
+  });
+
+  it("ends local call when Twilio reports call is not in-progress (21220)", async () => {
+    const provider = new FakeProvider("twilio");
+    provider.playTtsError = new Error(
+      'Twilio API error: 400 {"code":21220,"message":"Call is not in-progress. Cannot redirect. ","status":400}',
+    );
+
+    const { manager } = createManagerHarness({}, provider);
+
+    const started = await manager.initiateCall("+15550000007");
+    expect(started.success).toBe(true);
+    markCallAnswered(manager, started.callId, "evt-21220-answered");
+
+    const result = await manager.speak(started.callId, "hello");
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("Call has ended");
+
+    expect(manager.getCall(started.callId)).toBeUndefined();
+    expect(manager.getCallByProviderCallId("request-uuid")).toBeUndefined();
+
+    const again = await manager.speak(started.callId, "retry");
+    expect(again.success).toBe(false);
+    expect(again.error).toBe("Call not found");
   });
 });
