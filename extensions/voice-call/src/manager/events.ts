@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { isAllowlistedCaller, normalizePhoneNumber } from "../allowlist.js";
+import { loadContactsFileSync, resolveInboundGreeting } from "../contact-file.js";
 import type { CallRecord, CallState, NormalizedEvent } from "../types.js";
 import type { CallManagerContext } from "./context.js";
 import { findCall } from "./lookup.js";
@@ -9,6 +10,7 @@ import { persistCallRecord } from "./store.js";
 import {
   clearMaxDurationTimer,
   rejectTranscriptWaiter,
+  resolveCallEndWaiter,
   resolveTranscriptWaiter,
   startMaxDurationTimer,
 } from "./timers.js";
@@ -24,6 +26,7 @@ type EventContext = Pick<
   | "storePath"
   | "transcriptWaiters"
   | "maxDurationTimers"
+  | "callEndWaiters"
   | "onCallAnswered"
 >;
 
@@ -78,16 +81,27 @@ function createInboundCall(params: {
     startedAt: Date.now(),
     transcript: [],
     processedEventIds: [],
-    metadata: {
-      initialMessage: params.ctx.config.inboundGreeting || "Hello! How can I help you today?",
-    },
+    metadata: {},
   };
+
+  // Resolve personalised greeting + caller name from VOICE_CONTACTS.md
+  const contacts = loadContactsFileSync();
+  const { greeting, callerName } = resolveInboundGreeting(
+    params.from,
+    params.ctx.config.inboundGreeting,
+    contacts,
+  );
+  callRecord.metadata!.initialMessage = greeting;
+  if (callerName) {
+    callRecord.metadata!.callerName = callerName;
+  }
 
   params.ctx.activeCalls.set(callId, callRecord);
   params.ctx.providerCallIdMap.set(params.providerCallId, callId);
   persistCallRecord(params.ctx.storePath, callRecord);
 
-  console.log(`[voice-call] Created inbound call record: ${callId} from ${params.from}`);
+  const callerLabel = callerName ? `${params.from} (${callerName})` : params.from;
+  console.log(`[voice-call] Created inbound call record: ${callId} from ${callerLabel}`);
   return callRecord;
 }
 
@@ -173,13 +187,17 @@ export function processEvent(ctx: EventContext, event: NormalizedEvent): void {
     case "call.answered":
       call.answeredAt = event.timestamp;
       transitionState(call, "answered");
-      startMaxDurationTimer({
-        ctx,
-        callId: call.callId,
-        onTimeout: async (callId) => {
-          await endCall(ctx, callId);
-        },
-      });
+      // Only start the max duration timer once (avoid double-start from
+      // parallel status callback + main webhook both reporting in-progress)
+      if (!ctx.maxDurationTimers.has(call.callId)) {
+        startMaxDurationTimer({
+          ctx,
+          callId: call.callId,
+          onTimeout: async (callId) => {
+            await endCall(ctx, callId);
+          },
+        });
+      }
       ctx.onCallAnswered?.(call);
       break;
 
@@ -217,6 +235,7 @@ export function processEvent(ctx: EventContext, event: NormalizedEvent): void {
       transitionState(call, event.reason as CallState);
       clearMaxDurationTimer(ctx, call.callId);
       rejectTranscriptWaiter(ctx, call.callId, `Call ended: ${event.reason}`);
+      resolveCallEndWaiter(ctx, call.callId, call);
       ctx.activeCalls.delete(call.callId);
       if (call.providerCallId) {
         ctx.providerCallIdMap.delete(call.providerCallId);
@@ -230,6 +249,7 @@ export function processEvent(ctx: EventContext, event: NormalizedEvent): void {
         transitionState(call, "error");
         clearMaxDurationTimer(ctx, call.callId);
         rejectTranscriptWaiter(ctx, call.callId, `Call error: ${event.error}`);
+        resolveCallEndWaiter(ctx, call.callId, call);
         ctx.activeCalls.delete(call.callId);
         if (call.providerCallId) {
           ctx.providerCallIdMap.delete(call.providerCallId);
