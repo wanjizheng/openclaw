@@ -2,8 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VoiceCallConfigSchema, type VoiceCallConfig } from "./config.js";
 import type { CallManager } from "./manager.js";
 import type { VoiceCallProvider } from "./providers/base.js";
+import { generateVoiceResponse } from "./response-generator.js";
 import type { CallRecord } from "./types.js";
 import { VoiceCallWebhookServer } from "./webhook.js";
+
+vi.mock("./response-generator.js", () => ({
+  generateVoiceResponse: vi.fn(),
+}));
 
 const provider: VoiceCallProvider = {
   name: "mock",
@@ -249,5 +254,141 @@ describe("VoiceCallWebhookServer replay handling", () => {
     } finally {
       await server.stop();
     }
+  });
+});
+
+describe("VoiceCallWebhookServer auto-response queue", () => {
+  const mockedGenerateVoiceResponse = vi.mocked(generateVoiceResponse);
+
+  const createAutoResponseManager = () => {
+    const processEvent = vi.fn();
+    const endCall = vi.fn(async () => ({ success: true }));
+    const speak = vi.fn(async () => ({ success: true }));
+    const call: CallRecord = {
+      callId: "call-1",
+      providerCallId: "provider-call-1",
+      provider: "mock",
+      direction: "inbound",
+      state: "active",
+      from: "+15550001234",
+      to: "+15550005678",
+      startedAt: Date.now(),
+      transcript: [],
+      processedEventIds: [],
+    };
+    const manager = {
+      getActiveCalls: () => [call],
+      getCall: vi.fn(() => call),
+      processEvent,
+      endCall,
+      speak,
+    } as unknown as CallManager;
+    return { manager, speak };
+  };
+
+  beforeEach(() => {
+    mockedGenerateVoiceResponse.mockReset();
+  });
+
+  it("serializes by call and coalesces pending transcript to latest", async () => {
+    const { manager, speak } = createAutoResponseManager();
+    const config = createConfig();
+    const server = new VoiceCallWebhookServer(config, manager, provider, {});
+    const serverAccess = server as unknown as {
+      enqueueInboundResponse: (callId: string, userMessage: string) => void;
+    };
+
+    let resolveFirst: ((value: { text: string }) => void) | null = null;
+    mockedGenerateVoiceResponse
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveFirst = resolve;
+          }) as Promise<{ text: string }>,
+      )
+      .mockResolvedValue({ text: "second reply" } as { text: string });
+
+    serverAccess.enqueueInboundResponse("call-1", "first");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    serverAccess.enqueueInboundResponse("call-1", "second");
+    serverAccess.enqueueInboundResponse("call-1", "third");
+
+    expect(mockedGenerateVoiceResponse).toHaveBeenCalledTimes(1);
+    expect(mockedGenerateVoiceResponse.mock.calls[0]?.[0]?.userMessage).toBe("first");
+
+    resolveFirst?.({ text: "first reply" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(mockedGenerateVoiceResponse).toHaveBeenCalledTimes(2);
+    expect(mockedGenerateVoiceResponse.mock.calls[1]?.[0]?.userMessage).toBe("third");
+    expect(speak).toHaveBeenCalledTimes(2);
+  });
+
+  it("speaks fallback when response generation returns error", async () => {
+    const { manager, speak } = createAutoResponseManager();
+    const config = createConfig();
+    const server = new VoiceCallWebhookServer(config, manager, provider, {});
+    const serverAccess = server as unknown as {
+      enqueueInboundResponse: (callId: string, userMessage: string) => void;
+    };
+
+    mockedGenerateVoiceResponse.mockResolvedValue({ text: null, error: "timeout" });
+
+    serverAccess.enqueueInboundResponse("call-1", "hello");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(speak).toHaveBeenCalledWith("call-1", "抱歉，我刚刚没来得及回答。请你再说一遍。");
+  });
+
+  it("speaks fallback when response text is empty", async () => {
+    const { manager, speak } = createAutoResponseManager();
+    const config = createConfig();
+    const server = new VoiceCallWebhookServer(config, manager, provider, {});
+    const serverAccess = server as unknown as {
+      enqueueInboundResponse: (callId: string, userMessage: string) => void;
+    };
+
+    mockedGenerateVoiceResponse.mockResolvedValue({ text: null });
+
+    serverAccess.enqueueInboundResponse("call-1", "hello");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(speak).toHaveBeenCalledWith(
+      "call-1",
+      "抱歉，这个问题我暂时没法回答。你可以再换个问法。",
+    );
+  });
+
+  it("speaks fallback when response generation throws", async () => {
+    const { manager, speak } = createAutoResponseManager();
+    const config = createConfig();
+    const server = new VoiceCallWebhookServer(config, manager, provider, {});
+    const serverAccess = server as unknown as {
+      enqueueInboundResponse: (callId: string, userMessage: string) => void;
+    };
+
+    mockedGenerateVoiceResponse.mockRejectedValue(new Error("boom"));
+
+    serverAccess.enqueueInboundResponse("call-1", "hello");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(speak).toHaveBeenCalledWith("call-1", "抱歉，我这边刚刚出了点问题。请再说一遍。");
+  });
+
+  it("hangs up immediately on end-call intent without calling LLM", async () => {
+    const { manager, speak } = createAutoResponseManager();
+    const endCall = vi.spyOn(manager, "endCall");
+    const config = createConfig();
+    const server = new VoiceCallWebhookServer(config, manager, provider, {});
+    const serverAccess = server as unknown as {
+      enqueueInboundResponse: (callId: string, userMessage: string) => void;
+    };
+
+    serverAccess.enqueueInboundResponse("call-1", "好了，那就挂了吧，拜拜。");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(mockedGenerateVoiceResponse).not.toHaveBeenCalled();
+    expect(speak).toHaveBeenCalledWith("call-1", "好的，拜拜。");
+    expect(endCall).toHaveBeenCalledWith("call-1");
   });
 });

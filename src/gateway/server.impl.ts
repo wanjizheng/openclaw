@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../agents/agent-scope.js";
 import { getActiveEmbeddedRunCount } from "../agents/pi-embedded-runner/runs.js";
@@ -118,6 +120,76 @@ const logHooks = log.child("hooks");
 const logPlugins = log.child("plugins");
 const logWsControl = log.child("ws");
 const logSecrets = log.child("secrets");
+
+const VOICE_CALL_TERMINAL_STATES = new Set([
+  "completed",
+  "hangup-user",
+  "hangup-bot",
+  "timeout",
+  "error",
+  "failed",
+  "no-answer",
+  "busy",
+  "voicemail",
+]);
+
+function resolveVoiceCallStoreDir(cfg: OpenClawConfig): string {
+  const configuredStore =
+    cfg.plugins?.entries?.["voice-call"]?.config &&
+    typeof cfg.plugins.entries["voice-call"].config === "object" &&
+    cfg.plugins.entries["voice-call"].config !== null &&
+    "store" in cfg.plugins.entries["voice-call"].config
+      ? (cfg.plugins.entries["voice-call"].config.store as string | undefined)
+      : undefined;
+  const raw = configuredStore?.trim();
+  if (raw) {
+    return raw.startsWith("~") ? path.join(os.homedir(), raw.slice(1)) : raw;
+  }
+  return path.join(os.homedir(), ".openclaw", "voice-calls");
+}
+
+function getActiveVoiceCallCount(cfg: OpenClawConfig): number {
+  const voiceCallPlugin = cfg.plugins?.entries?.["voice-call"];
+  if (!voiceCallPlugin || voiceCallPlugin.enabled === false) {
+    return 0;
+  }
+
+  const storeDir = resolveVoiceCallStoreDir(cfg);
+  const storeFile = path.join(storeDir, "calls.jsonl");
+  if (!fs.existsSync(storeFile)) {
+    return 0;
+  }
+
+  const latestStateByCall = new Map<string, string>();
+  try {
+    const rows = fs.readFileSync(storeFile, "utf8").split("\n");
+    for (const row of rows) {
+      const line = row.trim();
+      if (!line) {
+        continue;
+      }
+      try {
+        const record = JSON.parse(line) as { callId?: string; state?: string };
+        if (!record.callId || !record.state) {
+          continue;
+        }
+        latestStateByCall.set(record.callId, record.state);
+      } catch {
+        // Ignore malformed rows.
+      }
+    }
+  } catch {
+    return 0;
+  }
+
+  let active = 0;
+  for (const state of latestStateByCall.values()) {
+    if (!VOICE_CALL_TERMINAL_STATES.has(state)) {
+      active += 1;
+    }
+  }
+  return active;
+}
 const gatewayRuntime = runtimeForLogger(log);
 const canvasRuntime = runtimeForLogger(logCanvas);
 
@@ -374,9 +446,12 @@ export async function startGatewayServer(
     startDiagnosticHeartbeat();
   }
   setGatewaySigusr1RestartPolicy({ allowExternal: isRestartEnabled(cfgAtStart) });
-  setPreRestartDeferralCheck(
-    () => getTotalQueueSize() + getTotalPendingReplies() + getActiveEmbeddedRunCount(),
-  );
+  setPreRestartDeferralCheck(() => {
+    const queuePending =
+      getTotalQueueSize() + getTotalPendingReplies() + getActiveEmbeddedRunCount();
+    const activeVoiceCalls = getActiveVoiceCallCount(cfgAtStart);
+    return queuePending + activeVoiceCalls;
+  });
   initSubagentRegistry();
   const defaultAgentId = resolveDefaultAgentId(cfgAtStart);
   const defaultWorkspaceDir = resolveAgentWorkspaceDir(cfgAtStart, defaultAgentId);
