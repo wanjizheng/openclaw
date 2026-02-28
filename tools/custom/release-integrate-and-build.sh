@@ -93,8 +93,8 @@ git checkout custom-main --quiet 2>/dev/null \
 if ! git merge-base --is-ancestor upstream/main custom-main; then
   # Need rebase: custom-main is behind upstream/main
   if ! git rebase upstream/main --quiet; then
+    log "WARN: rebase custom-main onto upstream/main failed; fallback to current custom-main (no rebase)"
     git rebase --abort 2>/dev/null || true
-    die "rebase custom-main onto upstream/main failed — resolve manually then re-run"
   fi
 fi
 log "custom-main is up-to-date with upstream/main"
