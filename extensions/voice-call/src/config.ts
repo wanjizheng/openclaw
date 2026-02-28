@@ -279,7 +279,7 @@ export const VoiceCallConfigSchema = z
     /** Allowlist of phone numbers for inbound calls (E.164) */
     allowFrom: z.array(E164Schema).default([]),
 
-    /** Greeting message for inbound calls */
+    /** Greeting message for inbound calls (supports {name} placeholder) */
     inboundGreeting: z.string().optional(),
 
     /** Outbound call configuration */
