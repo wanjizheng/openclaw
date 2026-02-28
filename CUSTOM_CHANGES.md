@@ -201,3 +201,29 @@ Each entry should explain:
   - Each call now produces a persisted markdown record (plus inbound Discord summary).
   - Duplicate end-report spam is eliminated in race conditions.
   - Gateway avoids restarting while phone calls are active.
+
+### Safety guard: block accidental `gateway:dev` while prod gateway is running
+
+- What changed:
+  - Added a custom guard script to wrap dev gateway startup.
+  - Updated npm scripts so `pnpm gateway:dev` and `pnpm gateway:dev:reset` now go through this guard.
+  - Guard behavior:
+    - if `openclaw-gateway.service` is active, dev launch is blocked by default,
+    - allows explicit override via `OPENCLAW_ALLOW_DEV_GATEWAY=1`.
+- Why:
+  - Prevent accidental dual-gateway runtime (prod + dev) that causes Discord interaction conflicts and model picker inconsistencies.
+  - Keep operational behavior deterministic for daily usage.
+- Files:
+  - `tools/custom/gateway-dev-guard.sh` (new)
+  - `package.json`
+  - `CUSTOM_CHANGES.md`
+- When merging from upstream:
+  - Keep `package.json` scripts:
+    - `gateway:dev`
+    - `gateway:dev:reset`
+      pointed to `tools/custom/gateway-dev-guard.sh`.
+  - Keep the override contract unchanged:
+    - `OPENCLAW_ALLOW_DEV_GATEWAY=1` bypasses the guard intentionally.
+- User-visible behavior:
+  - Running `pnpm gateway:dev` now fails fast with a clear instruction when prod gateway is active.
+  - Accidental creation of parallel dev/prod gateway instances is prevented by default.
