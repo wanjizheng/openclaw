@@ -1,4 +1,4 @@
-import { TerminalStates, type CallId } from "../types.js";
+import { TerminalStates, type CallId, type CallRecord } from "../types.js";
 import type { CallManagerContext } from "./context.js";
 import { persistCallRecord } from "./store.js";
 
@@ -11,6 +11,7 @@ type MaxDurationTimerContext = Pick<
   "activeCalls" | "maxDurationTimers" | "config" | "storePath"
 >;
 type TranscriptWaiterContext = Pick<TimerContext, "transcriptWaiters">;
+type CallEndWaiterContext = Pick<CallManagerContext, "callEndWaiters" | "onCallEnded">;
 
 export function clearMaxDurationTimer(
   ctx: Pick<MaxDurationTimerContext, "maxDurationTimers">,
@@ -109,4 +110,30 @@ export function waitForFinalTranscript(
 
     ctx.transcriptWaiters.set(callId, { resolve, reject, timeout, turnToken });
   });
+}
+
+/**
+ * Resolve a call-end waiter with the final call record.
+ * Safe to call even if no waiter exists for the given callId.
+ */
+const firedCallEndIds = new Set<string>();
+
+export function resolveCallEndWaiter(
+  ctx: CallEndWaiterContext,
+  callId: CallId,
+  call: CallRecord,
+): void {
+  const snapshot = { ...call, transcript: [...call.transcript] };
+  const waiter = ctx.callEndWaiters.get(callId);
+  if (waiter) {
+    ctx.callEndWaiters.delete(callId);
+    waiter.resolve(snapshot);
+  }
+  // Fire the global hook exactly once per call end, regardless of waiter presence.
+  if (!firedCallEndIds.has(callId)) {
+    firedCallEndIds.add(callId);
+    // Prevent unbounded growth — clean up after a short delay.
+    setTimeout(() => firedCallEndIds.delete(callId), 60_000);
+    ctx.onCallEnded?.(snapshot);
+  }
 }

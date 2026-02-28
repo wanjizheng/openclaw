@@ -35,6 +35,17 @@ describe("TwilioProvider", () => {
     expect(result.providerResponseBody).toContain("<Connect>");
   });
 
+  it("returns streaming TwiML for outbound callbacks even without callId query", () => {
+    const provider = createProvider();
+    const ctx = createContext("Direction=outbound-api&CallSid=CA321");
+
+    const result = provider.parseWebhookEvent(ctx);
+
+    expect(result.providerResponseBody).toContain(STREAM_URL);
+    expect(result.providerResponseBody).toContain('<Parameter name="token" value="');
+    expect(result.providerResponseBody).toContain("<Connect>");
+  });
+
   it("returns empty TwiML for status callbacks", () => {
     const provider = createProvider();
     const ctx = createContext("CallStatus=ringing&Direction=outbound-api", {
@@ -113,5 +124,66 @@ describe("TwilioProvider", () => {
     const event = provider.parseWebhookEvent(ctx).events[0];
     expect(event?.type).toBe("call.speech");
     expect(event?.turnToken).toBe("turn-xyz");
+  });
+
+  it("playTts with hosted audio uses Play then reconnects stream (no Gather)", async () => {
+    const provider = createProvider();
+    (provider as unknown as { callWebhookUrls: Map<string, string> }).callWebhookUrls.set(
+      "CA100",
+      "https://example.ngrok.app/voice/webhook?callId=call-1",
+    );
+
+    const fetchMock = async (_url: string, init?: RequestInit): Promise<Response> => {
+      const body = init?.body as URLSearchParams;
+      const twiml = body.get("Twiml") || "";
+      expect(twiml).toContain("<Play>");
+      expect(twiml).toContain("<Connect>");
+      expect(twiml).toContain("<Stream");
+      expect(twiml).not.toContain("<Gather");
+      return new Response("", { status: 200 });
+    };
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof fetch;
+    try {
+      await provider.playTts({
+        callId: "call-1",
+        providerCallId: "CA100",
+        text: "hello",
+        audioUrl: "https://cdn.example.com/reply.mp3",
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("playTts Say fallback reconnects stream without Gather", async () => {
+    const provider = createProvider();
+    (provider as unknown as { callWebhookUrls: Map<string, string> }).callWebhookUrls.set(
+      "CA101",
+      "https://example.ngrok.app/voice/webhook?callId=call-2",
+    );
+
+    const fetchMock = async (_url: string, init?: RequestInit): Promise<Response> => {
+      const body = init?.body as URLSearchParams;
+      const twiml = body.get("Twiml") || "";
+      expect(twiml).toContain("<Say");
+      expect(twiml).toContain("<Connect>");
+      expect(twiml).toContain("<Stream");
+      expect(twiml).not.toContain("<Gather");
+      return new Response("", { status: 200 });
+    };
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as typeof fetch;
+    try {
+      await provider.playTts({
+        callId: "call-2",
+        providerCallId: "CA101",
+        text: "fallback",
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

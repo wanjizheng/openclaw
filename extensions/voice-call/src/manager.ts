@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import type { VoiceCallConfig } from "./config.js";
 import type { CallManagerContext } from "./manager/context.js";
+import type { CallEndWaiter } from "./manager/context.js";
 import { processEvent as processManagerEvent } from "./manager/events.js";
 import { getCallByProviderCallId as getCallByProviderCallIdFromMaps } from "./manager/lookup.js";
 import {
@@ -57,6 +58,7 @@ export class CallManager {
     }
   >();
   private maxDurationTimers = new Map<CallId, NodeJS.Timeout>();
+  private callEndWaiters = new Map<CallId, CallEndWaiter>();
 
   constructor(config: VoiceCallConfig, storePath?: string) {
     this.config = config;
@@ -100,8 +102,12 @@ export class CallManager {
   /**
    * Speak to user in an active call.
    */
-  async speak(callId: CallId, text: string): Promise<{ success: boolean; error?: string }> {
-    return speakWithContext(this.getContext(), callId, text);
+  async speak(
+    callId: CallId,
+    text: string,
+    options?: { audioUrl?: string },
+  ): Promise<{ success: boolean; error?: string }> {
+    return speakWithContext(this.getContext(), callId, text, options);
   }
 
   /**
@@ -124,8 +130,27 @@ export class CallManager {
   /**
    * End an active call.
    */
+  /** Optional: set by the embedding layer to receive every call-end event exactly once. */
+  onCallEnded?: (call: CallRecord) => void;
+
   async endCall(callId: CallId): Promise<{ success: boolean; error?: string }> {
     return endCallWithContext(this.getContext(), callId);
+  }
+
+  /**
+   * Wait for a call to reach a terminal state (completed, hangup, error, etc.).
+   * Returns the final CallRecord with the full transcript.
+   */
+  waitForCallEnd(callId: CallId): Promise<CallRecord> {
+    // If the call is already gone (ended before we registered), check store.
+    const active = this.activeCalls.get(callId);
+    if (!active) {
+      return Promise.reject(new Error("Call not found or already ended"));
+    }
+
+    return new Promise<CallRecord>((resolve) => {
+      this.callEndWaiters.set(callId, { resolve });
+    });
   }
 
   private getContext(): CallManagerContext {
@@ -141,9 +166,11 @@ export class CallManager {
       activeTurnCalls: this.activeTurnCalls,
       transcriptWaiters: this.transcriptWaiters,
       maxDurationTimers: this.maxDurationTimers,
+      callEndWaiters: this.callEndWaiters,
       onCallAnswered: (call) => {
         this.maybeSpeakInitialMessageOnAnswered(call);
       },
+      onCallEnded: this.onCallEnded,
     };
   }
 

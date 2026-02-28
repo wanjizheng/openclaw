@@ -6,7 +6,9 @@ import {
   readRequestBodyWithLimit,
   requestBodyErrorToText,
 } from "openclaw/plugin-sdk";
+import { normalizePhoneNumber } from "./allowlist.js";
 import type { VoiceCallConfig } from "./config.js";
+import { loadContactsFileAsync } from "./contact-file.js";
 import type { CoreConfig } from "./core-bridge.js";
 import type { CallManager } from "./manager.js";
 import type { MediaStreamConfig } from "./media-stream.js";
@@ -14,10 +16,45 @@ import { MediaStreamHandler } from "./media-stream.js";
 import type { VoiceCallProvider } from "./providers/base.js";
 import { OpenAIRealtimeSTTProvider } from "./providers/stt-openai-realtime.js";
 import type { TwilioProvider } from "./providers/twilio.js";
-import type { NormalizedEvent, WebhookContext } from "./types.js";
+import { generateGreetingText, maybeGenerateHostedAudioUrl } from "./response-generator.js";
+import { TerminalStates, type NormalizedEvent, type WebhookContext } from "./types.js";
 import { startStaleCallReaper } from "./webhook/stale-call-reaper.js";
 
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
+
+const END_CALL_KEYWORDS = [
+  "没了",
+  "沒有了",
+  "没有了",
+  "没有问题了",
+  "先这样",
+  "先這樣",
+  "就这样",
+  "就這樣",
+  "挂了",
+  "掛了",
+  "挂断",
+  "掛斷",
+  "结束通话",
+  "結束通話",
+  "再见",
+  "再見",
+  "拜拜",
+  "掰掰",
+  "白白",
+  "謝謝",
+  "谢谢",
+];
+
+function isEndCallIntent(text: string): boolean {
+  const lower = text.toLowerCase();
+  if (/(^|\b)(bye|goodbye|hang\s*up|end\s*call)(\b|$)/i.test(lower)) {
+    return true;
+  }
+
+  const compact = lower.replace(/\s+/g, "");
+  return END_CALL_KEYWORDS.some((keyword) => compact.includes(keyword));
+}
 
 /**
  * HTTP server for receiving voice call webhooks from providers.
@@ -33,6 +70,12 @@ export class VoiceCallWebhookServer {
 
   /** Media stream handler for bidirectional audio (when streaming enabled) */
   private mediaStreamHandler: MediaStreamHandler | null = null;
+  private inFlightAutoResponses = new Set<string>();
+  private pendingAutoResponses = new Map<string, string>();
+  /** Calls already flagged for early end-intent hangup from partial transcript */
+  private earlyEndIntentCalls = new Set<string>();
+  /** Pre-generated audio URLs for inbound contact greetings, keyed by normalised phone digits */
+  private preGeneratedGreetingUrls = new Map<string, string>();
 
   constructor(
     config: VoiceCallConfig,
@@ -56,6 +99,88 @@ export class VoiceCallWebhookServer {
    */
   getMediaStreamHandler(): MediaStreamHandler | null {
     return this.mediaStreamHandler;
+  }
+
+  /**
+   * WORKFLOW_AUTO: Pre-generate inbound greeting audio per contact so inbound
+   * calls can play it instantly via WebSocket streaming.  Reads VOICE_CONTACTS.md
+   * from the workspace directory; falls back to the global `inboundGreeting` if
+   * no contacts file is present.  Fire-and-forget — failures are non-fatal.
+   */
+  preGenerateInboundGreeting(): void {
+    if (!this.coreConfig) {
+      return;
+    }
+    void (async () => {
+      try {
+        const contacts = await loadContactsFileAsync();
+
+        // If no contacts file, fall back to the global greeting
+        if (contacts.length === 0) {
+          const globalGreeting = this.config.inboundGreeting;
+          if (!globalGreeting) return;
+          const url = await maybeGenerateHostedAudioUrl({
+            text: globalGreeting,
+            coreConfig: this.coreConfig!,
+            voiceConfig: this.config,
+          });
+          if (url) {
+            this.preGeneratedGreetingUrls.set("__global__", url);
+            console.log(`[voice-call] Pre-generated global inbound greeting audio: ${url}`);
+          }
+          return;
+        }
+
+        const start = Date.now();
+        let count = 0;
+        for (const contact of contacts) {
+          const template = contact.greeting ?? this.config.inboundGreeting;
+          // Static fallback: substitute {name} in template
+          const staticText = template
+            ? contact.name
+              ? template.replace(/\{name\}/g, contact.name)
+              : template.replace(/\s*\{name\}\s*/g, " ").trim()
+            : undefined;
+          try {
+            // Ask LLM to generate the greeting using VOICE_SYSTEM_PROMPT as style guide
+            const llmText = await generateGreetingText({
+              voiceConfig: this.config,
+              coreConfig: this.coreConfig!,
+              from: contact.phone,
+              callerName: contact.name,
+              greetingHint: template,
+              callerInfo: contact.info,
+            });
+            const finalText = llmText ?? staticText;
+            if (!finalText) continue;
+            const url = await maybeGenerateHostedAudioUrl({
+              text: finalText,
+              coreConfig: this.coreConfig!,
+              voiceConfig: this.config,
+            });
+            if (url) {
+              const key = normalizePhoneNumber(contact.phone);
+              if (key) {
+                this.preGeneratedGreetingUrls.set(key, url);
+                count++;
+              }
+            }
+          } catch (err) {
+            console.warn(
+              `[voice-call] Failed to pre-generate greeting for ${contact.name}:`,
+              err instanceof Error ? err.message : String(err),
+            );
+          }
+        }
+        const ms = Date.now() - start;
+        console.log(`[voice-call] Pre-generated ${count} contact greeting(s) in ${ms}ms`);
+      } catch (err) {
+        console.warn(
+          `[voice-call] Failed to pre-generate inbound greetings:`,
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+    })();
   }
 
   /**
@@ -127,9 +252,7 @@ export class VoiceCallWebhookServer {
         const callMode = call.metadata?.mode as string | undefined;
         const shouldRespond = call.direction === "inbound" || callMode === "conversation";
         if (shouldRespond) {
-          this.handleInboundResponse(call.callId, transcript).catch((err) => {
-            console.warn(`[voice-call] Failed to auto-respond:`, err);
-          });
+          this.enqueueInboundResponse(call.callId, transcript);
         }
       },
       onSpeechStart: (providerCallId) => {
@@ -137,14 +260,57 @@ export class VoiceCallWebhookServer {
           (this.provider as TwilioProvider).clearTtsQueue(providerCallId);
         }
       },
-      onPartialTranscript: (callId, partial) => {
-        console.log(`[voice-call] Partial for ${callId}: ${partial}`);
+      onPartialTranscript: (providerCallId, partial) => {
+        console.log(`[voice-call] Partial for ${providerCallId}: ${partial}`);
+
+        // Early end-intent detection from partial transcript
+        if (isEndCallIntent(partial)) {
+          const call = this.manager.getCallByProviderCallId(providerCallId);
+          if (call && !this.earlyEndIntentCalls.has(call.callId)) {
+            this.earlyEndIntentCalls.add(call.callId);
+            console.log(
+              `[voice-call] Early end-intent from partial for ${call.callId}: "${partial}"`,
+            );
+            void this.trySpeakFallback(call.callId, "好的，拜拜。", true).catch((err) => {
+              console.warn(`[voice-call] Failed early end-intent hangup:`, err);
+            });
+          }
+        }
       },
       onConnect: (callId, streamSid) => {
         console.log(`[voice-call] Media stream connected: ${callId} -> ${streamSid}`);
         // Register stream with provider for TTS routing
         if (this.provider.name === "twilio") {
           (this.provider as TwilioProvider).registerCallStream(callId, streamSid);
+        }
+
+        // WORKFLOW_AUTO: For inbound calls, handle state transitions and
+        // inject pre-generated greeting audio for instant playback.
+        const call = this.manager.getCallByProviderCallId(callId);
+        if (call && call.direction === "inbound") {
+          // Twilio doesn't reliably send status-callback "in-progress" for
+          // inbound calls, so synthesize a call.answered event when the
+          // media stream connects (definitive proof the call is active).
+          if (call.state === "ringing") {
+            const answeredEvent: NormalizedEvent = {
+              id: `stream-answered-${Date.now()}`,
+              type: "call.answered" as const,
+              callId: call.callId,
+              providerCallId: callId,
+              timestamp: Date.now(),
+            };
+            this.manager.processEvent(answeredEvent);
+          }
+
+          // Inject pre-generated greeting audio so speakInitialMessage can
+          // stream it instantly instead of waiting for real-time TTS.
+          const callerKey = normalizePhoneNumber(call.from);
+          const greetingUrl =
+            this.preGeneratedGreetingUrls.get(callerKey) ??
+            this.preGeneratedGreetingUrls.get("__global__");
+          if (greetingUrl && call.metadata) {
+            call.metadata.initialMessageAudioUrl = greetingUrl;
+          }
         }
 
         // Speak initial message if one was provided when call was initiated
@@ -157,8 +323,35 @@ export class VoiceCallWebhookServer {
       },
       onDisconnect: (callId) => {
         console.log(`[voice-call] Media stream disconnected: ${callId}`);
-        // Auto-end call when media stream disconnects to prevent stuck calls.
-        // Without this, calls can remain active indefinitely after the stream closes.
+        if (this.provider.name === "twilio") {
+          // Twilio stream disconnects can happen during mid-call TwiML updates
+          // (e.g., Play/Redirect). Do not auto-end outbound calls on disconnect.
+          (this.provider as TwilioProvider).unregisterCallStream(callId);
+
+          // WORKFLOW_AUTO: For inbound calls, stream disconnect means the caller
+          // hung up. Twilio doesn't reliably deliver a completion webhook for
+          // inbound calls, so we end the call after a short grace period.
+          const disconnectedCall = this.manager.getCallByProviderCallId(callId);
+          if (disconnectedCall && disconnectedCall.direction === "inbound") {
+            setTimeout(() => {
+              const current = this.manager.getCall(disconnectedCall.callId);
+              if (current && !TerminalStates.has(current.state)) {
+                console.log(
+                  `[voice-call] Auto-ending inbound call ${disconnectedCall.callId} after stream disconnect`,
+                );
+                void this.manager.endCall(disconnectedCall.callId).catch((err) => {
+                  console.warn(
+                    `[voice-call] Failed to auto-end inbound call ${disconnectedCall.callId}:`,
+                    err,
+                  );
+                });
+              }
+            }, 2000);
+          }
+          return;
+        }
+
+        // For non-Twilio providers, keep the previous safety behavior.
         const disconnectedCall = this.manager.getCallByProviderCallId(callId);
         if (disconnectedCall) {
           console.log(
@@ -167,9 +360,6 @@ export class VoiceCallWebhookServer {
           void this.manager.endCall(disconnectedCall.callId).catch((err) => {
             console.warn(`[voice-call] Failed to auto-end call ${disconnectedCall.callId}:`, err);
           });
-        }
-        if (this.provider.name === "twilio") {
-          (this.provider as TwilioProvider).unregisterCallStream(callId);
         }
       },
     };
@@ -334,6 +524,12 @@ export class VoiceCallWebhookServer {
       for (const event of result.events) {
         try {
           this.manager.processEvent(event);
+          if (event.type === "call.ended") {
+            this.pendingAutoResponses.delete(event.callId);
+            this.inFlightAutoResponses.delete(event.callId);
+            this.earlyEndIntentCalls.delete(event.callId);
+            // Audio file cleanup is handled by the onCallEnded hook.
+          }
         } catch (err) {
           console.error(`[voice-call] Error processing event ${event.type}:`, err);
         }
@@ -364,6 +560,45 @@ export class VoiceCallWebhookServer {
   }
 
   /**
+   * Serialize auto-responses per call to avoid overlapping LLM runs.
+   */
+  private enqueueInboundResponse(callId: string, userMessage: string): void {
+    const normalized = userMessage.trim();
+    if (!normalized) {
+      return;
+    }
+
+    this.pendingAutoResponses.set(callId, normalized);
+    if (this.inFlightAutoResponses.has(callId)) {
+      return;
+    }
+
+    this.inFlightAutoResponses.add(callId);
+    void this.drainInboundResponseQueue(callId).finally(() => {
+      this.inFlightAutoResponses.delete(callId);
+      if (this.pendingAutoResponses.has(callId)) {
+        this.enqueueInboundResponse(callId, this.pendingAutoResponses.get(callId) || "");
+      }
+    });
+  }
+
+  private async drainInboundResponseQueue(callId: string): Promise<void> {
+    while (true) {
+      const nextMessage = this.pendingAutoResponses.get(callId);
+      if (!nextMessage) {
+        return;
+      }
+      this.pendingAutoResponses.delete(callId);
+
+      try {
+        await this.handleInboundResponse(callId, nextMessage);
+      } catch (err) {
+        console.warn(`[voice-call] Failed to auto-respond:`, err);
+      }
+    }
+  }
+
+  /**
    * Handle auto-response for inbound calls using the agent system.
    * Supports tool calling for richer voice interactions.
    */
@@ -382,29 +617,91 @@ export class VoiceCallWebhookServer {
       return;
     }
 
+    if (isEndCallIntent(userMessage)) {
+      console.log(`[voice-call] End-call intent detected for ${callId}; hanging up immediately`);
+      await this.trySpeakFallback(callId, "好的，拜拜。", true);
+      return;
+    }
+
+    // Skip LLM if early end-intent already triggered from partial transcript
+    if (this.earlyEndIntentCalls.has(callId)) {
+      console.log(`[voice-call] Skipping LLM for ${callId}: early end-intent already triggered`);
+      return;
+    }
+
     try {
       const { generateVoiceResponse } = await import("./response-generator.js");
 
+      const genStart = Date.now();
       const result = await generateVoiceResponse({
         voiceConfig: this.config,
         coreConfig: this.coreConfig,
         callId,
         from: call.from,
+        callerName:
+          typeof call.metadata?.callerName === "string" ? call.metadata.callerName : undefined,
         transcript: call.transcript,
         userMessage,
       });
+      const genMs = Date.now() - genStart;
 
       if (result.error) {
-        console.error(`[voice-call] Response generation error: ${result.error}`);
+        console.error(`[voice-call] Response generation error (${genMs}ms): ${result.error}`);
+        console.log(`[voice-call] Fallback response for ${callId}: llm_error`);
+        await this.trySpeakFallback(callId, "抱歉，我刚刚没来得及回答。请你再说一遍。");
         return;
       }
 
-      if (result.text) {
-        console.log(`[voice-call] AI response: "${result.text}"`);
-        await this.manager.speak(callId, result.text);
+      if (!result.text) {
+        console.log(`[voice-call] Fallback response for ${callId} (${genMs}ms): empty_output`);
+        await this.trySpeakFallback(callId, "抱歉，这个问题我暂时没法回答。你可以再换个问法。");
+        return;
+      }
+
+      console.log(`[voice-call] AI response (${genMs}ms): "${result.text}"`);
+      if (result.audioUrl) {
+        console.log(`[voice-call] Hosted audio ready: ${result.audioUrl}`);
+      }
+
+      const speakStart = Date.now();
+      const speakResult = await this.manager.speak(callId, result.text, {
+        audioUrl: result.audioUrl,
+      });
+      const speakMs = Date.now() - speakStart;
+      if (!speakResult.success) {
+        console.warn(
+          `[voice-call] Failed to speak AI response for ${callId} (${speakMs}ms): ${speakResult.error}`,
+        );
+      } else {
+        console.log(
+          `[voice-call] Speak completed for ${callId} in ${speakMs}ms (total: ${genMs + speakMs}ms)`,
+        );
       }
     } catch (err) {
       console.error(`[voice-call] Auto-response error:`, err);
+      console.log(`[voice-call] Fallback response for ${callId}: exception`);
+      await this.trySpeakFallback(callId, "抱歉，我这边刚刚出了点问题。请再说一遍。");
+    }
+  }
+
+  private async trySpeakFallback(
+    callId: string,
+    text: string,
+    endAfterSpeak = false,
+  ): Promise<void> {
+    const result = await this.manager.speak(callId, text);
+    if (!result.success) {
+      console.warn(`[voice-call] Failed to speak fallback for ${callId}: ${result.error}`);
+      return;
+    }
+
+    if (endAfterSpeak) {
+      const endResult = await this.manager.endCall(callId);
+      if (!endResult.success) {
+        console.warn(
+          `[voice-call] Failed to end call ${callId} after fallback: ${endResult.error}`,
+        );
+      }
     }
   }
 }

@@ -29,6 +29,7 @@ type CoreAgentDeps = {
     sessionId: string;
     sessionKey?: string;
     messageProvider?: string;
+    disableMessageTool?: boolean;
     sessionFile: string;
     workspaceDir: string;
     config?: CoreConfig;
@@ -60,8 +61,17 @@ type CoreAgentDeps = {
   DEFAULT_PROVIDER: string;
 };
 
+type CoreTtsDeps = {
+  textToSpeech: (params: {
+    text: string;
+    cfg: CoreConfig;
+    channel?: string;
+  }) => Promise<{ success: boolean; audioPath?: string; error?: string }>;
+};
+
 let coreRootCache: string | null = null;
 let coreDepsPromise: Promise<CoreAgentDeps> | null = null;
+let coreTtsDepsPromise: Promise<CoreTtsDeps> | null = null;
 
 function findPackageRoot(startDir: string, name: string): string | null {
   let dir = startDir;
@@ -156,4 +166,30 @@ export async function loadCoreAgentDeps(): Promise<CoreAgentDeps> {
   })();
 
   return coreDepsPromise;
+}
+
+export async function loadCoreTtsDeps(): Promise<CoreTtsDeps> {
+  if (coreTtsDepsPromise) {
+    return coreTtsDepsPromise;
+  }
+
+  coreTtsDepsPromise = (async () => {
+    const distPath = path.join(resolveOpenClawRoot(), "dist", "tts", "tts.js");
+    if (!fs.existsSync(distPath)) {
+      throw new Error(
+        `Missing core TTS module at ${distPath}. Run \`pnpm build\` or install the official package.`,
+      );
+    }
+    const mod = (await import(pathToFileURL(distPath).href)) as {
+      textToSpeech?: CoreTtsDeps["textToSpeech"];
+    };
+    if (typeof mod.textToSpeech !== "function") {
+      throw new Error("Core TTS module does not export textToSpeech");
+    }
+    return {
+      textToSpeech: mod.textToSpeech,
+    };
+  })();
+
+  return coreTtsDepsPromise;
 }

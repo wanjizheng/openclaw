@@ -15,6 +15,7 @@ import {
   clearMaxDurationTimer,
   clearTranscriptWaiter,
   rejectTranscriptWaiter,
+  resolveCallEndWaiter,
   waitForFinalTranscript,
 } from "./timers.js";
 import { generateNotifyTwiml } from "./twiml.js";
@@ -26,7 +27,15 @@ type InitiateContext = Pick<
 
 type SpeakContext = Pick<
   CallManagerContext,
-  "activeCalls" | "providerCallIdMap" | "provider" | "config" | "storePath"
+  | "activeCalls"
+  | "providerCallIdMap"
+  | "provider"
+  | "config"
+  | "storePath"
+  | "transcriptWaiters"
+  | "maxDurationTimers"
+  | "callEndWaiters"
+  | "onCallEnded"
 >;
 
 type ConversationContext = Pick<
@@ -49,6 +58,8 @@ type EndCallContext = Pick<
   | "storePath"
   | "transcriptWaiters"
   | "maxDurationTimers"
+  | "callEndWaiters"
+  | "onCallEnded"
 >;
 
 type ConnectedCallContext = Pick<CallManagerContext, "activeCalls" | "provider">;
@@ -102,6 +113,14 @@ function requireConnectedCall(ctx: ConnectedCallContext, callId: CallId): Connec
   };
 }
 
+function isTwilioCallNotInProgressError(errorMessage: string): boolean {
+  const normalized = errorMessage.toLowerCase();
+  return (
+    normalized.includes("twilio api error") &&
+    (normalized.includes('"code":21220') || normalized.includes("call is not in-progress"))
+  );
+}
+
 export async function initiateCall(
   ctx: InitiateContext,
   to: string,
@@ -148,6 +167,7 @@ export async function initiateCall(
     processedEventIds: [],
     metadata: {
       ...(initialMessage && { initialMessage }),
+      ...(opts.initialMessageAudioUrl && { initialMessageAudioUrl: opts.initialMessageAudioUrl }),
       mode,
     },
   };
@@ -199,6 +219,7 @@ export async function speak(
   ctx: SpeakContext,
   callId: CallId,
   text: string,
+  options?: { audioUrl?: string },
 ): Promise<{ success: boolean; error?: string }> {
   const connected = requireConnectedCall(ctx, callId);
   if (!connected.ok) {
@@ -217,12 +238,37 @@ export async function speak(
       callId,
       providerCallId,
       text,
+      audioUrl: options?.audioUrl,
       voice,
     });
 
     return { success: true };
   } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : String(err) };
+    const errorMessage = err instanceof Error ? err.message : String(err);
+
+    if (
+      provider.name === "twilio" &&
+      isTwilioCallNotInProgressError(errorMessage) &&
+      !TerminalStates.has(call.state)
+    ) {
+      console.warn(
+        `[voice-call] Twilio call ${callId} is no longer in-progress; ending local call state`,
+      );
+      call.endedAt = Date.now();
+      call.endReason = "completed";
+      transitionState(call, "completed");
+      clearMaxDurationTimer(ctx, callId);
+      rejectTranscriptWaiter(ctx, callId, "Call ended: completed");
+      resolveCallEndWaiter(ctx, callId, call);
+      ctx.activeCalls.delete(callId);
+      if (call.providerCallId) {
+        ctx.providerCallIdMap.delete(call.providerCallId);
+      }
+      persistCallRecord(ctx.storePath, call);
+      return { success: false, error: "Call has ended" };
+    }
+
+    return { success: false, error: errorMessage };
   }
 }
 
@@ -254,8 +300,16 @@ export async function speakInitialMessage(
     persistCallRecord(ctx.storePath, call);
   }
 
-  console.log(`[voice-call] Speaking initial message for call ${call.callId} (mode: ${mode})`);
-  const result = await speak(ctx, call.callId, initialMessage);
+  const audioUrl = call.metadata?.initialMessageAudioUrl as string | undefined;
+  // Clear pre-gen audio URL from metadata too.
+  if (call.metadata) {
+    delete call.metadata.initialMessageAudioUrl;
+  }
+
+  console.log(
+    `[voice-call] Speaking initial message for call ${call.callId} (mode: ${mode}, preGenAudio: ${audioUrl ? "yes" : "no"})`,
+  );
+  const result = await speak(ctx, call.callId, initialMessage, { audioUrl });
   if (!result.success) {
     console.warn(`[voice-call] Failed to speak initial message: ${result.error}`);
     return;
@@ -369,6 +423,7 @@ export async function endCall(
 
     clearMaxDurationTimer(ctx, callId);
     rejectTranscriptWaiter(ctx, callId, "Call ended: hangup-bot");
+    resolveCallEndWaiter(ctx, callId, call);
 
     ctx.activeCalls.delete(callId);
     ctx.providerCallIdMap.delete(providerCallId);

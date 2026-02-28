@@ -231,6 +231,7 @@ export type PlayTtsInput = {
   callId: CallId;
   providerCallId: ProviderCallId;
   text: string;
+  audioUrl?: string;
   voice?: string;
   locale?: string;
 };
@@ -257,6 +258,8 @@ export type OutboundCallOptions = {
   message?: string;
   /** Call mode (overrides config default) */
   mode?: CallMode;
+  /** Pre-generated audio URL for the initial message (SAG TTS). */
+  initialMessageAudioUrl?: string;
 };
 
 // -----------------------------------------------------------------------------
