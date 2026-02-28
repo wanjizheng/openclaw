@@ -9,7 +9,7 @@
 #   5. Collect ONLY the custom commits (upstream/main..custom-main)
 #   6. Create release-custom/<tag> from that tag + cherry-pick custom commits
 #   7. Build (pnpm install + build + ui:build)
-#   8. Deploy built artifacts to global install + restart gateway
+#   8. Deploy built artifacts to global install + refresh gateway service + restart
 #   9. Merge release-custom/<tag> back into custom-main
 #  10. Push everything & switch to custom-main
 #
@@ -238,6 +238,10 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   [[ -d "$DEPLOY_TARGET/extensions" ]] && rsync -a --delete extensions/ "$DEPLOY_TARGET/extensions/"
   [[ -d "$DEPLOY_TARGET/skills" ]]     && rsync -a --delete skills/ "$DEPLOY_TARGET/skills/"
   log "artifacts synced"
+
+  # ── Refresh gateway service unit/env ──
+  step "gateway install --force"
+  openclaw gateway install --force
 
   # ── Normalize systemd unit metadata (strip version from Description only) ──
   UNIT_FILE="$HOME/.config/systemd/user/$SERVICE_NAME"
