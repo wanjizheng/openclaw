@@ -9,7 +9,7 @@
 #   5. Collect ONLY the custom commits (upstream/main..custom-main)
 #   6. Create release-custom/<tag> from that tag + cherry-pick custom commits
 #   7. Build (pnpm install + build + ui:build)
-#   8. Deploy built artifacts to global install + restart gateway
+#   8. Deploy built artifacts to global install + refresh gateway service + restart
 #   9. Merge release-custom/<tag> back into custom-main
 #  10. Push everything & switch to custom-main
 #
@@ -239,7 +239,11 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   [[ -d "$DEPLOY_TARGET/skills" ]]     && rsync -a --delete skills/ "$DEPLOY_TARGET/skills/"
   log "artifacts synced"
 
-  # ── Normalize systemd unit metadata (avoid hardcoded version strings) ──
+  # ── Refresh gateway service unit/env ──
+  step "gateway install --force"
+  openclaw gateway install --force
+
+  # ── Normalize systemd unit metadata (strip version from Description only) ──
   UNIT_FILE="$HOME/.config/systemd/user/$SERVICE_NAME"
   if [[ -f "$UNIT_FILE" ]]; then
     UNIT_CHANGED=0
@@ -247,12 +251,8 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
       sed -i -E 's/^Description=OpenClaw Gateway \(v[^)]*\)$/Description=OpenClaw Gateway/' "$UNIT_FILE"
       UNIT_CHANGED=1
     fi
-    if grep -q '^Environment=OPENCLAW_SERVICE_VERSION=' "$UNIT_FILE"; then
-      sed -i '/^Environment=OPENCLAW_SERVICE_VERSION=/d' "$UNIT_FILE"
-      UNIT_CHANGED=1
-    fi
     if [[ "$UNIT_CHANGED" -eq 1 ]]; then
-      log "systemd unit metadata normalized (removed hardcoded version fields)"
+      log "systemd unit metadata normalized (description only)"
       systemctl --user daemon-reload
     fi
   fi
