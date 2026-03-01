@@ -4,9 +4,9 @@
 # Workflow (matches user requirement exactly):
 #   1. Save any dirty worktree changes
 #   2. Fetch upstream + tags
-#   3. Find latest stable release tag (e.g. v2026.2.26)
-#   4. Merge latest stable tag into custom-main (preserve custom-main history)
-#   5. Collect ONLY the custom commits (<latest-tag>..custom-main)
+#   3. Rebase custom-main onto upstream/main (keep only custom commits on top)
+#   4. Find latest stable release tag (e.g. v2026.2.26)
+#   5. Collect ONLY the custom commits (upstream/main..custom-main)
 #   6. Create release-custom/<tag> from that tag + cherry-pick custom commits
 #   7. Build (pnpm install + build + ui:build)
 #   8. Deploy built artifacts to global install + refresh gateway service + restart
@@ -33,9 +33,6 @@ SKIP_INSTALL="false"
 SKIP_BUILD="false"
 SKIP_DEPLOY="false"
 CONFLICT_STRATEGY="prefer-custom"
-SYNC_CUSTOM_MAIN="false"
-MAX_CUSTOM_COMMITS="300"
-AUTO_SLIM_COMMITS="true"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -51,9 +48,6 @@ while (( $# )); do
     --skip-install)      SKIP_INSTALL="true"; shift ;;
     --skip-build)        SKIP_BUILD="true"; shift ;;
     --skip-deploy)       SKIP_DEPLOY="true"; shift ;;
-    --sync-custom-main)  SYNC_CUSTOM_MAIN="true"; shift ;;
-    --max-custom-commits) MAX_CUSTOM_COMMITS="${2:-300}"; shift 2 ;;
-    --no-auto-slim-commits) AUTO_SLIM_COMMITS="false"; shift ;;
     --conflict-strategy) CONFLICT_STRATEGY="${2:-prefer-custom}"; shift 2 ;;
     --deploy-target)     DEPLOY_TARGET="${2:?}"; shift 2 ;;
     *) die "unknown arg: $1" ;;
@@ -62,40 +56,6 @@ done
 
 [[ "$CONFLICT_STRATEGY" =~ ^(prefer-custom|stop)$ ]] \
   || die "--conflict-strategy must be prefer-custom|stop"
-
-[[ "$MAX_CUSTOM_COMMITS" =~ ^[0-9]+$ ]] \
-  || die "--max-custom-commits must be a non-negative integer"
-
-[[ "$AUTO_SLIM_COMMITS" =~ ^(true|false)$ ]] \
-  || die "--no-auto-slim-commits parse failed"
-
-slim_commit_list_by_subject() {
-  local -a input_commits=("$@")
-  local -A seen_subjects=()
-  local -a newest_unique=()
-
-  local index sha subject
-  for (( index=${#input_commits[@]}-1; index>=0; index-- )); do
-    sha="${input_commits[$index]}"
-    subject="$(git --no-pager show -s --format=%s "$sha")"
-
-    case "$subject" in
-      "update"|"chore: snapshot WIP before release integrate ("*|"chore(auto-update): snapshot fork changes before release integrate ("*)
-        continue
-        ;;
-    esac
-
-    if [[ -n "${seen_subjects[$subject]+x}" ]]; then
-      continue
-    fi
-    seen_subjects["$subject"]=1
-    newest_unique+=("$sha")
-  done
-
-  for (( index=${#newest_unique[@]}-1; index>=0; index-- )); do
-    printf '%s\n' "${newest_unique[$index]}"
-  done
-}
 
 SECONDS=0
 ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
@@ -124,7 +84,23 @@ git fetch upstream --tags --prune --quiet
 git fetch origin --prune --quiet
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. Find latest stable tag
+# 3. Rebase custom-main onto upstream/main
+# ══════════════════════════════════════════════════════════════════════════════
+step "rebase custom-main onto upstream/main"
+git checkout custom-main --quiet 2>/dev/null \
+  || git checkout -b custom-main upstream/main --quiet
+
+if ! git merge-base --is-ancestor upstream/main custom-main; then
+  # Need rebase: custom-main is behind upstream/main
+  if ! git rebase upstream/main --quiet; then
+    log "WARN: rebase custom-main onto upstream/main failed; fallback to current custom-main (no rebase)"
+    git rebase --abort 2>/dev/null || true
+  fi
+fi
+log "custom-main is up-to-date with upstream/main"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4. Find latest stable tag
 # ══════════════════════════════════════════════════════════════════════════════
 LATEST_TAG="$(git tag -l 'v*' \
   | grep -E '^v[0-9]+' \
@@ -134,57 +110,17 @@ LATEST_TAG="$(git tag -l 'v*' \
 log "latest stable tag: $LATEST_TAG"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. Merge latest stable tag into custom-main
-# ══════════════════════════════════════════════════════════════════════════════
-git checkout custom-main --quiet 2>/dev/null \
-  || git checkout -b custom-main "$LATEST_TAG" --quiet
-
-if [[ "$SYNC_CUSTOM_MAIN" == "true" ]]; then
-  step "merge $LATEST_TAG into custom-main"
-  if ! git merge-base --is-ancestor "$LATEST_TAG" custom-main; then
-    merge_args=(--no-edit --no-ff "$LATEST_TAG")
-    if [[ "$CONFLICT_STRATEGY" == "prefer-custom" ]]; then
-      merge_args=(--no-edit --no-ff -X ours "$LATEST_TAG")
-    fi
-
-    if ! git merge "${merge_args[@]}" --quiet; then
-      log "WARN: merge $LATEST_TAG into custom-main failed; fallback to current custom-main (no merge)"
-      git merge --abort 2>/dev/null || true
-    fi
-  fi
-  log "custom-main sync attempt finished"
-else
-  log "skip latest-tag merge (use --sync-custom-main to enable)"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
 # 5. Collect custom-only commits
-#    Use first-parent to stay on custom-main mainline and avoid traversing
-#    historical merged side branches. Exclude commits already present on
-#    upstream/main to avoid reapplying upstream changes.
+#    These are the commits ABOVE upstream/main on custom-main.
+#    After rebase, this is exactly your custom work — typically ~11 commits,
+#    NOT hundreds. This is why the new script is fast.
 # ══════════════════════════════════════════════════════════════════════════════
 step "collecting custom commits"
 mapfile -t CUSTOM_COMMITS < <(
-  git --no-pager log --first-parent --reverse --no-merges --pretty=%H "${LATEST_TAG}..custom-main" ^upstream/main
+  git --no-pager log --reverse --no-merges --pretty=%H upstream/main..custom-main
 )
 if (( ${#CUSTOM_COMMITS[@]} == 0 )) || [[ -z "${CUSTOM_COMMITS[0]:-}" ]]; then
-  die "no custom commits found between ${LATEST_TAG} and custom-main"
-fi
-
-RAW_CUSTOM_COMMIT_COUNT="${#CUSTOM_COMMITS[@]}"
-if [[ "$AUTO_SLIM_COMMITS" == "true" ]]; then
-  mapfile -t SLIMMED_COMMITS < <(slim_commit_list_by_subject "${CUSTOM_COMMITS[@]}")
-  if (( ${#SLIMMED_COMMITS[@]} == 0 )); then
-    die "auto-slim removed all commits; run with --no-auto-slim-commits to inspect full set"
-  fi
-  if (( RAW_CUSTOM_COMMIT_COUNT != ${#SLIMMED_COMMITS[@]} )); then
-    log "auto-slim result: ${RAW_CUSTOM_COMMIT_COUNT} -> ${#SLIMMED_COMMITS[@]} commit(s)"
-  fi
-  CUSTOM_COMMITS=("${SLIMMED_COMMITS[@]}")
-fi
-
-if (( ${#CUSTOM_COMMITS[@]} > MAX_CUSTOM_COMMITS )); then
-  die "custom commit set is too large (${#CUSTOM_COMMITS[@]} > ${MAX_CUSTOM_COMMITS}); increase --max-custom-commits or pre-clean custom-main"
+  die "no custom commits found between upstream/main and custom-main"
 fi
 log "found ${#CUSTOM_COMMITS[@]} custom commit(s) to cherry-pick:"
 for sha in "${CUSTOM_COMMITS[@]}"; do
