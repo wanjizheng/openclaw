@@ -13,9 +13,14 @@ import {
   speak as speakWithContext,
   speakInitialMessage as speakInitialMessageWithContext,
 } from "./manager/outbound.js";
-import { getCallHistoryFromStore, loadActiveCallsFromStore } from "./manager/store.js";
+import {
+  getCallHistoryFromStore,
+  loadActiveCallsFromStore,
+  persistCallRecord,
+} from "./manager/store.js";
 import type { VoiceCallProvider } from "./providers/base.js";
 import type { CallId, CallRecord, NormalizedEvent, OutboundCallOptions } from "./types.js";
+import { TerminalStates } from "./types.js";
 import { resolveUserPath } from "./utils.js";
 
 function resolveDefaultStoreBase(config: VoiceCallConfig, storePath?: string): string {
@@ -79,6 +84,68 @@ export class CallManager {
     this.providerCallIdMap = persisted.providerCallIdMap;
     this.processedEventIds = persisted.processedEventIds;
     this.rejectedProviderCallIds = persisted.rejectedProviderCallIds;
+  }
+
+  /**
+   * Reconcile persisted active calls against the provider on startup.
+   *
+   * When the gateway crashes (e.g. kill -9) mid-call, the in-memory cleanup
+   * never runs and Twilio's status callback is lost because the server was
+   * down.  On restart, `loadActiveCallsFromStore()` reloads these calls as
+   * "active" even though they've long finished on the provider side.
+   *
+   * This method queries the provider for each loaded active call and marks
+   * any that are already finished as terminal, freeing the concurrent-call
+   * slot and avoiding phantom "active" calls.
+   */
+  async reconcileActiveCalls(): Promise<void> {
+    if (!this.provider?.getCallStatus) {
+      return;
+    }
+    const TWILIO_TERMINAL = new Set(["completed", "canceled", "failed", "busy", "no-answer"]);
+    const toReconcile = Array.from(this.activeCalls.values()).filter(
+      (c) => c.providerCallId && !TerminalStates.has(c.state),
+    );
+    if (toReconcile.length === 0) {
+      return;
+    }
+    console.log(
+      `[voice-call] Reconciling ${toReconcile.length} persisted active call(s) against provider`,
+    );
+    for (const call of toReconcile) {
+      try {
+        const status = await this.provider.getCallStatus(call.providerCallId!);
+        if (status && TWILIO_TERMINAL.has(status)) {
+          // Map provider status to our EndReason type
+          const reason = status === "canceled" ? "hangup-bot" : (status as CallRecord["endReason"]);
+          console.log(
+            `[voice-call] Reconciled stale call ${call.callId}: provider status="${status}" → ending locally as "${reason}"`,
+          );
+          call.state = reason as CallRecord["state"];
+          call.endedAt = Date.now();
+          call.endReason = reason;
+          call.metadata = {
+            ...call.metadata,
+            reconciledAtStartup: true,
+            reconciledProviderStatus: status,
+          };
+          persistCallRecord(this.storePath, call);
+          this.activeCalls.delete(call.callId);
+          if (call.providerCallId) {
+            this.providerCallIdMap.delete(call.providerCallId);
+          }
+        } else {
+          console.log(
+            `[voice-call] Call ${call.callId} still active on provider (status="${status ?? "unknown"}")`,
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `[voice-call] Failed to reconcile call ${call.callId}:`,
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+    }
   }
 
   /**
