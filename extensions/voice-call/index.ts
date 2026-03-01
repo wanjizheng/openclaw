@@ -11,6 +11,16 @@ import type { CoreConfig } from "./src/core-bridge.js";
 import { deleteCallAudioFiles, maybeGenerateHostedAudioUrl } from "./src/response-generator.js";
 import { createVoiceCallRuntime, type VoiceCallRuntime } from "./src/runtime.js";
 
+// ── Module-level singleton state ──────────────────────────────────────
+// The plugin loader may call register() more than once (e.g. when the
+// config cache key differs due to unresolved secret placeholders vs
+// resolved values).  By keeping the runtime state at module scope we
+// ensure all closures share the same webhook server / port binding and
+// avoid EADDRINUSE when a second closure tries to create a new runtime.
+let _runtimePromise: Promise<VoiceCallRuntime> | null = null;
+let _runtime: VoiceCallRuntime | null = null;
+let _stopPromise: Promise<void> | null = null;
+
 const voiceCallConfigSchema = {
   parse(value: unknown): VoiceCallConfig {
     const raw =
@@ -161,12 +171,6 @@ const voiceCallPlugin = {
       }
     }
 
-    let runtimePromise: Promise<VoiceCallRuntime> | null = null;
-    let runtime: VoiceCallRuntime | null = null;
-    // Track in-flight stop so ensureRuntime() waits for the port to be
-    // released before trying to create a new runtime (prevents EADDRINUSE).
-    let stopPromise: Promise<void> | null = null;
-
     const ensureRuntime = async () => {
       if (!config.enabled) {
         throw new Error("Voice call disabled in plugin config");
@@ -176,17 +180,17 @@ const voiceCallPlugin = {
       }
       // If a stop is in flight, wait for it to finish so the port is freed
       // before we attempt to bind a new server.
-      if (stopPromise) {
-        await stopPromise;
+      if (_stopPromise) {
+        await _stopPromise;
       }
-      if (runtime) {
-        return runtime;
+      if (_runtime) {
+        return _runtime;
       }
-      if (!runtimePromise) {
+      if (!_runtimePromise) {
         console.log(
-          `[voice-call] ensureRuntime: creating new runtime (runtime=${runtime}, runtimePromise=${runtimePromise})`,
+          `[voice-call] ensureRuntime: creating new runtime (_runtime=${_runtime}, _runtimePromise=${_runtimePromise})`,
         );
-        runtimePromise = createVoiceCallRuntime({
+        _runtimePromise = createVoiceCallRuntime({
           config,
           coreConfig: api.config as CoreConfig,
           ttsRuntime: api.runtime.tts,
@@ -194,16 +198,18 @@ const voiceCallPlugin = {
         });
       }
       try {
-        runtime = await runtimePromise;
+        _runtime = await _runtimePromise;
       } catch (err) {
         // Clear the rejected promise so the next call can retry
         // instead of being stuck on the same cached rejection.
-        runtimePromise = null;
+        _runtimePromise = null;
         // For EADDRINUSE, provide a friendlier error message so the
         // AI agent doesn't try to kill the process holding the port
         // (which is its own gateway process).
         const isAddrInUse =
-          err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "EADDRINUSE";
+          err instanceof Error &&
+          "code" in err &&
+          (err as NodeJS.ErrnoException).code === "EADDRINUSE";
         if (isAddrInUse) {
           throw new Error(
             "Voice call webhook server is already running on another instance. " +
@@ -213,7 +219,7 @@ const voiceCallPlugin = {
         }
         throw err;
       }
-      return runtime;
+      return _runtime;
     };
 
     const sendError = (respond: (ok: boolean, payload?: unknown) => void, err: unknown) => {
@@ -807,22 +813,22 @@ const voiceCallPlugin = {
         }
       },
       stop: async () => {
-        if (!runtimePromise) {
+        if (!_runtimePromise) {
           return;
         }
-        stopPromise = (async () => {
+        _stopPromise = (async () => {
           try {
-            const rt = await runtimePromise;
+            const rt = await _runtimePromise;
             await rt.stop();
           } finally {
-            runtimePromise = null;
-            runtime = null;
+            _runtimePromise = null;
+            _runtime = null;
           }
         })();
         try {
-          await stopPromise;
+          await _stopPromise;
         } finally {
-          stopPromise = null;
+          _stopPromise = null;
         }
       },
     });
