@@ -94,7 +94,7 @@ slim_commit_list_by_subject() {
     subject="$(git --no-pager show -s --format=%s "$sha")"
 
     case "$subject" in
-      "update"|"chore: snapshot WIP before release integrate ("*|"chore(auto-update): snapshot fork changes before release integrate ("*)
+      "chore: snapshot WIP before release integrate ("*|"chore(auto-update): snapshot fork changes before release integrate ("*)
         continue
         ;;
     esac
