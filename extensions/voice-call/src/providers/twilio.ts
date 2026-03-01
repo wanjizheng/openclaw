@@ -1073,7 +1073,7 @@ ${nextStepXml}
     return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <ConversationRelay url="${escapeXml(wsUrl)}" language="multi" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true"${greetingAttr} />
+    <ConversationRelay url="${escapeXml(wsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true"${greetingAttr} />
   </Connect>
 </Response>`;
   }
