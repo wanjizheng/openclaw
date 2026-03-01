@@ -9,11 +9,27 @@ if [ "$(git branch --show-current)" != "custom-main" ]; then
   git checkout custom-main
 fi
 
-echo "[step] fetch upstream"
-git fetch upstream
+echo "[step] fetch upstream tags"
+git fetch upstream --tags --prune
 
-echo "[step] rebase custom-main onto upstream/main"
-git rebase upstream/main
+LATEST_TAG="$({ git tag -l 'v*' | grep -E '^v[0-9]+' | grep -Evi 'alpha|beta|rc|pre' | sort -V | tail -n 1; } || true)"
+if [[ -z "$LATEST_TAG" ]]; then
+  echo "[error] no stable upstream tag found"
+  exit 1
+fi
+
+echo "[info] latest stable tag: $LATEST_TAG"
+
+if git merge-base --is-ancestor "$LATEST_TAG" custom-main; then
+  echo "[ok] custom-main already contains $LATEST_TAG"
+else
+  echo "[step] merge $LATEST_TAG into custom-main (preserve custom history)"
+  if ! git merge --no-edit --no-ff -X ours "$LATEST_TAG"; then
+    echo "[error] merge failed; aborting"
+    git merge --abort || true
+    exit 1
+  fi
+fi
 
 echo "[ok] update complete"
 git --no-pager log --oneline --decorate --max-count=8
