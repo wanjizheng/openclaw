@@ -126,8 +126,6 @@ git fetch origin --prune --quiet
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. Find latest stable tag
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. Find latest stable tag
-# ══════════════════════════════════════════════════════════════════════════════
 LATEST_TAG="$(git tag -l 'v*' \
   | grep -E '^v[0-9]+' \
   | grep -Evi 'alpha|beta|rc|pre' \
@@ -161,18 +159,19 @@ fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. Collect custom-only commits
-#    These are the commits ABOVE latest stable tag on custom-main.
+#    Use first-parent to stay on custom-main mainline and avoid traversing
+#    historical merged side branches.
 # ══════════════════════════════════════════════════════════════════════════════
 step "collecting custom commits"
 mapfile -t CUSTOM_COMMITS < <(
-  git --no-pager log --reverse --no-merges --pretty=%H "${LATEST_TAG}..custom-main"
+  git --no-pager log --first-parent --reverse --no-merges --pretty=%H "${LATEST_TAG}..custom-main"
 )
 if (( ${#CUSTOM_COMMITS[@]} == 0 )) || [[ -z "${CUSTOM_COMMITS[0]:-}" ]]; then
   die "no custom commits found between ${LATEST_TAG} and custom-main"
 fi
 
 if [[ "$AUTO_SLIM_COMMITS" == "true" ]] && (( ${#CUSTOM_COMMITS[@]} > MAX_CUSTOM_COMMITS )); then
-  log "WARN: large commit set detected (${#CUSTOM_COMMITS[@]} > ${MAX_CUSTOM_COMMITS}); auto-slimming by unique subject"
+  log "WARN: large mainline commit set detected (${#CUSTOM_COMMITS[@]} > ${MAX_CUSTOM_COMMITS}); auto-slimming by unique subject"
   mapfile -t SLIMMED_COMMITS < <(slim_commit_list_by_subject "${CUSTOM_COMMITS[@]}")
   if (( ${#SLIMMED_COMMITS[@]} == 0 )); then
     die "auto-slim removed all commits; run with --no-auto-slim-commits to inspect full set"
