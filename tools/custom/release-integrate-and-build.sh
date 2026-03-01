@@ -72,11 +72,24 @@ done
 
 slim_commit_list_by_subject() {
   local -a input_commits=("$@")
-  local -A seen_subjects=()
-  local -a newest_unique=()
+  local -A chosen_sha_by_subject=()
+  local -A chosen_score_by_subject=()
+  local -A emitted_subject=()
 
-  local index sha subject
-  for (( index=${#input_commits[@]}-1; index>=0; index-- )); do
+  commit_change_score() {
+    local commit_sha="$1"
+    git --no-pager show --numstat --format= --no-renames "$commit_sha" \
+      | awk '{
+          add=$1; del=$2;
+          if (add == "-") add=0;
+          if (del == "-") del=0;
+          score += add + del;
+        }
+        END { print score + 0 }'
+  }
+
+  local index sha subject score current_best
+  for (( index=0; index<${#input_commits[@]}; index++ )); do
     sha="${input_commits[$index]}"
     subject="$(git --no-pager show -s --format=%s "$sha")"
 
@@ -86,15 +99,21 @@ slim_commit_list_by_subject() {
         ;;
     esac
 
-    if [[ -n "${seen_subjects[$subject]+x}" ]]; then
-      continue
+    score="$(commit_change_score "$sha")"
+    current_best="${chosen_score_by_subject[$subject]:--1}"
+    if (( score > current_best )); then
+      chosen_score_by_subject["$subject"]="$score"
+      chosen_sha_by_subject["$subject"]="$sha"
     fi
-    seen_subjects["$subject"]=1
-    newest_unique+=("$sha")
   done
 
-  for (( index=${#newest_unique[@]}-1; index>=0; index-- )); do
-    printf '%s\n' "${newest_unique[$index]}"
+  for sha in "${input_commits[@]}"; do
+    subject="$(git --no-pager show -s --format=%s "$sha")"
+    [[ -n "${chosen_sha_by_subject[$subject]+x}" ]] || continue
+    if [[ "${chosen_sha_by_subject[$subject]}" == "$sha" && -z "${emitted_subject[$subject]+x}" ]]; then
+      printf '%s\n' "$sha"
+      emitted_subject["$subject"]=1
+    fi
   done
 }
 
