@@ -65,4 +65,13 @@ export interface VoiceCallProvider {
    * Stop listening for user speech (deactivate STT).
    */
   stopListening(input: StopListeningInput): Promise<void>;
+
+  /**
+   * Query the provider for the current status of a call.
+   * Returns the provider-specific status string (e.g. "completed", "in-progress"),
+   * or null if the provider doesn't support this or the call wasn't found.
+   *
+   * Used at startup to reconcile persisted active-call state against the provider.
+   */
+  getCallStatus?(providerCallId: string): Promise<string | null>;
 }
