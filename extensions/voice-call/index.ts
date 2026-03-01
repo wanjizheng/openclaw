@@ -182,7 +182,14 @@ const voiceCallPlugin = {
           logger: api.logger,
         });
       }
-      runtime = await runtimePromise;
+      try {
+        runtime = await runtimePromise;
+      } catch (err) {
+        // Clear the rejected promise so the next call can retry
+        // instead of being stuck on the same cached rejection.
+        runtimePromise = null;
+        throw err;
+      }
       return runtime;
     };
 
