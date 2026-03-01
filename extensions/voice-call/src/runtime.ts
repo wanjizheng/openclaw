@@ -191,6 +191,12 @@ export async function createVoiceCallRuntime(params: {
 
   manager.initialize(provider, webhookUrl);
 
+  // Reconcile persisted active calls against the provider.
+  // After a crash, stale calls remain in calls.jsonl as "active" even though
+  // they've already ended on the provider side.  This check frees those slots
+  // so maxConcurrentCalls doesn't block new calls.
+  await manager.reconcileActiveCalls();
+
   // WORKFLOW_AUTO: Pre-generate inbound greeting audio for instant playback
   // when someone calls the bot.  Fire-and-forget so it doesn't block startup.
   webhookServer.preGenerateInboundGreeting();
