@@ -56,6 +56,12 @@ function isEndCallIntent(text: string): boolean {
   return END_CALL_KEYWORDS.some((keyword) => compact.includes(keyword));
 }
 
+function estimateTtsPlaybackMs(text: string): number {
+  const compactChars = text.replace(/\s+/g, "").length;
+  const estimated = compactChars * 220;
+  return Math.max(1200, Math.min(8000, estimated));
+}
+
 /**
  * HTTP server for receiving voice call webhooks from providers.
  * Supports WebSocket upgrades for media streams when streaming is enabled.
@@ -722,6 +728,11 @@ export class VoiceCallWebhookServer {
     }
 
     if (endAfterSpeak) {
+      const waitMs =
+        estimateTtsPlaybackMs(text) +
+        Math.max(800, Math.round(this.config.outbound.notifyHangupDelaySec * 1000));
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+
       const endResult = await this.manager.endCall(callId);
       if (!endResult.success) {
         console.warn(
