@@ -601,6 +601,34 @@ const voiceCallPlugin = {
             // path which previously skipped this).
             void deleteCallAudioFiles(call.callId).catch(() => {});
 
+            // Delete the per-call session file to free disk space
+            void (async () => {
+              try {
+                const { loadCoreAgentDeps } = await import("./src/core-bridge.js");
+                const nodeFsp = require("node:fs/promises") as typeof import("node:fs/promises");
+                const deps = await loadCoreAgentDeps();
+                const cfg = api.config as CoreConfig;
+                const agentId = "main";
+                const storePath = deps.resolveStorePath(cfg.session?.store, { agentId });
+                const sessionStore = deps.loadSessionStore(storePath);
+                const sessionKey = `voice:${call.callId}`;
+                const entry = sessionStore[sessionKey] as
+                  | { sessionId: string; updatedAt: number }
+                  | undefined;
+                if (entry) {
+                  const sessionFile = deps.resolveSessionFilePath(entry.sessionId, entry, {
+                    agentId,
+                  });
+                  delete sessionStore[sessionKey];
+                  await deps.saveSessionStore(storePath, sessionStore);
+                  await nodeFsp.unlink(sessionFile).catch(() => {});
+                  console.log(`[voice-call] Deleted per-call session for ${call.callId}`);
+                }
+              } catch {
+                // Non-fatal — session cleanup failure should not affect call flow
+              }
+            })();
+
             void (async () => {
               try {
                 const nodePath = require("node:path") as typeof import("node:path");
