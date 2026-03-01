@@ -1,6 +1,4 @@
 import type {
-  GetCallStatusInput,
-  GetCallStatusResult,
   HangupCallInput,
   InitiateCallInput,
   InitiateCallResult,
@@ -69,10 +67,11 @@ export interface VoiceCallProvider {
   stopListening(input: StopListeningInput): Promise<void>;
 
   /**
-   * Query provider for current call status.
-   * Used to verify persisted calls are still active on restart.
-   * Must return `isUnknown: true` for transient errors (network, 5xx)
-   * so the caller can keep the call and rely on timer-based fallback.
+   * Query the provider for the current status of a call.
+   * Returns the provider-specific status string (e.g. "completed", "in-progress"),
+   * or null if the provider doesn't support this or the call wasn't found.
+   *
+   * Used at startup to reconcile persisted active-call state against the provider.
    */
-  getCallStatus(input: GetCallStatusInput): Promise<GetCallStatusResult>;
+  getCallStatus?(providerCallId: string): Promise<string | null>;
 }

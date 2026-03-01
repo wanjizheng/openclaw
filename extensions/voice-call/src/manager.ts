@@ -13,16 +13,14 @@ import {
   speak as speakWithContext,
   speakInitialMessage as speakInitialMessageWithContext,
 } from "./manager/outbound.js";
-import { getCallHistoryFromStore, loadActiveCallsFromStore } from "./manager/store.js";
-import { startMaxDurationTimer } from "./manager/timers.js";
-import type { VoiceCallProvider } from "./providers/base.js";
 import {
-  TerminalStates,
-  type CallId,
-  type CallRecord,
-  type NormalizedEvent,
-  type OutboundCallOptions,
-} from "./types.js";
+  getCallHistoryFromStore,
+  loadActiveCallsFromStore,
+  persistCallRecord,
+} from "./manager/store.js";
+import type { VoiceCallProvider } from "./providers/base.js";
+import type { CallId, CallRecord, NormalizedEvent, OutboundCallOptions } from "./types.js";
+import { TerminalStates } from "./types.js";
 import { resolveUserPath } from "./utils.js";
 
 function resolveDefaultStoreBase(config: VoiceCallConfig, storePath?: string): string {
@@ -74,126 +72,80 @@ export class CallManager {
 
   /**
    * Initialize the call manager with a provider.
-   * Verifies persisted calls with the provider and restarts timers.
    */
-  async initialize(provider: VoiceCallProvider, webhookUrl: string): Promise<void> {
+  initialize(provider: VoiceCallProvider, webhookUrl: string): void {
     this.provider = provider;
     this.webhookUrl = webhookUrl;
 
     fs.mkdirSync(this.storePath, { recursive: true });
 
     const persisted = loadActiveCallsFromStore(this.storePath);
+    this.activeCalls = persisted.activeCalls;
+    this.providerCallIdMap = persisted.providerCallIdMap;
     this.processedEventIds = persisted.processedEventIds;
     this.rejectedProviderCallIds = persisted.rejectedProviderCallIds;
-
-    const verified = await this.verifyRestoredCalls(provider, persisted.activeCalls);
-    this.activeCalls = verified;
-
-    // Rebuild providerCallIdMap from verified calls only
-    this.providerCallIdMap = new Map();
-    for (const [callId, call] of verified) {
-      if (call.providerCallId) {
-        this.providerCallIdMap.set(call.providerCallId, callId);
-      }
-    }
-
-    // Restart max-duration timers for restored calls that are past the answered state
-    for (const [callId, call] of verified) {
-      if (call.answeredAt && !TerminalStates.has(call.state)) {
-        const elapsed = Date.now() - call.answeredAt;
-        const maxDurationMs = this.config.maxDurationSeconds * 1000;
-        if (elapsed >= maxDurationMs) {
-          // Already expired — remove instead of keeping
-          verified.delete(callId);
-          if (call.providerCallId) {
-            this.providerCallIdMap.delete(call.providerCallId);
-          }
-          console.log(
-            `[voice-call] Skipping restored call ${callId} (max duration already elapsed)`,
-          );
-          continue;
-        }
-        startMaxDurationTimer({
-          ctx: this.getContext(),
-          callId,
-          onTimeout: async (id) => {
-            await endCallWithContext(this.getContext(), id);
-          },
-        });
-        console.log(`[voice-call] Restarted max-duration timer for restored call ${callId}`);
-      }
-    }
-
-    if (verified.size > 0) {
-      console.log(`[voice-call] Restored ${verified.size} active call(s) from store`);
-    }
   }
 
   /**
-   * Verify persisted calls with the provider before restoring.
-   * Calls without providerCallId or older than maxDurationSeconds are skipped.
-   * Transient provider errors keep the call (rely on timer fallback).
+   * Reconcile persisted active calls against the provider on startup.
+   *
+   * When the gateway crashes (e.g. kill -9) mid-call, the in-memory cleanup
+   * never runs and Twilio's status callback is lost because the server was
+   * down.  On restart, `loadActiveCallsFromStore()` reloads these calls as
+   * "active" even though they've long finished on the provider side.
+   *
+   * This method queries the provider for each loaded active call and marks
+   * any that are already finished as terminal, freeing the concurrent-call
+   * slot and avoiding phantom "active" calls.
    */
-  private async verifyRestoredCalls(
-    provider: VoiceCallProvider,
-    candidates: Map<CallId, CallRecord>,
-  ): Promise<Map<CallId, CallRecord>> {
-    if (candidates.size === 0) {
-      return new Map();
+  async reconcileActiveCalls(): Promise<void> {
+    if (!this.provider?.getCallStatus) {
+      return;
     }
-
-    const maxAgeMs = this.config.maxDurationSeconds * 1000;
-    const now = Date.now();
-    const verified = new Map<CallId, CallRecord>();
-    const verifyTasks: Array<{ callId: CallId; call: CallRecord; promise: Promise<void> }> = [];
-
-    for (const [callId, call] of candidates) {
-      // Skip calls without a provider ID — can't verify
-      if (!call.providerCallId) {
-        console.log(`[voice-call] Skipping restored call ${callId} (no providerCallId)`);
-        continue;
-      }
-
-      // Skip calls older than maxDurationSeconds (time-based fallback)
-      if (now - call.startedAt > maxAgeMs) {
-        console.log(
-          `[voice-call] Skipping restored call ${callId} (older than maxDurationSeconds)`,
+    const TWILIO_TERMINAL = new Set(["completed", "canceled", "failed", "busy", "no-answer"]);
+    const toReconcile = Array.from(this.activeCalls.values()).filter(
+      (c) => c.providerCallId && !TerminalStates.has(c.state),
+    );
+    if (toReconcile.length === 0) {
+      return;
+    }
+    console.log(
+      `[voice-call] Reconciling ${toReconcile.length} persisted active call(s) against provider`,
+    );
+    for (const call of toReconcile) {
+      try {
+        const status = await this.provider.getCallStatus(call.providerCallId!);
+        if (status && TWILIO_TERMINAL.has(status)) {
+          // Map provider status to our EndReason type
+          const reason = status === "canceled" ? "hangup-bot" : (status as CallRecord["endReason"]);
+          console.log(
+            `[voice-call] Reconciled stale call ${call.callId}: provider status="${status}" → ending locally as "${reason}"`,
+          );
+          call.state = reason as CallRecord["state"];
+          call.endedAt = Date.now();
+          call.endReason = reason;
+          call.metadata = {
+            ...call.metadata,
+            reconciledAtStartup: true,
+            reconciledProviderStatus: status,
+          };
+          persistCallRecord(this.storePath, call);
+          this.activeCalls.delete(call.callId);
+          if (call.providerCallId) {
+            this.providerCallIdMap.delete(call.providerCallId);
+          }
+        } else {
+          console.log(
+            `[voice-call] Call ${call.callId} still active on provider (status="${status ?? "unknown"}")`,
+          );
+        }
+      } catch (err) {
+        console.warn(
+          `[voice-call] Failed to reconcile call ${call.callId}:`,
+          err instanceof Error ? err.message : String(err),
         );
-        continue;
       }
-
-      const task = {
-        callId,
-        call,
-        promise: provider
-          .getCallStatus({ providerCallId: call.providerCallId })
-          .then((result) => {
-            if (result.isTerminal) {
-              console.log(
-                `[voice-call] Skipping restored call ${callId} (provider status: ${result.status})`,
-              );
-            } else if (result.isUnknown) {
-              console.log(
-                `[voice-call] Keeping restored call ${callId} (provider status unknown, relying on timer)`,
-              );
-              verified.set(callId, call);
-            } else {
-              verified.set(callId, call);
-            }
-          })
-          .catch(() => {
-            // Verification failed entirely — keep the call, rely on timer
-            console.log(
-              `[voice-call] Keeping restored call ${callId} (verification failed, relying on timer)`,
-            );
-            verified.set(callId, call);
-          }),
-      };
-      verifyTasks.push(task);
     }
-
-    await Promise.allSettled(verifyTasks.map((t) => t.promise));
-    return verified;
   }
 
   /**
@@ -305,6 +257,12 @@ export class CallManager {
     }
 
     if (!this.provider || !call.providerCallId) {
+      return;
+    }
+
+    // Twilio has provider-specific state for speaking (<Say> fallback) and can
+    // fail for inbound calls; keep existing Twilio behavior unchanged.
+    if (this.provider.name === "twilio") {
       return;
     }
 
