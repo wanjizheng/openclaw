@@ -4,9 +4,9 @@
 # Workflow (matches user requirement exactly):
 #   1. Save any dirty worktree changes
 #   2. Fetch upstream + tags
-#   3. Rebase custom-main onto upstream/main (keep only custom commits on top)
-#   4. Find latest stable release tag (e.g. v2026.2.26)
-#   5. Collect ONLY the custom commits (upstream/main..custom-main)
+#   3. Find latest stable release tag (e.g. v2026.2.26)
+#   4. Merge latest stable tag into custom-main (preserve custom-main history)
+#   5. Collect ONLY the custom commits (<latest-tag>..custom-main)
 #   6. Create release-custom/<tag> from that tag + cherry-pick custom commits
 #   7. Build (pnpm install + build + ui:build)
 #   8. Deploy built artifacts to global install + refresh gateway service + restart
@@ -124,24 +124,7 @@ git fetch upstream --tags --prune --quiet
 git fetch origin --prune --quiet
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. Rebase custom-main onto upstream/main
-# ══════════════════════════════════════════════════════════════════════════════
-git checkout custom-main --quiet 2>/dev/null \
-  || git checkout -b custom-main upstream/main --quiet
-
-if [[ "$SYNC_CUSTOM_MAIN" == "true" ]]; then
-  step "rebase custom-main onto upstream/main"
-  if ! git merge-base --is-ancestor upstream/main custom-main; then
-    if ! git rebase upstream/main --quiet; then
-      log "WARN: rebase custom-main onto upstream/main failed; fallback to current custom-main (no rebase)"
-      git rebase --abort 2>/dev/null || true
-    fi
-  fi
-  log "custom-main sync attempt finished"
-else
-  log "skip upstream/main rebase (use --sync-custom-main to enable)"
-fi
-
+# 3. Find latest stable tag
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. Find latest stable tag
 # ══════════════════════════════════════════════════════════════════════════════
@@ -153,10 +136,32 @@ LATEST_TAG="$(git tag -l 'v*' \
 log "latest stable tag: $LATEST_TAG"
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 4. Merge latest stable tag into custom-main
+# ══════════════════════════════════════════════════════════════════════════════
+git checkout custom-main --quiet 2>/dev/null \
+  || git checkout -b custom-main "$LATEST_TAG" --quiet
+
+if [[ "$SYNC_CUSTOM_MAIN" == "true" ]]; then
+  step "merge $LATEST_TAG into custom-main"
+  if ! git merge-base --is-ancestor "$LATEST_TAG" custom-main; then
+    merge_args=(--no-edit --no-ff "$LATEST_TAG")
+    if [[ "$CONFLICT_STRATEGY" == "prefer-custom" ]]; then
+      merge_args=(--no-edit --no-ff -X ours "$LATEST_TAG")
+    fi
+
+    if ! git merge "${merge_args[@]}" --quiet; then
+      log "WARN: merge $LATEST_TAG into custom-main failed; fallback to current custom-main (no merge)"
+      git merge --abort 2>/dev/null || true
+    fi
+  fi
+  log "custom-main sync attempt finished"
+else
+  log "skip latest-tag merge (use --sync-custom-main to enable)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 5. Collect custom-only commits
-#    These are the commits ABOVE upstream/main on custom-main.
-#    After rebase, this is exactly your custom work — typically ~11 commits,
-#    NOT hundreds. This is why the new script is fast.
+#    These are the commits ABOVE latest stable tag on custom-main.
 # ══════════════════════════════════════════════════════════════════════════════
 step "collecting custom commits"
 mapfile -t CUSTOM_COMMITS < <(
