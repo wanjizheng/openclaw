@@ -202,6 +202,29 @@ is_protected_custom_script_path() {
     || [[ "$file_path" == "tools/custom/status.sh" ]]
 }
 
+sync_protected_scripts_from_custom_main() {
+  local changed=0
+  local script_path
+  for script_path in \
+    tools/custom/release-integrate-and-build.sh \
+    tools/custom/update-upstream.sh \
+    tools/custom/status.sh; do
+    if git ls-tree -r --name-only custom-main -- "$script_path" | grep -q .; then
+      git checkout custom-main -- "$script_path" 2>/dev/null || true
+      git add "$script_path" 2>/dev/null || true
+      changed=1
+    fi
+  done
+
+  if [[ "$changed" -eq 1 ]] && ! git diff --cached --quiet 2>/dev/null; then
+    git -c core.hooksPath=/dev/null commit \
+      -m "chore(custom): keep protected helper scripts from custom-main" \
+      --no-verify 2>/dev/null || true
+  else
+    git reset 2>/dev/null || true
+  fi
+}
+
 FILTERED_CUSTOM_COMMITS=()
 for sha in "${CUSTOM_COMMITS[@]}"; do
   subject="$(git --no-pager show -s --format=%s "$sha")"
@@ -289,6 +312,9 @@ cherry_pick_one() {
 for sha in "${CUSTOM_COMMITS[@]}"; do
   cherry_pick_one "$sha"
 done
+
+sync_protected_scripts_from_custom_main
+
 log "cherry-pick complete ($(elapsed))"
 
 # ══════════════════════════════════════════════════════════════════════════════
