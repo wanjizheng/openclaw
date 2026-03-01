@@ -90,12 +90,16 @@ export type VoiceResponseParams = {
   transcript: Array<{ speaker: "user" | "bot"; text: string }>;
   /** Latest user message */
   userMessage: string;
+  /** Original reason/purpose for this outbound call (e.g. the instruction that triggered it) */
+  callReason?: string;
 };
 
 export type VoiceResponseResult = {
   text: string | null;
   audioUrl?: string;
   error?: string;
+  /** True when the LLM included [END_CALL] in its response, signalling it wants to hang up */
+  endCall?: boolean;
 };
 
 type SessionEntry = {
@@ -206,6 +210,9 @@ export async function generateVoiceResponse(
   if (callerInfo) {
     systemCore += `\n\n${callerName ?? from}的个人信息：\n${callerInfo}`;
   }
+  if (params.callReason) {
+    systemCore += `\n\n【本次通话的目的/背景】${params.callReason}`;
+  }
 
   let extraSystemPrompt = systemCore;
   if (transcript.length > 0) {
@@ -225,9 +232,8 @@ export async function generateVoiceResponse(
       sessionId,
       sessionKey,
       messageProvider: "voice",
-      disableMessageTool: true,
       disableTools: true,
-      promptMode: "none",
+      promptMode: "minimal",
       sessionFile,
       workspaceDir,
       config: cfg,
@@ -258,6 +264,13 @@ export async function generateVoiceResponse(
       text = stripDsmlMarkup(text) || null;
     }
 
+    // Detect and strip [END_CALL] marker before TTS (don't speak the tag aloud)
+    let endCall = false;
+    if (text && /\[END_CALL\]/i.test(text)) {
+      endCall = true;
+      text = text.replace(/\[END_CALL\]/gi, "").trim() || null;
+    }
+
     if (!text && result.meta?.aborted) {
       return { text: null, error: "Response generation was aborted" };
     }
@@ -277,7 +290,7 @@ export async function generateVoiceResponse(
       );
     }
 
-    return { text, audioUrl };
+    return { text, audioUrl, endCall };
   } catch (err) {
     console.error(`[voice-call] Response generation failed:`, err);
     return { text: null, error: String(err) };
@@ -364,7 +377,7 @@ export async function generateGreetingText(params: {
       messageProvider: "voice",
       disableMessageTool: true,
       disableTools: true,
-      promptMode: "none",
+      promptMode: "minimal",
       sessionFile,
       workspaceDir,
       config: cfg,

@@ -22,40 +22,6 @@ import { startStaleCallReaper } from "./webhook/stale-call-reaper.js";
 
 const MAX_WEBHOOK_BODY_BYTES = 1024 * 1024;
 
-const END_CALL_KEYWORDS = [
-  "没了",
-  "沒有了",
-  "没有了",
-  "没有问题了",
-  "先这样",
-  "先這樣",
-  "就这样",
-  "就這樣",
-  "挂了",
-  "掛了",
-  "挂断",
-  "掛斷",
-  "结束通话",
-  "結束通話",
-  "再见",
-  "再見",
-  "拜拜",
-  "掰掰",
-  "白白",
-  "謝謝",
-  "谢谢",
-];
-
-function isEndCallIntent(text: string): boolean {
-  const lower = text.toLowerCase();
-  if (/(^|\b)(bye|goodbye|hang\s*up|end\s*call)(\b|$)/i.test(lower)) {
-    return true;
-  }
-
-  const compact = lower.replace(/\s+/g, "");
-  return END_CALL_KEYWORDS.some((keyword) => compact.includes(keyword));
-}
-
 /**
  * HTTP server for receiving voice call webhooks from providers.
  * Supports WebSocket upgrades for media streams when streaming is enabled.
@@ -72,8 +38,6 @@ export class VoiceCallWebhookServer {
   private mediaStreamHandler: MediaStreamHandler | null = null;
   private inFlightAutoResponses = new Set<string>();
   private pendingAutoResponses = new Map<string, string>();
-  /** Calls already flagged for early end-intent hangup from partial transcript */
-  private earlyEndIntentCalls = new Set<string>();
   /** Provider call IDs currently playing initial greeting — transcripts are discarded to avoid echo */
   private greetingCalls = new Set<string>();
   /** Pre-generated audio URLs for inbound contact greetings, keyed by normalised phone digits */
@@ -298,20 +262,6 @@ export class VoiceCallWebhookServer {
       },
       onPartialTranscript: (providerCallId, partial) => {
         console.log(`[voice-call] Partial for ${providerCallId}: ${partial}`);
-
-        // Early end-intent detection from partial transcript
-        if (isEndCallIntent(partial)) {
-          const call = this.manager.getCallByProviderCallId(providerCallId);
-          if (call && !this.earlyEndIntentCalls.has(call.callId)) {
-            this.earlyEndIntentCalls.add(call.callId);
-            console.log(
-              `[voice-call] Early end-intent from partial for ${call.callId}: "${partial}"`,
-            );
-            void this.trySpeakFallback(call.callId, "好的，拜拜。", true).catch((err) => {
-              console.warn(`[voice-call] Failed early end-intent hangup:`, err);
-            });
-          }
-        }
       },
       onConnect: (callId, streamSid) => {
         console.log(`[voice-call] Media stream connected: ${callId} -> ${streamSid}`);
@@ -577,7 +527,6 @@ export class VoiceCallWebhookServer {
           if (event.type === "call.ended") {
             this.pendingAutoResponses.delete(event.callId);
             this.inFlightAutoResponses.delete(event.callId);
-            this.earlyEndIntentCalls.delete(event.callId);
             // Audio file cleanup is handled by the onCallEnded hook.
           }
         } catch (err) {
@@ -667,18 +616,6 @@ export class VoiceCallWebhookServer {
       return;
     }
 
-    // Skip if early end-intent already triggered from partial transcript
-    if (this.earlyEndIntentCalls.has(callId)) {
-      console.log(`[voice-call] Skipping for ${callId}: early end-intent already triggered`);
-      return;
-    }
-
-    if (isEndCallIntent(userMessage)) {
-      console.log(`[voice-call] End-call intent detected for ${callId}; hanging up immediately`);
-      await this.trySpeakFallback(callId, "好的，拜拜。", true);
-      return;
-    }
-
     try {
       const { generateVoiceResponse } = await import("./response-generator.js");
 
@@ -697,6 +634,10 @@ export class VoiceCallWebhookServer {
         direction: call.direction as "inbound" | "outbound",
         transcript: call.transcript,
         userMessage,
+        callReason:
+          call.direction === "outbound" && typeof call.metadata?.initialMessage === "string"
+            ? call.metadata.initialMessage.trim() || undefined
+            : undefined,
       });
       const genMs = Date.now() - genStart;
 
@@ -713,7 +654,12 @@ export class VoiceCallWebhookServer {
         return;
       }
 
-      console.log(`[voice-call] AI response (${genMs}ms): "${result.text}"`);
+      const shouldEndCall = result.endCall === true;
+      console.log(
+        `[voice-call] AI response (${genMs}ms): "${result.text}"${
+          shouldEndCall ? " [END_CALL]" : ""
+        }`,
+      );
       if (result.audioUrl) {
         console.log(`[voice-call] Hosted audio ready: ${result.audioUrl}`);
       }
@@ -731,6 +677,14 @@ export class VoiceCallWebhookServer {
         console.log(
           `[voice-call] Speak completed for ${callId} in ${speakMs}ms (total: ${genMs + speakMs}ms)`,
         );
+        if (shouldEndCall) {
+          console.log(`[voice-call] LLM signaled [END_CALL] for ${callId}, hanging up in 4s...`);
+          await new Promise((resolve) => setTimeout(resolve, 4000));
+          const endResult = await this.manager.endCall(callId);
+          if (!endResult.success) {
+            console.warn(`[voice-call] Failed to end call ${callId}: ${endResult.error}`);
+          }
+        }
       }
     } catch (err) {
       console.error(`[voice-call] Auto-response error:`, err);

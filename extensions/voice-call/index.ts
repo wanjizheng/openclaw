@@ -753,7 +753,8 @@ const voiceCallPlugin = {
                     /[^\w\u4e00-\u9fff-]/g,
                     "",
                   );
-                  const fileName = `${dateStr}-${timeStr}-${nameTag}.md`;
+                  const dirPrefix = isInbound ? "IN" : "OUT";
+                  const fileName = `${dirPrefix}-${dateStr}-${timeStr}-${nameTag}.md`;
                   const filePath = nodePath.join(logsDir, fileName);
 
                   await nodeFsp.writeFile(filePath, reportMd + "\n", "utf-8");
@@ -784,7 +785,7 @@ const voiceCallPlugin = {
 
                   // Discord message uses simpler format (no markdown headings)
                   const discordLines = [
-                    `📞 **来电通话已结束**`,
+                    `📞 **来电通话已结束**（此消息为自动通话记录，无需操作或回复）`,
                     `**来电方：** ${callerLabel}`,
                     `**时长：** ${durationStr}`,
                     `**结束原因：** ${call.endReason ?? "未知"}`,
