@@ -13,52 +13,6 @@ import type { VoiceCallConfig } from "./config.js";
 import { findContactByPhone, loadContactsFileAsync } from "./contact-file.js";
 import { loadCoreAgentDeps, loadCoreTtsDeps, type CoreConfig } from "./core-bridge.js";
 
-/**
- * Strip DeepSeek DSML function-call markup from LLM output.
- * When DeepSeek has no tools registered, it sometimes hallucinates its native
- * DSML XML format as raw text.  This extracts the actual speech text from
- * patterns like `sag speak ... "actual text here"` or invoke blocks with
- * tool names like `speak_to_user`.
- */
-function stripDsmlMarkup(raw: string): string {
-  // If the response doesn't contain DSML markers or known tool names, return as-is
-  if (!raw.includes("DSML") && !raw.includes("function_calls") && !raw.includes("speak_to_user")) {
-    return raw;
-  }
-
-  // Try to extract the quoted text from sag speak commands
-  const sagSpeakPattern = /sag\s+speak\b[^"]*"([^"]+)"/g;
-  const matches: string[] = [];
-  let match: RegExpExecArray | null;
-  while ((match = sagSpeakPattern.exec(raw)) !== null) {
-    matches.push(match[1].trim());
-  }
-
-  if (matches.length > 0) {
-    console.log(`[voice-call] Stripped DSML markup, extracted ${matches.length} text segment(s)`);
-    return matches.join(" ");
-  }
-
-  // Fallback: strip all DSML XML tags and return remaining text
-  let stripped = raw
-    .replace(/<｜DSML｜[^>]*>/g, "")
-    .replace(/<\/｜DSML｜[^>]*>/g, "")
-    .replace(/<\|DSML\|[^>]*>/g, "")
-    .replace(/<\/\|DSML\|[^>]*>/g, "")
-    .trim();
-
-  // Strip leading hallucinated tool names (e.g. "speak_to_user\n...", "exec\n...")
-  // The model sometimes emits the tool name as plain text after DSML tag removal
-  stripped = stripped.replace(/^(?:speak_to_user|exec|speak|say|respond)\s*/i, "");
-
-  if (stripped) {
-    console.log(`[voice-call] Stripped DSML tags, remaining: "${stripped.substring(0, 80)}..."`);
-    return stripped;
-  }
-
-  return raw;
-}
-
 export type VoiceResponseParams = {
   /** Voice call config */
   voiceConfig: VoiceCallConfig;
@@ -208,8 +162,6 @@ export async function generateVoiceResponse(
       sessionKey,
       messageProvider: "voice",
       disableMessageTool: true,
-      disableTools: true,
-      promptMode: "none",
       sessionFile,
       workspaceDir,
       config: cfg,
@@ -233,8 +185,7 @@ export async function generateVoiceResponse(
       .map((p) => p.text?.trim())
       .filter(Boolean);
 
-    const rawText = texts.join(" ") || null;
-    const text = rawText ? stripDsmlMarkup(rawText) : null;
+    const text = texts.join(" ") || null;
 
     if (!text && result.meta?.aborted) {
       return { text: null, error: "Response generation was aborted" };
@@ -341,8 +292,6 @@ export async function generateGreetingText(params: {
       sessionKey: `voice:greeting:${from.replace(/\D/g, "")}`,
       messageProvider: "voice",
       disableMessageTool: true,
-      disableTools: true,
-      promptMode: "none",
       sessionFile,
       workspaceDir,
       config: cfg,
@@ -363,8 +312,7 @@ export async function generateGreetingText(params: {
       .map((p: { text?: string }) => p.text?.trim())
       .filter(Boolean);
 
-    const rawText = texts.join(" ") || null;
-    const text = rawText ? stripDsmlMarkup(rawText) : null;
+    const text = texts.join(" ") || null;
     if (text) {
       console.log(`[voice-call] LLM-generated greeting for ${callerLabel}: "${text}"`);
     }

@@ -608,29 +608,8 @@ const voiceCallPlugin = {
                 const nodeFsp = require("node:fs/promises") as typeof import("node:fs/promises");
                 const nodeOs = require("node:os") as typeof import("node:os");
 
-                const isInbound = call.direction === "inbound";
-                // For inbound: other party is call.from; for outbound: other party is call.to
-                const otherPartyPhone = isInbound ? call.from : call.to;
-
-                // Resolve other party name: first check metadata, then look up contacts
-                let otherPartyResolvedName = call.metadata?.callerName as string | undefined;
-                if (!otherPartyResolvedName) {
-                  try {
-                    const { findContactByPhone, loadContactsFileSync } =
-                      await import("./src/contact-file.js");
-                    const contacts = loadContactsFileSync();
-                    const contact = findContactByPhone(otherPartyPhone, contacts);
-                    if (contact?.name) {
-                      otherPartyResolvedName = contact.name;
-                    }
-                  } catch {
-                    // Contact lookup failed; continue without name
-                  }
-                }
-
-                const callerLabel = otherPartyResolvedName
-                  ? `${otherPartyResolvedName} (${otherPartyPhone})`
-                  : otherPartyPhone;
+                const callerName = call.metadata?.callerName as string | undefined;
+                const callerLabel = callerName ? `${callerName} (${call.from})` : call.from;
                 const durationMs =
                   call.endedAt && call.startedAt ? call.endedAt - call.startedAt : undefined;
                 const durationStr = durationMs ? `${Math.round(durationMs / 1000)}秒` : "未知";
@@ -651,7 +630,8 @@ const voiceCallPlugin = {
                   // IDENTITY.md not found; fall back to "Bot"
                 }
 
-                const otherPartyName = otherPartyResolvedName ?? (isInbound ? "来电方" : "对方");
+                const isInbound = call.direction === "inbound";
+                const otherPartyName = callerName ?? (isInbound ? "来电方" : "对方");
 
                 const transcriptLines =
                   call.transcript.length > 0
@@ -703,8 +683,6 @@ const voiceCallPlugin = {
                       sessionKey: `voice:summary:${call.callId}`,
                       messageProvider: "voice",
                       disableMessageTool: true,
-                      disableTools: true,
-                      promptMode: "none",
                       sessionFile,
                       workspaceDir,
                       config: cfg,
@@ -765,10 +743,7 @@ const voiceCallPlugin = {
                   const pad = (n: number) => String(n).padStart(2, "0");
                   const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
                   const timeStr = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-                  const nameTag = (otherPartyResolvedName ?? otherPartyPhone).replace(
-                    /[^\w\u4e00-\u9fff-]/g,
-                    "",
-                  );
+                  const nameTag = (callerName ?? call.from).replace(/[^\w\u4e00-\u9fff-]/g, "");
                   const fileName = `${dateStr}-${timeStr}-${nameTag}.md`;
                   const filePath = nodePath.join(logsDir, fileName);
 
@@ -782,8 +757,8 @@ const voiceCallPlugin = {
                   );
                 }
 
-                // --- Discord DM for call reports ---
-                {
+                // --- Discord DM for inbound calls ---
+                if (isInbound) {
                   const discordCfg = (api.config as CoreConfig & Record<string, unknown>)
                     ?.channels as Record<string, unknown> | undefined;
                   const allowFrom = (discordCfg?.discord as Record<string, unknown> | undefined)
@@ -793,15 +768,15 @@ const voiceCallPlugin = {
                     : undefined;
                   if (!ownerId) {
                     api.logger.warn(
-                      "[voice-call] No Discord owner ID found; cannot send call report",
+                      "[voice-call] No Discord owner ID found; cannot send inbound call report",
                     );
                     return;
                   }
 
                   // Discord message uses simpler format (no markdown headings)
                   const discordLines = [
-                    `📞 **${directionLabel}已结束**`,
-                    `**${partyLabel}：** ${callerLabel}`,
+                    `📞 **来电通话已结束**`,
+                    `**来电方：** ${callerLabel}`,
                     `**时长：** ${durationStr}`,
                     `**结束原因：** ${call.endReason ?? "未知"}`,
                     ``,
@@ -816,7 +791,9 @@ const voiceCallPlugin = {
                     `user:${ownerId}`,
                     discordLines.join("\n"),
                   );
-                  api.logger.info(`[voice-call] Sent call report to Discord user ${ownerId}`);
+                  api.logger.info(
+                    `[voice-call] Sent inbound call report to Discord user ${ownerId}`,
+                  );
                 }
               } catch (err) {
                 api.logger.warn(

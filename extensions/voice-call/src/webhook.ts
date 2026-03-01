@@ -617,15 +617,15 @@ export class VoiceCallWebhookServer {
       return;
     }
 
-    // Skip if early end-intent already triggered from partial transcript
-    if (this.earlyEndIntentCalls.has(callId)) {
-      console.log(`[voice-call] Skipping for ${callId}: early end-intent already triggered`);
-      return;
-    }
-
     if (isEndCallIntent(userMessage)) {
       console.log(`[voice-call] End-call intent detected for ${callId}; hanging up immediately`);
       await this.trySpeakFallback(callId, "好的，拜拜。", true);
+      return;
+    }
+
+    // Skip LLM if early end-intent already triggered from partial transcript
+    if (this.earlyEndIntentCalls.has(callId)) {
+      console.log(`[voice-call] Skipping LLM for ${callId}: early end-intent already triggered`);
       return;
     }
 
@@ -659,17 +659,12 @@ export class VoiceCallWebhookServer {
       }
 
       console.log(`[voice-call] AI response (${genMs}ms): "${result.text}"`);
-
-      // Check if LLM wants to end the call via [END_CALL] marker
-      const wantsEndCall = result.text.includes("[END_CALL]");
-      const speakText = result.text.replace(/\[END_CALL\]/g, "").trim();
-
       if (result.audioUrl) {
         console.log(`[voice-call] Hosted audio ready: ${result.audioUrl}`);
       }
 
       const speakStart = Date.now();
-      const speakResult = await this.manager.speak(callId, speakText, {
+      const speakResult = await this.manager.speak(callId, result.text, {
         audioUrl: result.audioUrl,
       });
       const speakMs = Date.now() - speakStart;
@@ -681,17 +676,6 @@ export class VoiceCallWebhookServer {
         console.log(
           `[voice-call] Speak completed for ${callId} in ${speakMs}ms (total: ${genMs + speakMs}ms)`,
         );
-      }
-
-      // End the call if the LLM included [END_CALL]
-      if (wantsEndCall) {
-        console.log(`[voice-call] LLM requested end-call via [END_CALL] marker for ${callId}`);
-        // Delay to let Twilio finish playing the buffered farewell audio
-        setTimeout(() => {
-          void this.manager.endCall(callId).catch((err) => {
-            console.warn(`[voice-call] Failed to end call ${callId}:`, err);
-          });
-        }, 4000);
       }
     } catch (err) {
       console.error(`[voice-call] Auto-response error:`, err);
@@ -705,35 +689,13 @@ export class VoiceCallWebhookServer {
     text: string,
     endAfterSpeak = false,
   ): Promise<void> {
-    // Try to generate SAG audio so the fallback uses the same natural voice
-    let audioUrl: string | undefined;
-    if (this.coreConfig) {
-      try {
-        audioUrl = await maybeGenerateHostedAudioUrl({
-          text,
-          coreConfig: this.coreConfig,
-          voiceConfig: this.config,
-          callId,
-        });
-        if (audioUrl) {
-          console.log(`[voice-call] Fallback SAG audio ready for ${callId}: ${audioUrl}`);
-        }
-      } catch (err) {
-        console.warn(`[voice-call] Fallback SAG generation failed, using Twilio TTS:`, err);
-      }
-    }
-
-    const result = await this.manager.speak(callId, text, {
-      audioUrl,
-    });
+    const result = await this.manager.speak(callId, text);
     if (!result.success) {
       console.warn(`[voice-call] Failed to speak fallback for ${callId}: ${result.error}`);
       return;
     }
 
     if (endAfterSpeak) {
-      // Delay to let Twilio finish playing the buffered farewell audio
-      await new Promise((resolve) => setTimeout(resolve, 4000));
       const endResult = await this.manager.endCall(callId);
       if (!endResult.success) {
         console.warn(
