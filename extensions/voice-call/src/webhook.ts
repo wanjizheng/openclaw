@@ -417,7 +417,9 @@ export class VoiceCallWebhookServer {
   }
 
   /**
-   * Stop the webhook server.
+   * Stop the webhook server.  Uses a hard timeout to forcefully destroy
+   * lingering connections (e.g. WebSocket media streams) so the port is
+   * always released in time for a subsequent restart.
    */
   async stop(): Promise<void> {
     if (this.stopStaleCallReaper) {
@@ -426,7 +428,16 @@ export class VoiceCallWebhookServer {
     }
     return new Promise((resolve) => {
       if (this.server) {
-        this.server.close(() => {
+        const srv = this.server;
+
+        // Force-close after 3 s to guarantee the port is freed.
+        const forceTimer = setTimeout(() => {
+          console.warn("[voice-call] Force-closing webhook server (timeout)");
+          srv.closeAllConnections();
+        }, 3_000);
+
+        srv.close(() => {
+          clearTimeout(forceTimer);
           this.server = null;
           resolve();
         });
