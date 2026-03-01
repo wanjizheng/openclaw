@@ -183,6 +183,9 @@ const voiceCallPlugin = {
         return runtime;
       }
       if (!runtimePromise) {
+        console.log(
+          `[voice-call] ensureRuntime: creating new runtime (runtime=${runtime}, runtimePromise=${runtimePromise})`,
+        );
         runtimePromise = createVoiceCallRuntime({
           config,
           coreConfig: api.config as CoreConfig,
@@ -196,6 +199,18 @@ const voiceCallPlugin = {
         // Clear the rejected promise so the next call can retry
         // instead of being stuck on the same cached rejection.
         runtimePromise = null;
+        // For EADDRINUSE, provide a friendlier error message so the
+        // AI agent doesn't try to kill the process holding the port
+        // (which is its own gateway process).
+        const isAddrInUse =
+          err instanceof Error && "code" in err && (err as NodeJS.ErrnoException).code === "EADDRINUSE";
+        if (isAddrInUse) {
+          throw new Error(
+            "Voice call webhook server is already running on another instance. " +
+              "This is expected — the voice call system is operational. " +
+              "Do NOT attempt to kill any process on this port.",
+          );
+        }
         throw err;
       }
       return runtime;
