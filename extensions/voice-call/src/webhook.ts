@@ -17,6 +17,7 @@ import type { VoiceCallProvider } from "./providers/base.js";
 import { OpenAIRealtimeSTTProvider } from "./providers/stt-openai-realtime.js";
 import type { TwilioProvider } from "./providers/twilio.js";
 import { generateGreetingText, maybeGenerateHostedAudioUrl } from "./response-generator.js";
+import { generateStreamingVoiceResponse } from "./streaming-response.js";
 import { TerminalStates, type NormalizedEvent, type WebhookContext } from "./types.js";
 import { startStaleCallReaper } from "./webhook/stale-call-reaper.js";
 
@@ -599,12 +600,17 @@ export class VoiceCallWebhookServer {
 
   /**
    * Handle auto-response for inbound calls using the agent system.
-   * Supports tool calling for richer voice interactions.
+   *
+   * Uses streaming LLM + incremental TTS: sentence-level chunks are sent to
+   * TTS as they arrive from the LLM, so the first audio plays while the model
+   * is still generating.  TAG detection ([END_CALL]) is handled by a buffering
+   * layer that retains a small tail to avoid speaking control markers.
+   *
+   * Falls back to non-streaming generateVoiceResponse when streaming setup fails.
    */
   private async handleInboundResponse(callId: string, userMessage: string): Promise<void> {
     console.log(`[voice-call] Auto-responding to inbound call ${callId}: "${userMessage}"`);
 
-    // Get call context for conversation history
     const call = this.manager.getCall(callId);
     if (!call) {
       console.warn(`[voice-call] Call ${callId} not found for auto-response`);
@@ -616,79 +622,85 @@ export class VoiceCallWebhookServer {
       return;
     }
 
+    const otherPartyPhone = call.direction === "inbound" ? call.from : call.to;
+    const voiceParams = {
+      voiceConfig: this.config,
+      coreConfig: this.coreConfig,
+      callId,
+      from: otherPartyPhone,
+      callerName:
+        typeof call.metadata?.callerName === "string" ? call.metadata.callerName : undefined,
+      direction: call.direction as "inbound" | "outbound",
+      transcript: call.transcript,
+      userMessage,
+      callReason:
+        call.direction === "outbound" && typeof call.metadata?.initialMessage === "string"
+          ? call.metadata.initialMessage.trim() || undefined
+          : undefined,
+    };
+
     try {
-      const { generateVoiceResponse } = await import("./response-generator.js");
-
-      // For outbound calls, the "other party" is call.to (the person we called).
-      // For inbound calls, it's call.from (the person who called us).
-      const otherPartyPhone = call.direction === "inbound" ? call.from : call.to;
-
       const genStart = Date.now();
-      const result = await generateVoiceResponse({
-        voiceConfig: this.config,
-        coreConfig: this.coreConfig,
-        callId,
-        from: otherPartyPhone,
-        callerName:
-          typeof call.metadata?.callerName === "string" ? call.metadata.callerName : undefined,
-        direction: call.direction as "inbound" | "outbound",
-        transcript: call.transcript,
-        userMessage,
-        callReason:
-          call.direction === "outbound" && typeof call.metadata?.initialMessage === "string"
-            ? call.metadata.initialMessage.trim() || undefined
-            : undefined,
-      });
-      const genMs = Date.now() - genStart;
+      let firstChunkSpoken = false;
+      const spokenTexts: string[] = [];
 
-      if (result.error) {
-        console.error(`[voice-call] Response generation error (${genMs}ms): ${result.error}`);
-        console.log(`[voice-call] Fallback response for ${callId}: llm_error`);
-        await this.trySpeakFallback(callId, "抱歉，我刚刚没来得及回答。请你再说一遍。");
+      const result = await generateStreamingVoiceResponse(voiceParams, async (chunk) => {
+        // Each chunk arrives with text + audioUrl — speak them sequentially
+        const speakResult = await this.manager.speak(callId, chunk.text, {
+          audioUrl: chunk.audioUrl,
+        });
+        if (speakResult.success) {
+          spokenTexts.push(chunk.text);
+          if (!firstChunkSpoken) {
+            firstChunkSpoken = true;
+            console.log(
+              `[voice-call] First streaming chunk spoken for ${callId} (TTFA=${Date.now() - genStart}ms)`,
+            );
+          }
+        } else {
+          console.warn(
+            `[voice-call] Failed to speak streaming chunk #${chunk.index} for ${callId}: ${speakResult.error}`,
+          );
+        }
+      });
+
+      const totalMs = Date.now() - genStart;
+
+      if (result.error && !result.text) {
+        console.error(`[voice-call] Streaming response error (${totalMs}ms): ${result.error}`);
+        if (!firstChunkSpoken) {
+          await this.trySpeakFallback(callId, "抱歉，我刚刚没来得及回答。请你再说一遍。");
+        }
         return;
       }
 
-      if (!result.text) {
-        console.log(`[voice-call] Fallback response for ${callId} (${genMs}ms): empty_output`);
+      if (!result.text && !firstChunkSpoken) {
+        console.log(`[voice-call] Fallback response for ${callId} (${totalMs}ms): empty_output`);
         await this.trySpeakFallback(callId, "抱歉，这个问题我暂时没法回答。你可以再换个问法。");
         return;
       }
 
-      const shouldEndCall = result.endCall === true;
       console.log(
-        `[voice-call] AI response (${genMs}ms): "${result.text}"${
-          shouldEndCall ? " [END_CALL]" : ""
-        }`,
+        `[voice-call] Streaming response complete for ${callId}: ${result.chunksStreamed} chunks, ` +
+          `TTFA=${result.timeToFirstAudioMs}ms, total=${totalMs}ms` +
+          `${result.endCall ? " [END_CALL]" : ""}`,
       );
-      if (result.audioUrl) {
-        console.log(`[voice-call] Hosted audio ready: ${result.audioUrl}`);
-      }
 
-      const speakStart = Date.now();
-      const speakResult = await this.manager.speak(callId, result.text, {
-        audioUrl: result.audioUrl,
-      });
-      const speakMs = Date.now() - speakStart;
-      if (!speakResult.success) {
-        console.warn(
-          `[voice-call] Failed to speak AI response for ${callId} (${speakMs}ms): ${speakResult.error}`,
-        );
-      } else {
-        console.log(
-          `[voice-call] Speak completed for ${callId} in ${speakMs}ms (total: ${genMs + speakMs}ms)`,
-        );
-        if (shouldEndCall) {
-          console.log(`[voice-call] LLM signaled [END_CALL] for ${callId}, hanging up in 4s...`);
-          await new Promise((resolve) => setTimeout(resolve, 4000));
-          const endResult = await this.manager.endCall(callId);
-          if (!endResult.success) {
-            console.warn(`[voice-call] Failed to end call ${callId}: ${endResult.error}`);
-          }
+      // Add full bot transcript entry (the individual speak calls already added per-chunk,
+      // but we want one consolidated entry for the transcript log)
+      // Note: each manager.speak() call already adds a transcript entry via addTranscriptEntry,
+      // so we don't need to add another one here.
+
+      if (result.endCall) {
+        console.log(`[voice-call] LLM signaled [END_CALL] for ${callId}, hanging up in 4s...`);
+        await new Promise((resolve) => setTimeout(resolve, 4000));
+        const endResult = await this.manager.endCall(callId);
+        if (!endResult.success) {
+          console.warn(`[voice-call] Failed to end call ${callId}: ${endResult.error}`);
         }
       }
     } catch (err) {
       console.error(`[voice-call] Auto-response error:`, err);
-      console.log(`[voice-call] Fallback response for ${callId}: exception`);
       await this.trySpeakFallback(callId, "抱歉，我这边刚刚出了点问题。请再说一遍。");
     }
   }
