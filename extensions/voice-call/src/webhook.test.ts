@@ -375,8 +375,7 @@ describe("VoiceCallWebhookServer auto-response queue", () => {
     expect(speak).toHaveBeenCalledWith("call-1", "抱歉，我这边刚刚出了点问题。请再说一遍。");
   });
 
-  it("hangs up after goodbye playback window on end-call intent without calling LLM", async () => {
-    vi.useFakeTimers();
+  it("hangs up immediately on end-call intent without calling LLM", async () => {
     const { manager, speak } = createAutoResponseManager();
     const endCall = vi.spyOn(manager, "endCall");
     const config = createConfig();
@@ -385,18 +384,11 @@ describe("VoiceCallWebhookServer auto-response queue", () => {
       enqueueInboundResponse: (callId: string, userMessage: string) => void;
     };
 
-    try {
-      serverAccess.enqueueInboundResponse("call-1", "好了，那就挂了吧，拜拜。");
-      await vi.advanceTimersByTimeAsync(0);
+    serverAccess.enqueueInboundResponse("call-1", "好了，那就挂了吧，拜拜。");
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(mockedGenerateVoiceResponse).not.toHaveBeenCalled();
-      expect(speak).toHaveBeenCalledWith("call-1", "好的，拜拜。");
-      expect(endCall).not.toHaveBeenCalled();
-
-      await vi.advanceTimersByTimeAsync(4000);
-      expect(endCall).toHaveBeenCalledWith("call-1");
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(mockedGenerateVoiceResponse).not.toHaveBeenCalled();
+    expect(speak).toHaveBeenCalledWith("call-1", "好的，拜拜。");
+    expect(endCall).toHaveBeenCalledWith("call-1");
   });
 });

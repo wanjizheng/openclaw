@@ -56,12 +56,6 @@ function isEndCallIntent(text: string): boolean {
   return END_CALL_KEYWORDS.some((keyword) => compact.includes(keyword));
 }
 
-function estimateTtsPlaybackMs(text: string): number {
-  const compactChars = text.replace(/\s+/g, "").length;
-  const estimated = compactChars * 220;
-  return Math.max(1200, Math.min(8000, estimated));
-}
-
 /**
  * HTTP server for receiving voice call webhooks from providers.
  * Supports WebSocket upgrades for media streams when streaming is enabled.
@@ -378,13 +372,6 @@ export class VoiceCallWebhookServer {
    * Start the webhook server.
    */
   async start(): Promise<string> {
-    // Guard: if a previous server is still bound, stop it first so we
-    // don't leak the old listener and hit EADDRINUSE.
-    if (this.server) {
-      console.warn("[voice-call] Server already running during start(); stopping old server first");
-      await this.stop();
-    }
-
     const { port, bind, path: webhookPath } = this.config.serve;
     const streamPath = this.config.streaming?.streamPath || "/voice/stream";
 
@@ -430,41 +417,22 @@ export class VoiceCallWebhookServer {
   }
 
   /**
-   * Stop the webhook server.  Immediately destroys all active connections
-   * so the port is freed without delay.  A hard 5 s deadline guarantees the
-   * promise always resolves even if `server.close()` gets stuck.
+   * Stop the webhook server.
    */
   async stop(): Promise<void> {
     if (this.stopStaleCallReaper) {
       this.stopStaleCallReaper();
       this.stopStaleCallReaper = null;
     }
-
-    const srv = this.server;
-    if (!srv) {
-      return;
-    }
-    // Clear the reference immediately so concurrent start() or stop()
-    // calls don't try to operate on the same server instance.
-    this.server = null;
-
-    return new Promise<void>((resolve) => {
-      // Hard deadline: resolve unconditionally after 5 s so we never hang.
-      const hardTimer = setTimeout(() => {
-        console.warn("[voice-call] Webhook server stop timed out after 5 s; giving up wait");
+    return new Promise((resolve) => {
+      if (this.server) {
+        this.server.close(() => {
+          this.server = null;
+          resolve();
+        });
+      } else {
         resolve();
-      }, 5_000);
-
-      srv.close(() => {
-        clearTimeout(hardTimer);
-        resolve();
-      });
-
-      // Destroy all active connections *immediately* so `srv.close()`
-      // callback fires without waiting for clients to disconnect.
-      // This replaces the previous 3 s delayed closeAllConnections which
-      // left a window where the port was still bound.
-      srv.closeAllConnections();
+      }
     });
   }
 
@@ -728,11 +696,6 @@ export class VoiceCallWebhookServer {
     }
 
     if (endAfterSpeak) {
-      const waitMs =
-        estimateTtsPlaybackMs(text) +
-        Math.max(800, Math.round(this.config.outbound.notifyHangupDelaySec * 1000));
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
-
       const endResult = await this.manager.endCall(callId);
       if (!endResult.success) {
         console.warn(
