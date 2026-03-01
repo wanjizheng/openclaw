@@ -389,7 +389,11 @@ else
     if [[ -n "$conflicted" ]]; then
       while IFS= read -r f; do
         [[ -n "$f" ]] || continue
-        git checkout --theirs -- "$f" && git add "$f"
+        if is_protected_custom_script_path "$f"; then
+          git checkout --ours -- "$f" && git add "$f"
+        else
+          git checkout --theirs -- "$f" && git add "$f"
+        fi
       done <<< "$conflicted"
     fi
     git commit --no-edit --no-verify 2>/dev/null || true
