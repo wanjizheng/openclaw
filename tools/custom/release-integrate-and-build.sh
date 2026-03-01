@@ -33,6 +33,8 @@ SKIP_INSTALL="false"
 SKIP_BUILD="false"
 SKIP_DEPLOY="false"
 CONFLICT_STRATEGY="prefer-custom"
+SYNC_CUSTOM_MAIN="false"
+MAX_CUSTOM_COMMITS="300"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -48,6 +50,8 @@ while (( $# )); do
     --skip-install)      SKIP_INSTALL="true"; shift ;;
     --skip-build)        SKIP_BUILD="true"; shift ;;
     --skip-deploy)       SKIP_DEPLOY="true"; shift ;;
+    --sync-custom-main)  SYNC_CUSTOM_MAIN="true"; shift ;;
+    --max-custom-commits) MAX_CUSTOM_COMMITS="${2:-300}"; shift 2 ;;
     --conflict-strategy) CONFLICT_STRATEGY="${2:-prefer-custom}"; shift 2 ;;
     --deploy-target)     DEPLOY_TARGET="${2:?}"; shift 2 ;;
     *) die "unknown arg: $1" ;;
@@ -56,6 +60,9 @@ done
 
 [[ "$CONFLICT_STRATEGY" =~ ^(prefer-custom|stop)$ ]] \
   || die "--conflict-strategy must be prefer-custom|stop"
+
+[[ "$MAX_CUSTOM_COMMITS" =~ ^[0-9]+$ ]] \
+  || die "--max-custom-commits must be a non-negative integer"
 
 SECONDS=0
 ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
@@ -86,18 +93,21 @@ git fetch origin --prune --quiet
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. Rebase custom-main onto upstream/main
 # ══════════════════════════════════════════════════════════════════════════════
-step "rebase custom-main onto upstream/main"
 git checkout custom-main --quiet 2>/dev/null \
   || git checkout -b custom-main upstream/main --quiet
 
-if ! git merge-base --is-ancestor upstream/main custom-main; then
-  # Need rebase: custom-main is behind upstream/main
-  if ! git rebase upstream/main --quiet; then
-    log "WARN: rebase custom-main onto upstream/main failed; fallback to current custom-main (no rebase)"
-    git rebase --abort 2>/dev/null || true
+if [[ "$SYNC_CUSTOM_MAIN" == "true" ]]; then
+  step "rebase custom-main onto upstream/main"
+  if ! git merge-base --is-ancestor upstream/main custom-main; then
+    if ! git rebase upstream/main --quiet; then
+      log "WARN: rebase custom-main onto upstream/main failed; fallback to current custom-main (no rebase)"
+      git rebase --abort 2>/dev/null || true
+    fi
   fi
+  log "custom-main sync attempt finished"
+else
+  log "skip upstream/main rebase (use --sync-custom-main to enable)"
 fi
-log "custom-main is up-to-date with upstream/main"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. Find latest stable tag
@@ -117,10 +127,13 @@ log "latest stable tag: $LATEST_TAG"
 # ══════════════════════════════════════════════════════════════════════════════
 step "collecting custom commits"
 mapfile -t CUSTOM_COMMITS < <(
-  git --no-pager log --reverse --no-merges --pretty=%H upstream/main..custom-main
+  git --no-pager log --reverse --no-merges --pretty=%H "${LATEST_TAG}..custom-main"
 )
 if (( ${#CUSTOM_COMMITS[@]} == 0 )) || [[ -z "${CUSTOM_COMMITS[0]:-}" ]]; then
-  die "no custom commits found between upstream/main and custom-main"
+  die "no custom commits found between ${LATEST_TAG} and custom-main"
+fi
+if (( ${#CUSTOM_COMMITS[@]} > MAX_CUSTOM_COMMITS )); then
+  die "custom commit set is too large (${#CUSTOM_COMMITS[@]} > ${MAX_CUSTOM_COMMITS}); update commit selection before release build"
 fi
 log "found ${#CUSTOM_COMMITS[@]} custom commit(s) to cherry-pick:"
 for sha in "${CUSTOM_COMMITS[@]}"; do
