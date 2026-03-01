@@ -163,6 +163,9 @@ const voiceCallPlugin = {
 
     let runtimePromise: Promise<VoiceCallRuntime> | null = null;
     let runtime: VoiceCallRuntime | null = null;
+    // Track in-flight stop so ensureRuntime() waits for the port to be
+    // released before trying to create a new runtime (prevents EADDRINUSE).
+    let stopPromise: Promise<void> | null = null;
 
     const ensureRuntime = async () => {
       if (!config.enabled) {
@@ -170,6 +173,11 @@ const voiceCallPlugin = {
       }
       if (!validation.valid) {
         throw new Error(validation.errors.join("; "));
+      }
+      // If a stop is in flight, wait for it to finish so the port is freed
+      // before we attempt to bind a new server.
+      if (stopPromise) {
+        await stopPromise;
       }
       if (runtime) {
         return runtime;
@@ -787,12 +795,19 @@ const voiceCallPlugin = {
         if (!runtimePromise) {
           return;
         }
+        stopPromise = (async () => {
+          try {
+            const rt = await runtimePromise;
+            await rt.stop();
+          } finally {
+            runtimePromise = null;
+            runtime = null;
+          }
+        })();
         try {
-          const rt = await runtimePromise;
-          await rt.stop();
+          await stopPromise;
         } finally {
-          runtimePromise = null;
-          runtime = null;
+          stopPromise = null;
         }
       },
     });

@@ -372,6 +372,13 @@ export class VoiceCallWebhookServer {
    * Start the webhook server.
    */
   async start(): Promise<string> {
+    // Guard: if a previous server is still bound, stop it first so we
+    // don't leak the old listener and hit EADDRINUSE.
+    if (this.server) {
+      console.warn("[voice-call] Server already running during start(); stopping old server first");
+      await this.stop();
+    }
+
     const { port, bind, path: webhookPath } = this.config.serve;
     const streamPath = this.config.streaming?.streamPath || "/voice/stream";
 
@@ -417,33 +424,41 @@ export class VoiceCallWebhookServer {
   }
 
   /**
-   * Stop the webhook server.  Uses a hard timeout to forcefully destroy
-   * lingering connections (e.g. WebSocket media streams) so the port is
-   * always released in time for a subsequent restart.
+   * Stop the webhook server.  Immediately destroys all active connections
+   * so the port is freed without delay.  A hard 5 s deadline guarantees the
+   * promise always resolves even if `server.close()` gets stuck.
    */
   async stop(): Promise<void> {
     if (this.stopStaleCallReaper) {
       this.stopStaleCallReaper();
       this.stopStaleCallReaper = null;
     }
-    return new Promise((resolve) => {
-      if (this.server) {
-        const srv = this.server;
 
-        // Force-close after 3 s to guarantee the port is freed.
-        const forceTimer = setTimeout(() => {
-          console.warn("[voice-call] Force-closing webhook server (timeout)");
-          srv.closeAllConnections();
-        }, 3_000);
+    const srv = this.server;
+    if (!srv) {
+      return;
+    }
+    // Clear the reference immediately so concurrent start() or stop()
+    // calls don't try to operate on the same server instance.
+    this.server = null;
 
-        srv.close(() => {
-          clearTimeout(forceTimer);
-          this.server = null;
-          resolve();
-        });
-      } else {
+    return new Promise<void>((resolve) => {
+      // Hard deadline: resolve unconditionally after 5 s so we never hang.
+      const hardTimer = setTimeout(() => {
+        console.warn("[voice-call] Webhook server stop timed out after 5 s; giving up wait");
         resolve();
-      }
+      }, 5_000);
+
+      srv.close(() => {
+        clearTimeout(hardTimer);
+        resolve();
+      });
+
+      // Destroy all active connections *immediately* so `srv.close()`
+      // callback fires without waiting for clients to disconnect.
+      // This replaces the previous 3 s delayed closeAllConnections which
+      // left a window where the port was still bound.
+      srv.closeAllConnections();
     });
   }
 
