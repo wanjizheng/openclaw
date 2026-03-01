@@ -682,14 +682,19 @@ export class VoiceCallWebhookServer {
     try {
       const { generateVoiceResponse } = await import("./response-generator.js");
 
+      // For outbound calls, the "other party" is call.to (the person we called).
+      // For inbound calls, it's call.from (the person who called us).
+      const otherPartyPhone = call.direction === "inbound" ? call.from : call.to;
+
       const genStart = Date.now();
       const result = await generateVoiceResponse({
         voiceConfig: this.config,
         coreConfig: this.coreConfig,
         callId,
-        from: call.from,
+        from: otherPartyPhone,
         callerName:
           typeof call.metadata?.callerName === "string" ? call.metadata.callerName : undefined,
+        direction: call.direction as "inbound" | "outbound",
         transcript: call.transcript,
         userMessage,
       });

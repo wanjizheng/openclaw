@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import type { CallMode } from "../config.js";
+import { findContactByPhone, loadContactsFileAsync } from "../contact-file.js";
 import {
   TerminalStates,
   type CallId,
@@ -171,6 +172,17 @@ export async function initiateCall(
       mode,
     },
   };
+
+  // Resolve callee name from VOICE_CONTACTS.md so the LLM knows who it's talking to
+  try {
+    const contacts = await loadContactsFileAsync();
+    const contact = findContactByPhone(to, contacts);
+    if (contact?.name) {
+      callRecord.metadata!.callerName = contact.name;
+    }
+  } catch {
+    // Contact lookup is best-effort
+  }
 
   ctx.activeCalls.set(callId, callRecord);
   persistCallRecord(ctx.storePath, callRecord);

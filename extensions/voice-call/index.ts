@@ -609,7 +609,11 @@ const voiceCallPlugin = {
                 const nodeOs = require("node:os") as typeof import("node:os");
 
                 const callerName = call.metadata?.callerName as string | undefined;
-                const callerLabel = callerName ? `${callerName} (${call.from})` : call.from;
+                // For outbound calls, the "other party" is call.to; for inbound, call.from
+                const otherPartyPhone = call.direction === "inbound" ? call.from : call.to;
+                const callerLabel = callerName
+                  ? `${callerName} (${otherPartyPhone})`
+                  : otherPartyPhone;
                 const durationMs =
                   call.endedAt && call.startedAt ? call.endedAt - call.startedAt : undefined;
                 const durationStr = durationMs ? `${Math.round(durationMs / 1000)}秒` : "未知";
@@ -745,7 +749,10 @@ const voiceCallPlugin = {
                   const pad = (n: number) => String(n).padStart(2, "0");
                   const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
                   const timeStr = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-                  const nameTag = (callerName ?? call.from).replace(/[^\w\u4e00-\u9fff-]/g, "");
+                  const nameTag = (callerName ?? otherPartyPhone).replace(
+                    /[^\w\u4e00-\u9fff-]/g,
+                    "",
+                  );
                   const fileName = `${dateStr}-${timeStr}-${nameTag}.md`;
                   const filePath = nodePath.join(logsDir, fileName);
 
