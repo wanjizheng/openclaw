@@ -683,6 +683,8 @@ const voiceCallPlugin = {
                       sessionKey: `voice:summary:${call.callId}`,
                       messageProvider: "voice",
                       disableMessageTool: true,
+                      disableTools: true,
+                      promptMode: "none",
                       sessionFile,
                       workspaceDir,
                       config: cfg,

@@ -771,16 +771,20 @@ ${nextStepXml}
       throw new Error("Media stream handler required");
     }
 
-    // Resolve local file path from audio URL
-    // URLs look like https://voice.ontoai.com/audio/call_xxx.mp3
-    // Local files are at ~/.openclaw/workspace/voice_messages/call_xxx.mp3
-    const fileName = decodeURIComponent(audioUrl.split("/").pop() ?? "");
-    if (!fileName) {
-      throw new Error("Unable to extract filename from audio URL");
+    // Resolve local file path: accept either a local path or a URL
+    let localPath: string;
+    if (audioUrl.startsWith("/")) {
+      // Already a local file path
+      localPath = audioUrl;
+    } else {
+      // Legacy URL format — extract filename and resolve to local voice_messages dir
+      const fileName = decodeURIComponent(audioUrl.split("/").pop() ?? "");
+      if (!fileName) {
+        throw new Error("Unable to extract filename from audio URL");
+      }
+      const homeDir = process.env.HOME || process.env.USERPROFILE || "/tmp";
+      localPath = join(homeDir, ".openclaw", "workspace", "voice_messages", fileName);
     }
-
-    const homeDir = process.env.HOME || process.env.USERPROFILE || "/tmp";
-    const localPath = join(homeDir, ".openclaw", "workspace", "voice_messages", fileName);
 
     // Convert to mu-law 8kHz using ffmpeg
     const muLawAudio = await convertToMulaw8k(localPath);

@@ -74,8 +74,12 @@ export class VoiceCallWebhookServer {
   private pendingAutoResponses = new Map<string, string>();
   /** Calls already flagged for early end-intent hangup from partial transcript */
   private earlyEndIntentCalls = new Set<string>();
+  /** Provider call IDs currently playing initial greeting — transcripts are discarded to avoid echo */
+  private greetingCalls = new Set<string>();
   /** Pre-generated audio URLs for inbound contact greetings, keyed by normalised phone digits */
   private preGeneratedGreetingUrls = new Map<string, string>();
+  /** Pre-generated farewell audio URL ("好的，拜拜。") so end-call can play instantly */
+  private cachedFarewellAudioUrl: string | undefined;
 
   constructor(
     config: VoiceCallConfig,
@@ -172,6 +176,21 @@ export class VoiceCallWebhookServer {
             );
           }
         }
+        // Also pre-generate the farewell audio so end-call plays instantly
+        try {
+          const farewellUrl = await maybeGenerateHostedAudioUrl({
+            text: "好的，拜拜。",
+            coreConfig: this.coreConfig!,
+            voiceConfig: this.config,
+          });
+          if (farewellUrl) {
+            this.cachedFarewellAudioUrl = farewellUrl;
+            console.log(`[voice-call] Pre-generated farewell audio: ${farewellUrl}`);
+          }
+        } catch (err) {
+          console.warn(`[voice-call] Failed to pre-generate farewell audio:`, err);
+        }
+
         const ms = Date.now() - start;
         console.log(`[voice-call] Pre-generated ${count} contact greeting(s) in ${ms}ms`);
       } catch (err) {
@@ -229,6 +248,15 @@ export class VoiceCallWebhookServer {
           (this.provider as TwilioProvider).clearTtsQueue(providerCallId);
         }
 
+        // Discard transcripts during initial greeting playback — they are
+        // echo of the bot's own voice picked up by Twilio before AEC warms up.
+        if (this.greetingCalls.has(providerCallId)) {
+          console.log(
+            `[voice-call] Discarding echo transcript during greeting for ${providerCallId}: "${transcript}"`,
+          );
+          return;
+        }
+
         // Look up our internal call ID from the provider call ID
         const call = this.manager.getCallByProviderCallId(providerCallId);
         if (!call) {
@@ -258,6 +286,14 @@ export class VoiceCallWebhookServer {
       onSpeechStart: (providerCallId) => {
         if (this.provider.name === "twilio") {
           (this.provider as TwilioProvider).clearTtsQueue(providerCallId);
+        }
+        // If user barges in during greeting, stop discarding transcripts
+        // so the follow-up real transcript is processed normally.
+        if (this.greetingCalls.has(providerCallId)) {
+          console.log(
+            `[voice-call] Barge-in during greeting for ${providerCallId}, resuming transcript processing`,
+          );
+          this.greetingCalls.delete(providerCallId);
         }
       },
       onPartialTranscript: (providerCallId, partial) => {
@@ -315,10 +351,24 @@ export class VoiceCallWebhookServer {
 
         // Speak initial message if one was provided when call was initiated
         // Use setTimeout to allow stream setup to complete
-        setTimeout(() => {
-          this.manager.speakInitialMessage(callId).catch((err) => {
+        this.greetingCalls.add(callId);
+        setTimeout(async () => {
+          try {
+            await this.manager.speakInitialMessage(callId);
+          } catch (err) {
             console.warn(`[voice-call] Failed to speak initial message:`, err);
-          });
+          } finally {
+            // Keep discarding echo transcripts for a short buffer after greeting
+            // finishes, then resume normal transcript processing.
+            setTimeout(() => {
+              if (this.greetingCalls.has(callId)) {
+                this.greetingCalls.delete(callId);
+                console.log(
+                  `[voice-call] Greeting done, resuming transcript processing for ${callId}`,
+                );
+              }
+            }, 1000);
+          }
         }, 500);
       },
       onDisconnect: (callId) => {
@@ -617,15 +667,15 @@ export class VoiceCallWebhookServer {
       return;
     }
 
-    if (isEndCallIntent(userMessage)) {
-      console.log(`[voice-call] End-call intent detected for ${callId}; hanging up immediately`);
-      await this.trySpeakFallback(callId, "好的，拜拜。", true);
+    // Skip if early end-intent already triggered from partial transcript
+    if (this.earlyEndIntentCalls.has(callId)) {
+      console.log(`[voice-call] Skipping for ${callId}: early end-intent already triggered`);
       return;
     }
 
-    // Skip LLM if early end-intent already triggered from partial transcript
-    if (this.earlyEndIntentCalls.has(callId)) {
-      console.log(`[voice-call] Skipping LLM for ${callId}: early end-intent already triggered`);
+    if (isEndCallIntent(userMessage)) {
+      console.log(`[voice-call] End-call intent detected for ${callId}; hanging up immediately`);
+      await this.trySpeakFallback(callId, "好的，拜拜。", true);
       return;
     }
 
@@ -689,13 +739,38 @@ export class VoiceCallWebhookServer {
     text: string,
     endAfterSpeak = false,
   ): Promise<void> {
-    const result = await this.manager.speak(callId, text);
+    // Use pre-cached farewell audio for instant playback, or generate SAG audio
+    let audioUrl: string | undefined;
+    if (text === "好的，拜拜。" && this.cachedFarewellAudioUrl) {
+      audioUrl = this.cachedFarewellAudioUrl;
+      console.log(`[voice-call] Using pre-cached farewell audio for ${callId}`);
+    } else if (this.coreConfig) {
+      try {
+        audioUrl = await maybeGenerateHostedAudioUrl({
+          text,
+          coreConfig: this.coreConfig,
+          voiceConfig: this.config,
+          callId,
+        });
+        if (audioUrl) {
+          console.log(`[voice-call] Fallback SAG audio ready for ${callId}: ${audioUrl}`);
+        }
+      } catch (err) {
+        console.warn(`[voice-call] Fallback SAG generation failed, using Twilio TTS:`, err);
+      }
+    }
+
+    const result = await this.manager.speak(callId, text, {
+      audioUrl,
+    });
     if (!result.success) {
       console.warn(`[voice-call] Failed to speak fallback for ${callId}: ${result.error}`);
       return;
     }
 
     if (endAfterSpeak) {
+      // Delay to let Twilio finish playing the buffered farewell audio
+      await new Promise((resolve) => setTimeout(resolve, 4000));
       const endResult = await this.manager.endCall(callId);
       if (!endResult.success) {
         console.warn(

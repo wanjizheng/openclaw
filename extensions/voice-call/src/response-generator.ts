@@ -13,6 +13,66 @@ import type { VoiceCallConfig } from "./config.js";
 import { findContactByPhone, loadContactsFileAsync } from "./contact-file.js";
 import { loadCoreAgentDeps, loadCoreTtsDeps, type CoreConfig } from "./core-bridge.js";
 
+/**
+ * Strip DeepSeek DSML function-call markup from LLM output.
+ * When DeepSeek has no tools registered, it sometimes hallucinates its native
+ * DSML XML format as raw text.  This extracts the actual speech text from
+ * patterns like `sag speak ... "actual text here"` or invoke blocks with
+ * tool names like `speak_to_user`.
+ */
+function stripDsmlMarkup(raw: string): string {
+  // If the response doesn't contain DSML markers or known tool names, return as-is
+  if (!raw.includes("DSML") && !raw.includes("function_calls") && !raw.includes("speak_to_user")) {
+    return raw;
+  }
+
+  // Try to extract the quoted text from sag speak commands
+  const sagSpeakPattern = /sag\s+speak\b[^"]*"([^"]+)"/g;
+  const matches: string[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = sagSpeakPattern.exec(raw)) !== null) {
+    matches.push(match[1].trim());
+  }
+
+  if (matches.length > 0) {
+    console.log(`[voice-call] Stripped DSML markup, extracted ${matches.length} text segment(s)`);
+    return matches.join(" ");
+  }
+
+  // Try to extract message content from DSML parameter tags
+  const paramPattern = /name="message"[^>]*>([^<]+)</g;
+  const paramMatches: string[] = [];
+  let pm: RegExpExecArray | null;
+  while ((pm = paramPattern.exec(raw)) !== null) {
+    const val = pm[1].trim();
+    if (val) paramMatches.push(val);
+  }
+
+  if (paramMatches.length > 0) {
+    const result = paramMatches.join(" ");
+    console.log(`[voice-call] Extracted message from DSML params: "${result.substring(0, 80)}..."`);
+    return result;
+  }
+
+  // Fallback: strip all DSML XML tags and return remaining text
+  let stripped = raw
+    .replace(/<\uFF5CDSML\uFF5C[^>]*>/g, "")
+    .replace(/<\/\uFF5CDSML\uFF5C[^>]*>/g, "")
+    .replace(/<\|DSML\|[^>]*>/g, "")
+    .replace(/<\/\|DSML\|[^>]*>/g, "")
+    .trim();
+
+  // Strip leading hallucinated tool names (e.g. "speak_to_user\n...", "exec\n...")
+  stripped = stripped.replace(/^(?:speak_to_user|exec|speak|say|respond)\s*/i, "");
+
+  if (stripped) {
+    console.log(`[voice-call] Stripped DSML tags, remaining: "${stripped.substring(0, 80)}..."`);
+    return stripped;
+  }
+
+  return raw;
+}
+
 export type VoiceResponseParams = {
   /** Voice call config */
   voiceConfig: VoiceCallConfig;
@@ -162,6 +222,8 @@ export async function generateVoiceResponse(
       sessionKey,
       messageProvider: "voice",
       disableMessageTool: true,
+      disableTools: true,
+      promptMode: "none",
       sessionFile,
       workspaceDir,
       config: cfg,
@@ -185,7 +247,12 @@ export async function generateVoiceResponse(
       .map((p) => p.text?.trim())
       .filter(Boolean);
 
-    const text = texts.join(" ") || null;
+    let text = texts.join(" ") || null;
+
+    // Strip any DSML markup the model may have hallucinated
+    if (text) {
+      text = stripDsmlMarkup(text) || null;
+    }
 
     if (!text && result.meta?.aborted) {
       return { text: null, error: "Response generation was aborted" };
@@ -292,6 +359,8 @@ export async function generateGreetingText(params: {
       sessionKey: `voice:greeting:${from.replace(/\D/g, "")}`,
       messageProvider: "voice",
       disableMessageTool: true,
+      disableTools: true,
+      promptMode: "none",
       sessionFile,
       workspaceDir,
       config: cfg,
@@ -312,7 +381,11 @@ export async function generateGreetingText(params: {
       .map((p: { text?: string }) => p.text?.trim())
       .filter(Boolean);
 
-    const text = texts.join(" ") || null;
+    let text = texts.join(" ") || null;
+    // Strip any DSML markup the model may have hallucinated
+    if (text) {
+      text = stripDsmlMarkup(text) || null;
+    }
     if (text) {
       console.log(`[voice-call] LLM-generated greeting for ${callerLabel}: "${text}"`);
     }
@@ -333,11 +406,6 @@ export async function maybeGenerateHostedAudioUrl(params: {
   /** When provided, audio files are named with the callId for easy per-call cleanup. */
   callId?: string;
 }): Promise<string | undefined> {
-  const baseUrl = resolveAudioBaseUrl(params.voiceConfig);
-  if (!baseUrl) {
-    return undefined;
-  }
-
   try {
     const outputDir = resolveVoiceMessagesDir();
     mkdirSync(outputDir, { recursive: true });
@@ -362,10 +430,10 @@ export async function maybeGenerateHostedAudioUrl(params: {
       copyFileSync(ttsResult.audioPath, destPath);
     }
 
-    return `${baseUrl}/${encodeURIComponent(fileName)}`;
+    return destPath;
   } catch (err) {
     console.warn(
-      `[voice-call] Hosted audio generation failed: ${err instanceof Error ? err.message : String(err)}`,
+      `[voice-call] Audio generation failed: ${err instanceof Error ? err.message : String(err)}`,
     );
     return undefined;
   }
@@ -465,10 +533,11 @@ export async function deleteCallAudioFiles(
     // Directory missing or unreadable — nothing to do.
   }
 
-  // Also delete extra files passed by URL (e.g. initial message pre-gen).
+  // Also delete extra files passed by path or URL (e.g. initial message pre-gen).
   await Promise.all(
-    extraUrls.map(async (url) => {
-      const fileName = decodeURIComponent(url.split("/").pop() ?? "");
+    extraUrls.map(async (urlOrPath) => {
+      // Support both local paths and URLs
+      const fileName = decodeURIComponent(urlOrPath.split("/").pop() ?? "");
       if (!fileName) return;
       const fp = path.join(dir, fileName);
       deleted.push(fileName);

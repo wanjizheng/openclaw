@@ -91,6 +91,8 @@ export class MediaStreamHandler {
   private ttsPlaying = new Map<string, boolean>();
   /** Active TTS playback controllers per stream */
   private ttsActiveControllers = new Map<string, AbortController>();
+  /** Streams with STT suppressed (to avoid echo during greeting playback) */
+  private sttSuppressed = new Set<string>();
 
   constructor(config: MediaStreamConfig) {
     this.config = config;
@@ -152,7 +154,6 @@ export class MediaStreamHandler {
 
           case "media":
             if (session && message.media?.payload) {
-              // Forward audio to STT
               const audioBuffer = Buffer.from(message.media.payload, "base64");
               session.sttSession.sendAudio(audioBuffer);
             }
@@ -420,6 +421,27 @@ export class MediaStreamHandler {
   }
 
   /**
+   * Suppress STT audio forwarding for a stream (e.g., during initial greeting to avoid echo).
+   */
+  suppressSTT(streamSid: string): void {
+    this.sttSuppressed.add(streamSid);
+  }
+
+  /**
+   * Resume STT audio forwarding for a stream.
+   */
+  resumeSTT(streamSid: string): void {
+    this.sttSuppressed.delete(streamSid);
+  }
+
+  /**
+   * Check if TTS is currently playing for a stream.
+   */
+  isTtsPlaying(streamSid: string): boolean {
+    return this.ttsPlaying.get(streamSid) ?? false;
+  }
+
+  /**
    * Get active session by call ID.
    */
   getSessionByCallId(callId: string): StreamSession | undefined {
@@ -493,6 +515,7 @@ export class MediaStreamHandler {
     this.ttsActiveControllers.delete(streamSid);
     this.ttsPlaying.delete(streamSid);
     this.ttsQueues.delete(streamSid);
+    this.sttSuppressed.delete(streamSid);
   }
 }
 

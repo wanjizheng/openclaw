@@ -30,6 +30,8 @@ type CoreAgentDeps = {
     sessionKey?: string;
     messageProvider?: string;
     disableMessageTool?: boolean;
+    disableTools?: boolean;
+    promptMode?: string;
     sessionFile: string;
     workspaceDir: string;
     config?: CoreConfig;
