@@ -1,8 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import type {
-  GatewayRequestHandlerOptions,
-  OpenClawPluginApi,
-} from "openclaw/plugin-sdk/voice-call";
+import type { GatewayRequestHandlerOptions, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { registerVoiceCallCli } from "./src/cli.js";
 import {
   VoiceCallConfigSchema,
@@ -13,6 +10,16 @@ import {
 import type { CoreConfig } from "./src/core-bridge.js";
 import { deleteCallAudioFiles, maybeGenerateHostedAudioUrl } from "./src/response-generator.js";
 import { createVoiceCallRuntime, type VoiceCallRuntime } from "./src/runtime.js";
+
+// ── Module-level singleton state ──────────────────────────────────────
+// The plugin loader may call register() more than once (e.g. when the
+// config cache key differs due to unresolved secret placeholders vs
+// resolved values).  By keeping the runtime state at module scope we
+// ensure all closures share the same webhook server / port binding and
+// avoid EADDRINUSE when a second closure tries to create a new runtime.
+let _runtimePromise: Promise<VoiceCallRuntime> | null = null;
+let _runtime: VoiceCallRuntime | null = null;
+let _stopPromise: Promise<void> | null = null;
 
 const voiceCallConfigSchema = {
   parse(value: unknown): VoiceCallConfig {
@@ -164,9 +171,6 @@ const voiceCallPlugin = {
       }
     }
 
-    let runtimePromise: Promise<VoiceCallRuntime> | null = null;
-    let runtime: VoiceCallRuntime | null = null;
-
     const ensureRuntime = async () => {
       if (!config.enabled) {
         throw new Error("Voice call disabled in plugin config");
@@ -174,11 +178,19 @@ const voiceCallPlugin = {
       if (!validation.valid) {
         throw new Error(validation.errors.join("; "));
       }
-      if (runtime) {
-        return runtime;
+      // If a stop is in flight, wait for it to finish so the port is freed
+      // before we attempt to bind a new server.
+      if (_stopPromise) {
+        await _stopPromise;
       }
-      if (!runtimePromise) {
-        runtimePromise = createVoiceCallRuntime({
+      if (_runtime) {
+        return _runtime;
+      }
+      if (!_runtimePromise) {
+        console.log(
+          `[voice-call] ensureRuntime: creating new runtime (_runtime=${_runtime}, _runtimePromise=${_runtimePromise})`,
+        );
+        _runtimePromise = createVoiceCallRuntime({
           config,
           coreConfig: api.config as CoreConfig,
           ttsRuntime: api.runtime.tts,
@@ -186,77 +198,32 @@ const voiceCallPlugin = {
         });
       }
       try {
-        runtime = await runtimePromise;
+        _runtime = await _runtimePromise;
       } catch (err) {
-        // Reset so the next call can retry instead of caching the
-        // rejected promise forever (which also leaves the port orphaned
-        // if the server started before the failure).  See: #32387
-        runtimePromise = null;
+        // Clear the rejected promise so the next call can retry
+        // instead of being stuck on the same cached rejection.
+        _runtimePromise = null;
+        // For EADDRINUSE, provide a friendlier error message so the
+        // AI agent doesn't try to kill the process holding the port
+        // (which is its own gateway process).
+        const isAddrInUse =
+          err instanceof Error &&
+          "code" in err &&
+          (err as NodeJS.ErrnoException).code === "EADDRINUSE";
+        if (isAddrInUse) {
+          throw new Error(
+            "Voice call webhook server is already running on another instance. " +
+              "This is expected — the voice call system is operational. " +
+              "Do NOT attempt to kill any process on this port.",
+          );
+        }
         throw err;
       }
-      return runtime;
+      return _runtime;
     };
 
     const sendError = (respond: (ok: boolean, payload?: unknown) => void, err: unknown) => {
       respond(false, { error: err instanceof Error ? err.message : String(err) });
-    };
-
-    const resolveCallMessageRequest = async (params: GatewayRequestHandlerOptions["params"]) => {
-      const callId = typeof params?.callId === "string" ? params.callId.trim() : "";
-      const message = typeof params?.message === "string" ? params.message.trim() : "";
-      if (!callId || !message) {
-        return { error: "callId and message required" } as const;
-      }
-      const rt = await ensureRuntime();
-      return { rt, callId, message } as const;
-    };
-    const initiateCallAndRespond = async (params: {
-      rt: VoiceCallRuntime;
-      respond: GatewayRequestHandlerOptions["respond"];
-      to: string;
-      message?: string;
-      mode?: "notify" | "conversation";
-    }) => {
-      const result = await params.rt.manager.initiateCall(params.to, undefined, {
-        message: params.message,
-        mode: params.mode,
-      });
-      if (!result.success) {
-        params.respond(false, { error: result.error || "initiate failed" });
-        return;
-      }
-      params.respond(true, { callId: result.callId, initiated: true });
-    };
-
-    const respondToCallMessageAction = async (params: {
-      requestParams: GatewayRequestHandlerOptions["params"];
-      respond: GatewayRequestHandlerOptions["respond"];
-      action: (
-        request: Exclude<Awaited<ReturnType<typeof resolveCallMessageRequest>>, { error: string }>,
-      ) => Promise<{
-        success: boolean;
-        error?: string;
-        transcript?: string;
-      }>;
-      failure: string;
-      includeTranscript?: boolean;
-    }) => {
-      const request = await resolveCallMessageRequest(params.requestParams);
-      if ("error" in request) {
-        params.respond(false, { error: request.error });
-        return;
-      }
-      const result = await params.action(request);
-      if (!result.success) {
-        params.respond(false, { error: result.error || params.failure });
-        return;
-      }
-      params.respond(
-        true,
-        params.includeTranscript
-          ? { success: true, transcript: result.transcript }
-          : { success: true },
-      );
     };
 
     api.registerGatewayMethod(
@@ -279,13 +246,15 @@ const voiceCallPlugin = {
           }
           const mode =
             params?.mode === "notify" || params?.mode === "conversation" ? params.mode : undefined;
-          await initiateCallAndRespond({
-            rt,
-            respond,
-            to,
+          const result = await rt.manager.initiateCall(to, undefined, {
             message,
             mode,
           });
+          if (!result.success) {
+            respond(false, { error: result.error || "initiate failed" });
+            return;
+          }
+          respond(true, { callId: result.callId, initiated: true });
         } catch (err) {
           sendError(respond, err);
         }
@@ -296,13 +265,19 @@ const voiceCallPlugin = {
       "voicecall.continue",
       async ({ params, respond }: GatewayRequestHandlerOptions) => {
         try {
-          await respondToCallMessageAction({
-            requestParams: params,
-            respond,
-            action: (request) => request.rt.manager.continueCall(request.callId, request.message),
-            failure: "continue failed",
-            includeTranscript: true,
-          });
+          const callId = typeof params?.callId === "string" ? params.callId.trim() : "";
+          const message = typeof params?.message === "string" ? params.message.trim() : "";
+          if (!callId || !message) {
+            respond(false, { error: "callId and message required" });
+            return;
+          }
+          const rt = await ensureRuntime();
+          const result = await rt.manager.continueCall(callId, message);
+          if (!result.success) {
+            respond(false, { error: result.error || "continue failed" });
+            return;
+          }
+          respond(true, { success: true, transcript: result.transcript });
         } catch (err) {
           sendError(respond, err);
         }
@@ -313,12 +288,19 @@ const voiceCallPlugin = {
       "voicecall.speak",
       async ({ params, respond }: GatewayRequestHandlerOptions) => {
         try {
-          await respondToCallMessageAction({
-            requestParams: params,
-            respond,
-            action: (request) => request.rt.manager.speak(request.callId, request.message),
-            failure: "speak failed",
-          });
+          const callId = typeof params?.callId === "string" ? params.callId.trim() : "";
+          const message = typeof params?.message === "string" ? params.message.trim() : "";
+          if (!callId || !message) {
+            respond(false, { error: "callId and message required" });
+            return;
+          }
+          const rt = await ensureRuntime();
+          const result = await rt.manager.speak(callId, message);
+          if (!result.success) {
+            respond(false, { error: result.error || "speak failed" });
+            return;
+          }
+          respond(true, { success: true });
         } catch (err) {
           sendError(respond, err);
         }
@@ -385,12 +367,14 @@ const voiceCallPlugin = {
             return;
           }
           const rt = await ensureRuntime();
-          await initiateCallAndRespond({
-            rt,
-            respond,
-            to,
+          const result = await rt.manager.initiateCall(to, undefined, {
             message: message || undefined,
           });
+          if (!result.success) {
+            respond(false, { error: result.error || "initiate failed" });
+            return;
+          }
+          respond(true, { callId: result.callId, initiated: true });
         } catch (err) {
           sendError(respond, err);
         }
@@ -829,15 +813,22 @@ const voiceCallPlugin = {
         }
       },
       stop: async () => {
-        if (!runtimePromise) {
+        if (!_runtimePromise) {
           return;
         }
+        _stopPromise = (async () => {
+          try {
+            const rt = await _runtimePromise;
+            await rt.stop();
+          } finally {
+            _runtimePromise = null;
+            _runtime = null;
+          }
+        })();
         try {
-          const rt = await runtimePromise;
-          await rt.stop();
+          await _stopPromise;
         } finally {
-          runtimePromise = null;
-          runtime = null;
+          _stopPromise = null;
         }
       },
     });
