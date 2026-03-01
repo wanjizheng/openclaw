@@ -160,23 +160,26 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. Collect custom-only commits
 #    Use first-parent to stay on custom-main mainline and avoid traversing
-#    historical merged side branches.
+#    historical merged side branches. Exclude commits already present on
+#    upstream/main to avoid reapplying upstream changes.
 # ══════════════════════════════════════════════════════════════════════════════
 step "collecting custom commits"
 mapfile -t CUSTOM_COMMITS < <(
-  git --no-pager log --first-parent --reverse --no-merges --pretty=%H "${LATEST_TAG}..custom-main"
+  git --no-pager log --first-parent --reverse --no-merges --pretty=%H "${LATEST_TAG}..custom-main" ^upstream/main
 )
 if (( ${#CUSTOM_COMMITS[@]} == 0 )) || [[ -z "${CUSTOM_COMMITS[0]:-}" ]]; then
   die "no custom commits found between ${LATEST_TAG} and custom-main"
 fi
 
-if [[ "$AUTO_SLIM_COMMITS" == "true" ]] && (( ${#CUSTOM_COMMITS[@]} > MAX_CUSTOM_COMMITS )); then
-  log "WARN: large mainline commit set detected (${#CUSTOM_COMMITS[@]} > ${MAX_CUSTOM_COMMITS}); auto-slimming by unique subject"
+RAW_CUSTOM_COMMIT_COUNT="${#CUSTOM_COMMITS[@]}"
+if [[ "$AUTO_SLIM_COMMITS" == "true" ]]; then
   mapfile -t SLIMMED_COMMITS < <(slim_commit_list_by_subject "${CUSTOM_COMMITS[@]}")
   if (( ${#SLIMMED_COMMITS[@]} == 0 )); then
     die "auto-slim removed all commits; run with --no-auto-slim-commits to inspect full set"
   fi
-  log "auto-slim result: ${#CUSTOM_COMMITS[@]} -> ${#SLIMMED_COMMITS[@]} commit(s)"
+  if (( RAW_CUSTOM_COMMIT_COUNT != ${#SLIMMED_COMMITS[@]} )); then
+    log "auto-slim result: ${RAW_CUSTOM_COMMIT_COUNT} -> ${#SLIMMED_COMMITS[@]} commit(s)"
+  fi
   CUSTOM_COMMITS=("${SLIMMED_COMMITS[@]}")
 fi
 
