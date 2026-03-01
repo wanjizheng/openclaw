@@ -410,9 +410,10 @@ export function buildAgentSystemPrompt(params: {
   });
   const workspaceNotes = (params.workspaceNotes ?? []).map((note) => note.trim()).filter(Boolean);
 
-  // For "none" mode, return just the basic identity line
+  // For "none" mode, return just the basic identity line + optional extra prompt
   if (promptMode === "none") {
-    return "You are a personal assistant running inside OpenClaw.";
+    const base = "You are a personal assistant running inside OpenClaw.";
+    return extraSystemPrompt ? `${base}\n\n${extraSystemPrompt}` : base;
   }
 
   const lines = [

@@ -69,6 +69,8 @@ export type RunEmbeddedPiAgentParams = {
   clientTools?: ClientToolDefinition[];
   /** Disable built-in tools for this run (LLM-only mode). */
   disableTools?: boolean;
+  /** Override prompt mode (full/minimal/none). Defaults to auto-detection from session key. */
+  promptMode?: "full" | "minimal" | "none";
   provider?: string;
   model?: string;
   authProfileId?: string;

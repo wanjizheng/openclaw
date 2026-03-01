@@ -659,12 +659,17 @@ export class VoiceCallWebhookServer {
       }
 
       console.log(`[voice-call] AI response (${genMs}ms): "${result.text}"`);
+
+      // Check if LLM wants to end the call via [END_CALL] marker
+      const wantsEndCall = result.text.includes("[END_CALL]");
+      const speakText = result.text.replace(/\[END_CALL\]/g, "").trim();
+
       if (result.audioUrl) {
         console.log(`[voice-call] Hosted audio ready: ${result.audioUrl}`);
       }
 
       const speakStart = Date.now();
-      const speakResult = await this.manager.speak(callId, result.text, {
+      const speakResult = await this.manager.speak(callId, speakText, {
         audioUrl: result.audioUrl,
       });
       const speakMs = Date.now() - speakStart;
@@ -676,6 +681,17 @@ export class VoiceCallWebhookServer {
         console.log(
           `[voice-call] Speak completed for ${callId} in ${speakMs}ms (total: ${genMs + speakMs}ms)`,
         );
+      }
+
+      // End the call if the LLM included [END_CALL]
+      if (wantsEndCall) {
+        console.log(`[voice-call] LLM requested end-call via [END_CALL] marker for ${callId}`);
+        // Delay to let Twilio finish playing the buffered farewell audio
+        setTimeout(() => {
+          void this.manager.endCall(callId).catch((err) => {
+            console.warn(`[voice-call] Failed to end call ${callId}:`, err);
+          });
+        }, 4000);
       }
     } catch (err) {
       console.error(`[voice-call] Auto-response error:`, err);
@@ -696,6 +712,8 @@ export class VoiceCallWebhookServer {
     }
 
     if (endAfterSpeak) {
+      // Delay to let Twilio finish playing the buffered farewell audio
+      await new Promise((resolve) => setTimeout(resolve, 4000));
       const endResult = await this.manager.endCall(callId);
       if (!endResult.success) {
         console.warn(
