@@ -231,16 +231,20 @@ export async function speak(
     transitionState(call, "speaking");
     persistCallRecord(ctx.storePath, call);
 
-    addTranscriptEntry(call, "bot", text);
-
     const voice = provider.name === "twilio" ? ctx.config.tts?.openai?.voice : undefined;
-    await provider.playTts({
-      callId,
-      providerCallId,
-      text,
-      audioUrl: options?.audioUrl,
-      voice,
-    });
+    try {
+      await provider.playTts({
+        callId,
+        providerCallId,
+        text,
+        audioUrl: options?.audioUrl,
+        voice,
+      });
+    } finally {
+      // Add bot transcript entry AFTER TTS is sent so the user's preceding
+      // speech entry (added when the final transcript arrives) is always first.
+      addTranscriptEntry(call, "bot", text);
+    }
 
     return { success: true };
   } catch (err) {
