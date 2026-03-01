@@ -35,6 +35,7 @@ SKIP_DEPLOY="false"
 CONFLICT_STRATEGY="prefer-custom"
 SYNC_CUSTOM_MAIN="false"
 MAX_CUSTOM_COMMITS="300"
+AUTO_SLIM_COMMITS="true"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -52,6 +53,7 @@ while (( $# )); do
     --skip-deploy)       SKIP_DEPLOY="true"; shift ;;
     --sync-custom-main)  SYNC_CUSTOM_MAIN="true"; shift ;;
     --max-custom-commits) MAX_CUSTOM_COMMITS="${2:-300}"; shift 2 ;;
+    --no-auto-slim-commits) AUTO_SLIM_COMMITS="false"; shift ;;
     --conflict-strategy) CONFLICT_STRATEGY="${2:-prefer-custom}"; shift 2 ;;
     --deploy-target)     DEPLOY_TARGET="${2:?}"; shift 2 ;;
     *) die "unknown arg: $1" ;;
@@ -63,6 +65,37 @@ done
 
 [[ "$MAX_CUSTOM_COMMITS" =~ ^[0-9]+$ ]] \
   || die "--max-custom-commits must be a non-negative integer"
+
+[[ "$AUTO_SLIM_COMMITS" =~ ^(true|false)$ ]] \
+  || die "--no-auto-slim-commits parse failed"
+
+slim_commit_list_by_subject() {
+  local -a input_commits=("$@")
+  local -A seen_subjects=()
+  local -a newest_unique=()
+
+  local index sha subject
+  for (( index=${#input_commits[@]}-1; index>=0; index-- )); do
+    sha="${input_commits[$index]}"
+    subject="$(git --no-pager show -s --format=%s "$sha")"
+
+    case "$subject" in
+      "update"|"chore: snapshot WIP before release integrate ("*|"chore(auto-update): snapshot fork changes before release integrate ("*)
+        continue
+        ;;
+    esac
+
+    if [[ -n "${seen_subjects[$subject]+x}" ]]; then
+      continue
+    fi
+    seen_subjects["$subject"]=1
+    newest_unique+=("$sha")
+  done
+
+  for (( index=${#newest_unique[@]}-1; index>=0; index-- )); do
+    printf '%s\n' "${newest_unique[$index]}"
+  done
+}
 
 SECONDS=0
 ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
@@ -132,8 +165,19 @@ mapfile -t CUSTOM_COMMITS < <(
 if (( ${#CUSTOM_COMMITS[@]} == 0 )) || [[ -z "${CUSTOM_COMMITS[0]:-}" ]]; then
   die "no custom commits found between ${LATEST_TAG} and custom-main"
 fi
+
+if [[ "$AUTO_SLIM_COMMITS" == "true" ]] && (( ${#CUSTOM_COMMITS[@]} > MAX_CUSTOM_COMMITS )); then
+  log "WARN: large commit set detected (${#CUSTOM_COMMITS[@]} > ${MAX_CUSTOM_COMMITS}); auto-slimming by unique subject"
+  mapfile -t SLIMMED_COMMITS < <(slim_commit_list_by_subject "${CUSTOM_COMMITS[@]}")
+  if (( ${#SLIMMED_COMMITS[@]} == 0 )); then
+    die "auto-slim removed all commits; run with --no-auto-slim-commits to inspect full set"
+  fi
+  log "auto-slim result: ${#CUSTOM_COMMITS[@]} -> ${#SLIMMED_COMMITS[@]} commit(s)"
+  CUSTOM_COMMITS=("${SLIMMED_COMMITS[@]}")
+fi
+
 if (( ${#CUSTOM_COMMITS[@]} > MAX_CUSTOM_COMMITS )); then
-  die "custom commit set is too large (${#CUSTOM_COMMITS[@]} > ${MAX_CUSTOM_COMMITS}); update commit selection before release build"
+  die "custom commit set is too large (${#CUSTOM_COMMITS[@]} > ${MAX_CUSTOM_COMMITS}); increase --max-custom-commits or pre-clean custom-main"
 fi
 log "found ${#CUSTOM_COMMITS[@]} custom commit(s) to cherry-pick:"
 for sha in "${CUSTOM_COMMITS[@]}"; do
