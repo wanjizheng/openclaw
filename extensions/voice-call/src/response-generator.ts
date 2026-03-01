@@ -526,7 +526,7 @@ async function synthesizeWithSag(text: string, outputPath: string): Promise<bool
   });
 }
 
-function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined {
+export function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined {
   const envBase = process.env.VOICE_CALL_AUDIO_BASE_URL?.trim();
   if (envBase) {
     return envBase.replace(/\/+$/, "");
@@ -548,6 +548,20 @@ function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Convert a local audio file path to a publicly accessible URL.
+ * Used by Gather mode to serve audio via `<Play>` in TwiML.
+ */
+export function localPathToPublicUrl(
+  localPath: string,
+  config: VoiceCallConfig,
+): string | undefined {
+  const baseUrl = resolveAudioBaseUrl(config);
+  if (!baseUrl) return undefined;
+  const fileName = path.basename(localPath);
+  return `${baseUrl}/${encodeURIComponent(fileName)}`;
 }
 
 /**

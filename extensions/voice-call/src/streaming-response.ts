@@ -215,6 +215,7 @@ export type StreamingVoiceResponseResult = VoiceResponseResult & {
 export async function generateStreamingVoiceResponse(
   params: VoiceResponseParams,
   onTtsChunk: StreamingTtsCallback,
+  options?: { skipTts?: boolean },
 ): Promise<StreamingVoiceResponseResult> {
   const { voiceConfig, callId, from, callerName, direction, transcript, userMessage, coreConfig } =
     params;
@@ -330,6 +331,8 @@ export async function generateStreamingVoiceResponse(
   // We keep a promise chain so chunks are emitted in order.
   let ttsChain = Promise.resolve();
 
+  const skipTts = options?.skipTts ?? false;
+
   const enqueueTtsChunk = (text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return; // Skip empty / whitespace-only chunks
@@ -337,18 +340,24 @@ export async function generateStreamingVoiceResponse(
     allTextParts.push(trimmed);
     ttsChain = ttsChain.then(async () => {
       try {
-        const ttsStart = Date.now();
-        const audioUrl = await maybeGenerateHostedAudioUrl({
-          text: trimmed,
-          coreConfig: cfg,
-          voiceConfig,
-          callId,
-        });
-        const ttsMs = Date.now() - ttsStart;
-        if (firstAudioAt === 0) firstAudioAt = Date.now();
-        console.log(
-          `[voice-call] Streaming TTS chunk #${idx} (${ttsMs}ms): "${trimmed.slice(0, 60)}..." audio=${audioUrl ? "yes" : "no"}`,
-        );
+        let audioUrl: string | undefined;
+        if (!skipTts) {
+          const ttsStart = Date.now();
+          audioUrl = await maybeGenerateHostedAudioUrl({
+            text: trimmed,
+            coreConfig: cfg,
+            voiceConfig,
+            callId,
+          });
+          const ttsMs = Date.now() - ttsStart;
+          if (firstAudioAt === 0) firstAudioAt = Date.now();
+          console.log(
+            `[voice-call] Streaming TTS chunk #${idx} (${ttsMs}ms): "${trimmed.slice(0, 60)}..." audio=${audioUrl ? "yes" : "no"}`,
+          );
+        } else {
+          if (firstAudioAt === 0) firstAudioAt = Date.now();
+          console.log(`[voice-call] Streaming text chunk #${idx}: "${trimmed.slice(0, 60)}..."`);
+        }
         await onTtsChunk({ text: trimmed, audioUrl, index: idx });
       } catch (err) {
         console.warn(
