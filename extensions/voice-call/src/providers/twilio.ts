@@ -221,8 +221,8 @@ export class TwilioProvider implements VoiceCallProvider {
    */
   private async apiRequest<T = unknown>(
     endpoint: string,
-    params: Record<string, string | string[]>,
-    options?: { allowNotFound?: boolean },
+    params?: Record<string, string | string[]>,
+    options?: { allowNotFound?: boolean; method?: "GET" | "POST" },
   ): Promise<T> {
     return await twilioApiRequest<T>({
       baseUrl: this.baseUrl,
@@ -230,8 +230,27 @@ export class TwilioProvider implements VoiceCallProvider {
       authToken: this.authToken,
       endpoint,
       body: params,
+      method: options?.method,
       allowNotFound: options?.allowNotFound,
     });
+  }
+
+  /**
+   * Query Twilio for the current status of a call by its SID.
+   * Returns the Twilio status string (e.g. "completed", "in-progress", "failed")
+   * or null if the call was not found.
+   */
+  async getCallStatus(providerCallId: string): Promise<string | null> {
+    try {
+      const result = await this.apiRequest<TwilioCallResponse>(
+        `/Calls/${providerCallId}.json`,
+        undefined,
+        { allowNotFound: true, method: "GET" },
+      );
+      return result?.status ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**
