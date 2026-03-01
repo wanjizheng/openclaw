@@ -617,15 +617,15 @@ export class VoiceCallWebhookServer {
       return;
     }
 
-    if (isEndCallIntent(userMessage)) {
-      console.log(`[voice-call] End-call intent detected for ${callId}; hanging up immediately`);
-      await this.trySpeakFallback(callId, "好的，拜拜。", true);
+    // Skip if early end-intent already triggered from partial transcript
+    if (this.earlyEndIntentCalls.has(callId)) {
+      console.log(`[voice-call] Skipping for ${callId}: early end-intent already triggered`);
       return;
     }
 
-    // Skip LLM if early end-intent already triggered from partial transcript
-    if (this.earlyEndIntentCalls.has(callId)) {
-      console.log(`[voice-call] Skipping LLM for ${callId}: early end-intent already triggered`);
+    if (isEndCallIntent(userMessage)) {
+      console.log(`[voice-call] End-call intent detected for ${callId}; hanging up immediately`);
+      await this.trySpeakFallback(callId, "好的，拜拜。", true);
       return;
     }
 
@@ -705,7 +705,27 @@ export class VoiceCallWebhookServer {
     text: string,
     endAfterSpeak = false,
   ): Promise<void> {
-    const result = await this.manager.speak(callId, text);
+    // Try to generate SAG audio so the fallback uses the same natural voice
+    let audioUrl: string | undefined;
+    if (this.coreConfig) {
+      try {
+        audioUrl = await maybeGenerateHostedAudioUrl({
+          text,
+          coreConfig: this.coreConfig,
+          voiceConfig: this.config,
+          callId,
+        });
+        if (audioUrl) {
+          console.log(`[voice-call] Fallback SAG audio ready for ${callId}: ${audioUrl}`);
+        }
+      } catch (err) {
+        console.warn(`[voice-call] Fallback SAG generation failed, using Twilio TTS:`, err);
+      }
+    }
+
+    const result = await this.manager.speak(callId, text, {
+      audioUrl,
+    });
     if (!result.success) {
       console.warn(`[voice-call] Failed to speak fallback for ${callId}: ${result.error}`);
       return;
