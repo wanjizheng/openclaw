@@ -19,6 +19,7 @@ import type { CoreConfig } from "./core-bridge.js";
 import { loadCoreAgentDeps, loadCoreTtsDeps } from "./core-bridge.js";
 import type { VoiceResponseParams, VoiceResponseResult } from "./response-generator.js";
 import { maybeGenerateHostedAudioUrl, loadPersonaContext } from "./response-generator.js";
+import { computeVoiceVisibleText } from "./utils.js";
 
 // ── TAG definitions ──────────────────────────────────────────────────────────
 
@@ -368,6 +369,9 @@ export async function generateStreamingVoiceResponse(
   // Accumulate full LLM text for logging / transcript
   let fullRawText = "";
   let dsmlDetected = false;
+  // Tracks how many characters of clean (think-stripped) text have already
+  // been pushed to the sentence buffer, so we can compute the incremental delta.
+  let prevCleanLen = 0;
 
   try {
     const llmStart = Date.now();
@@ -394,7 +398,6 @@ export async function generateStreamingVoiceResponse(
       onPartialReply: (payload) => {
         if (!payload.text) return;
 
-        const prevLen = fullRawText.length;
         fullRawText = payload.text;
 
         // Detect DSML markup in response — can't reliably strip per-delta
@@ -416,9 +419,15 @@ export async function generateStreamingVoiceResponse(
           return;
         }
 
-        // Normal non-DSML streaming: compute delta and push to sentence buffer
-        const delta = fullRawText.slice(prevLen);
-        sentenceBuffer.push(delta);
+        // Strip <think>…</think> reasoning blocks and <final> wrapper tags
+        // incrementally. computeVoiceVisibleText holds back any partial tag
+        // suffix that might grow into a special tag on the next chunk.
+        const cleanText = computeVoiceVisibleText(fullRawText, false);
+        const cleanDelta = cleanText.slice(prevCleanLen);
+        prevCleanLen = cleanText.length;
+        if (cleanDelta) {
+          sentenceBuffer.push(cleanDelta);
+        }
       },
     });
 
@@ -438,6 +447,15 @@ export async function generateStreamingVoiceResponse(
       }
     }
 
+    // Flush any text that was held back by partial-tag detection during streaming
+    if (!dsmlDetected && fullRawText) {
+      const finalCleanText = computeVoiceVisibleText(fullRawText, true);
+      const heldBack = finalCleanText.slice(prevCleanLen);
+      if (heldBack) {
+        sentenceBuffer.push(heldBack);
+      }
+    }
+
     // If onPartialReply didn't fire (model doesn't support streaming),
     // fall back to processing the full final output
     if (!fullRawText) {
@@ -448,6 +466,10 @@ export async function generateStreamingVoiceResponse(
       let text = texts.join(" ") || null;
       if (text) {
         text = stripDsmlMarkup(text) || null;
+      }
+      // Strip <think>/reasoning blocks and <final> wrapper tags from thinking models
+      if (text) {
+        text = computeVoiceVisibleText(text, true) || null;
       }
       if (text) {
         fullRawText = text;
