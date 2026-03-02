@@ -304,11 +304,23 @@ export class VoiceCallWebhookServer {
         // Use setTimeout to allow stream setup to complete
         this.greetingCalls.add(callId);
         setTimeout(async () => {
+          // Suppress STT during greeting to prevent echo pickup
+          if (this.provider.name === "twilio") {
+            (this.provider as TwilioProvider).suppressSTTForCall(callId);
+          }
           try {
             await this.manager.speakInitialMessage(callId);
+            // Wait for Twilio to finish playing the greeting audio
+            if (this.provider.name === "twilio") {
+              await (this.provider as TwilioProvider).waitForTtsComplete(callId);
+            }
           } catch (err) {
             console.warn(`[voice-call] Failed to speak initial message:`, err);
           } finally {
+            // Resume STT and remove greeting guard
+            if (this.provider.name === "twilio") {
+              (this.provider as TwilioProvider).resumeSTTForCall(callId);
+            }
             // Keep discarding echo transcripts for a short buffer after greeting
             // finishes, then resume normal transcript processing.
             setTimeout(() => {
@@ -609,13 +621,14 @@ export class VoiceCallWebhookServer {
    * Falls back to non-streaming generateVoiceResponse when streaming setup fails.
    */
   private async handleInboundResponse(callId: string, userMessage: string): Promise<void> {
-    console.log(`[voice-call] Auto-responding to inbound call ${callId}: "${userMessage}"`);
-
     const call = this.manager.getCall(callId);
     if (!call) {
       console.warn(`[voice-call] Call ${callId} not found for auto-response`);
       return;
     }
+    console.log(
+      `[voice-call] Auto-responding to ${call.direction} call ${callId}: "${userMessage}"`,
+    );
 
     if (!this.coreConfig) {
       console.warn("[voice-call] Core config missing; skipping auto-response");
@@ -634,10 +647,22 @@ export class VoiceCallWebhookServer {
       transcript: call.transcript,
       userMessage,
       callReason:
-        call.direction === "outbound" && typeof call.metadata?.initialMessage === "string"
-          ? call.metadata.initialMessage.trim() || undefined
+        call.direction === "outbound" &&
+        typeof (call.metadata?.callReason ?? call.metadata?.initialMessage) === "string"
+          ? String(call.metadata?.callReason ?? call.metadata?.initialMessage).trim() || undefined
           : undefined,
     };
+
+    if (voiceParams.callReason) {
+      console.log(`[voice-call] callReason for ${callId}: "${voiceParams.callReason}"`);
+    }
+
+    // Suppress STT for the entire speaking turn to prevent echo feedback loop.
+    // STT will resume after Twilio confirms all audio has been played (mark event).
+    const providerCallId = call.providerCallId;
+    if (providerCallId && this.provider.name === "twilio") {
+      (this.provider as TwilioProvider).suppressSTTForCall(providerCallId);
+    }
 
     try {
       const genStart = Date.now();
@@ -691,6 +716,13 @@ export class VoiceCallWebhookServer {
       // Note: each manager.speak() call already adds a transcript entry via addTranscriptEntry,
       // so we don't need to add another one here.
 
+      // Wait for Twilio to finish playing all audio, then resume STT
+      if (providerCallId && this.provider.name === "twilio") {
+        await (this.provider as TwilioProvider).waitForTtsComplete(providerCallId);
+        (this.provider as TwilioProvider).resumeSTTForCall(providerCallId);
+        console.log(`[voice-call] STT resumed after TTS complete for ${callId}`);
+      }
+
       if (result.endCall) {
         console.log(`[voice-call] LLM signaled [END_CALL] for ${callId}, hanging up in 4s...`);
         await new Promise((resolve) => setTimeout(resolve, 4000));
@@ -702,6 +734,13 @@ export class VoiceCallWebhookServer {
     } catch (err) {
       console.error(`[voice-call] Auto-response error:`, err);
       await this.trySpeakFallback(callId, "抱歉，我这边刚刚出了点问题。请再说一遍。");
+    } finally {
+      // Safety net: always wait for audio to finish and resume STT
+      if (providerCallId && this.provider.name === "twilio") {
+        const twilio = this.provider as TwilioProvider;
+        await twilio.waitForTtsComplete(providerCallId);
+        twilio.resumeSTTForCall(providerCallId);
+      }
     }
   }
 
