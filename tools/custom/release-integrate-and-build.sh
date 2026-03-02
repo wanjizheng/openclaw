@@ -205,6 +205,26 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
   step "pnpm ui:build"
   pnpm ui:build 2>&1 | tail -5
   log "build complete ($(elapsed))"
+  
+  # ── Normalize version string for stable releases ──
+  # Git tag v2026.3.1 may point to package.json with version 2026.3.1-beta.1
+  # because OpenClaw promotes beta to stable via npm dist-tag without updating git tags.
+  # Strip -beta.N suffix to match the stable release tag.
+  step "normalize package.json version to match tag"
+  CURRENT_VERSION="$(jq -r '.version' package.json)"
+  NORMALIZED_VERSION="${LATEST_TAG#v}"  # v2026.3.1 → 2026.3.1
+  if [[ "$CURRENT_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-beta\.[0-9]+$ ]]; then
+    BASE_VERSION="${BASH_REMATCH[1]}"
+    if [[ "$BASE_VERSION" == "$NORMALIZED_VERSION" ]]; then
+      log "patching package.json version: $CURRENT_VERSION → $NORMALIZED_VERSION"
+      jq --arg v "$NORMALIZED_VERSION" '.version = $v' package.json > package.json.tmp
+      mv package.json.tmp package.json
+    else
+      log "version mismatch: tag=$NORMALIZED_VERSION, base=$BASE_VERSION (keep as-is)"
+    fi
+  else
+    log "version $CURRENT_VERSION already normalized (not beta format)"
+  fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
