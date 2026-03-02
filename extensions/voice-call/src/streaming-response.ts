@@ -376,7 +376,7 @@ export async function generateStreamingVoiceResponse(
       sessionId,
       sessionKey,
       messageProvider: "voice",
-      disableTools: true,
+      disableTools: false,
       promptMode: "none",
       sessionFile,
       workspaceDir,
