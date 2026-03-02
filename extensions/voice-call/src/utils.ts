@@ -17,8 +17,6 @@ export function computeVoiceVisibleText(raw: string, isFinal = false): string {
   const THINK_OPEN_RE = /^<\s*(?:think(?:ing)?|thought|antthinking)\b[^>]*>/i;
   const FINAL_TAG_RE = /^<\s*\/?\s*final\b[^>]*>/i;
   const THINK_CLOSE_RE = /<\s*\/\s*(?:think(?:ing)?|thought|antthinking)\b[^>]*>/i;
-  // Does this string look like the start of a special tag?
-  const SPECIAL_PREFIX_RE = /^<\s*(?:\/\s*)?(?:th|fi|an)/i;
 
   let result = "";
   let inThink = false;
@@ -37,8 +35,9 @@ export function computeVoiceVisibleText(raw: string, isFinal = false): string {
 
       const slice = raw.slice(i);
 
-      // Streaming: if the remaining text looks like a partial special tag, hold it back
-      if (!isFinal && !slice.includes(">") && (slice === "<" || SPECIAL_PREFIX_RE.test(slice))) {
+      // Streaming: if remaining text starts with '<' but has no '>', hold it back.
+      // Voice output never legitimately contains angle brackets, so this is safe.
+      if (!isFinal && !slice.includes(">")) {
         break;
       }
 
@@ -54,6 +53,15 @@ export function computeVoiceVisibleText(raw: string, isFinal = false): string {
       const finalTag = slice.match(FINAL_TAG_RE);
       if (finalTag) {
         i += finalTag[0].length;
+        continue;
+      }
+
+      // Check for malformed double-close tags like </</final>
+      const malformedTag = slice.match(
+        /^(?:<\s*\/\s*)+(?:final|think(?:ing)?|thought|antthinking)\b[^>]*>/i,
+      );
+      if (malformedTag) {
+        i += malformedTag[0].length;
         continue;
       }
 
@@ -73,6 +81,13 @@ export function computeVoiceVisibleText(raw: string, isFinal = false): string {
       inThink = false;
     }
   }
+
+  // Final cleanup: strip any dangling tag fragments that survived the parser
+  // (e.g. "</</final" without closing ">", or lone "</")
+  result = result.replace(
+    /\s*(?:<\s*\/?)+\s*(?:final|think(?:ing)?|thought|antthinking)?\s*$/gi,
+    "",
+  );
 
   return result;
 }
