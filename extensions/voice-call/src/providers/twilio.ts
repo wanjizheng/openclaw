@@ -1256,7 +1256,7 @@ ${nextStepXml}
     const twiml = this.buildResumeRelayTwiml();
 
     try {
-      await this.client.calls(callSid).update({ twiml });
+      await this.updateCallTwiml(callSid, twiml);
       console.log(
         `[voice-call][hybrid] Switched from PLAYING to RELAY for ${callSid} due to interrupt`,
       );
