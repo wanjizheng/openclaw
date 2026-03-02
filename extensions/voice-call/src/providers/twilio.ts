@@ -217,6 +217,37 @@ export class TwilioProvider implements VoiceCallProvider {
   }
 
   /**
+   * Suppress STT for a call (stop forwarding audio to STT, discard transcripts).
+   */
+  suppressSTTForCall(callSid: string): void {
+    const streamSid = this.callStreamMap.get(callSid);
+    if (streamSid && this.mediaStreamHandler) {
+      this.mediaStreamHandler.suppressSTT(streamSid);
+    }
+  }
+
+  /**
+   * Resume STT for a call.
+   */
+  resumeSTTForCall(callSid: string): void {
+    const streamSid = this.callStreamMap.get(callSid);
+    if (streamSid && this.mediaStreamHandler) {
+      this.mediaStreamHandler.resumeSTT(streamSid);
+    }
+  }
+
+  /**
+   * Wait for Twilio to finish playing all buffered TTS audio for a call.
+   * Uses Twilio's mark events to know when audio has actually been rendered.
+   */
+  async waitForTtsComplete(callSid: string): Promise<void> {
+    const streamSid = this.callStreamMap.get(callSid);
+    if (streamSid && this.mediaStreamHandler) {
+      await this.mediaStreamHandler.waitForLastMark(streamSid);
+    }
+  }
+
+  /**
    * Make an authenticated request to the Twilio API.
    */
   private async apiRequest<T = unknown>(
