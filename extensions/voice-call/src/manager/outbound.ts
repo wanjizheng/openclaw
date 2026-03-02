@@ -168,6 +168,9 @@ export async function initiateCall(
     processedEventIds: [],
     metadata: {
       ...(initialMessage && { initialMessage }),
+      // Keep callReason as a separate field so it survives speakInitialMessage
+      // which deletes initialMessage after speaking to prevent re-speaking on reconnect.
+      ...(initialMessage && { callReason: initialMessage }),
       ...(opts.initialMessageAudioUrl && { initialMessageAudioUrl: opts.initialMessageAudioUrl }),
       mode,
     },

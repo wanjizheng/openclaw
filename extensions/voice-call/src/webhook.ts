@@ -232,6 +232,20 @@ export class VoiceCallWebhookServer {
       onTranscript: (providerCallId, transcript) => {
         console.log(`[voice-call] Transcript for ${providerCallId}: ${transcript}`);
 
+        // In hybrid mode, ignore the transcript that triggered an interrupt
+        if (this.provider.name === "twilio") {
+          const twilioProvider = this.provider as TwilioProvider;
+          if (
+            twilioProvider.isHybridMode &&
+            twilioProvider.consumeHybridInterruptFlag(providerCallId)
+          ) {
+            console.log(
+              `[voice-call][hybrid] Ignoring interrupt-trigger transcript for ${providerCallId}: "${transcript}"`,
+            );
+            return;
+          }
+        }
+
         // Clear TTS queue on barge-in (user started speaking, interrupt current playback)
         if (this.provider.name === "twilio") {
           (this.provider as TwilioProvider).clearTtsQueue(providerCallId);
@@ -274,7 +288,20 @@ export class VoiceCallWebhookServer {
       },
       onSpeechStart: (providerCallId) => {
         if (this.provider.name === "twilio") {
-          (this.provider as TwilioProvider).clearTtsQueue(providerCallId);
+          const twilioProvider = this.provider as TwilioProvider;
+
+          // In hybrid mode, if user speaks during PLAYING state, abort playback immediately
+          if (twilioProvider.isHybridMode) {
+            if (twilioProvider.hasActiveHybridQueue(providerCallId)) {
+              console.log(
+                `[voice-call][hybrid] User interrupted during playback for ${providerCallId}`,
+              );
+              twilioProvider.abortHybridPlay(providerCallId);
+              return; // Don't clear regular TTS queue in hybrid PLAYING state
+            }
+          }
+
+          twilioProvider.clearTtsQueue(providerCallId);
         }
         // If user barges in during greeting, stop discarding transcripts
         // so the follow-up real transcript is processed normally.
@@ -298,6 +325,40 @@ export class VoiceCallWebhookServer {
         // WORKFLOW_AUTO: For inbound calls, handle state transitions and
         // inject pre-generated greeting audio for instant playback.
         const call = this.manager.getCallByProviderCallId(callId);
+
+        // ── Hybrid mode: fork stream is STT-only ────────────────────────
+        const isHybrid =
+          this.provider.name === "twilio" && (this.provider as TwilioProvider).isHybridMode;
+
+        if (isHybrid) {
+          // In hybrid mode, the <Start><Stream> fork only provides STT.
+          // Greeting is spoken by CR's welcomeGreeting; lifecycle is managed by CR setup.
+          (this.provider as TwilioProvider).registerCallStream(callId, streamSid);
+
+          // Synthesize call.answered — the fork connects after the call is live
+          if (call && call.state === "ringing") {
+            const answeredEvent: NormalizedEvent = {
+              id: `stream-answered-${Date.now()}`,
+              type: "call.answered" as const,
+              callId: call.callId,
+              providerCallId: callId,
+              timestamp: Date.now(),
+            };
+            this.manager.processEvent(answeredEvent);
+          }
+
+          // Suppress echo transcripts during the CR greeting period
+          this.greetingCalls.add(callId);
+          setTimeout(() => {
+            if (this.greetingCalls.has(callId)) {
+              this.greetingCalls.delete(callId);
+              console.log(`[voice-call][hybrid] Greeting period ended, resuming STT for ${callId}`);
+            }
+          }, 5000);
+          return;
+        }
+
+        // ── Non-hybrid mode: original flow ───────────────────────────────
         if (call && call.direction === "inbound") {
           // Twilio doesn't reliably send status-callback "in-progress" for
           // inbound calls, so synthesize a call.answered event when the
@@ -546,12 +607,13 @@ export class VoiceCallWebhookServer {
       verifiedRequestKey: verification.verifiedRequestKey,
     });
 
-    // Gather action callbacks carry identical bodies (same CallSid, CallStatus,
+    // Gather/Play action callbacks carry identical bodies (same CallSid, CallStatus,
     // etc.) on every cycle, producing the same Twilio HMAC signature and thus
-    // the same replay key.  They are NOT replays — each one is a new Gather
+    // the same replay key.  They are NOT replays — each one is a new
     // timeout/speech event — so we must exempt them from the replay filter.
     const isGatherActionCallback = url.searchParams.get("gatherAction") === "1";
-    const treatAsReplay = verification.isReplay && !isGatherActionCallback;
+    const isPlayActionCallback = url.searchParams.get("playAction") === "1";
+    const treatAsReplay = verification.isReplay && !isGatherActionCallback && !isPlayActionCallback;
 
     // Process each event
     if (treatAsReplay) {
@@ -565,6 +627,7 @@ export class VoiceCallWebhookServer {
             this.inFlightAutoResponses.delete(event.callId);
             if (this.provider.name === "twilio" && event.providerCallId) {
               (this.provider as TwilioProvider).clearGatherQueue(event.providerCallId);
+              (this.provider as TwilioProvider).clearHybridQueue(event.providerCallId);
             }
             // Audio file cleanup is handled by the onCallEnded hook.
           }
@@ -623,6 +686,47 @@ export class VoiceCallWebhookServer {
               `[voice-call][cr] Embedded welcomeGreeting in initial TwiML for ${call.callId}: "${greetingText?.slice(0, 60)}"`,
             );
           }
+        }
+      }
+    }
+
+    // ── Hybrid mode: embed welcomeGreeting in initial TwiML ───────────────
+    if (this.provider.name === "twilio" && (this.provider as TwilioProvider).isHybridMode) {
+      for (const event of result.events) {
+        if (event.type === "call.ringing" && event.providerCallId) {
+          const call = this.manager.getCall(event.callId);
+          if (!call) continue;
+
+          let greetingText: string | undefined;
+
+          if (call.direction === "inbound") {
+            // Inbound: use pre-generated greeting text
+            const callerKey = normalizePhoneNumber(call.from);
+            greetingText =
+              this.preGeneratedGreetingTexts.get(callerKey) ??
+              this.preGeneratedGreetingTexts.get("__global__") ??
+              this.config.inboundGreeting;
+          } else {
+            // Outbound: use initial message from metadata as greeting
+            greetingText =
+              typeof call.metadata?.initialMessage === "string"
+                ? call.metadata.initialMessage
+                : undefined;
+          }
+
+          // Strip emotion markers
+          if (greetingText) {
+            greetingText = greetingText.replace(/\[[\w-]+\]\s*/g, "").trim();
+          }
+
+          const twilio = this.provider as TwilioProvider;
+          result.providerResponseBody = twilio.buildHybridInitialTwiml({
+            callSid: event.providerCallId,
+            welcomeGreeting: greetingText || undefined,
+          });
+          console.log(
+            `[voice-call][hybrid] Embedded greeting in initial TwiML for ${call.callId}: "${greetingText?.slice(0, 60)}"`,
+          );
         }
       }
     }
@@ -923,6 +1027,17 @@ export class VoiceCallWebhookServer {
               break;
             }
 
+            // In hybrid mode, STT comes from the fork Media Stream (OpenAI).
+            // CR's Deepgram transcript is ignored — CR is event-channel only.
+            const isHybridPrompt =
+              this.provider.name === "twilio" && (this.provider as TwilioProvider).isHybridMode;
+            if (isHybridPrompt) {
+              console.log(
+                `[voice-call][cr][hybrid] Ignoring CR prompt (using fork STT): "${voicePrompt.slice(0, 60)}" (call ${callId})`,
+              );
+              break;
+            }
+
             console.log(`[voice-call][cr] User said: "${voicePrompt}" (call ${callId})`);
 
             // Create speech event for the transcript
@@ -977,6 +1092,21 @@ export class VoiceCallWebhookServer {
       }
       if (callId) {
         this.crAbortControllers.delete(callId);
+
+        // In hybrid mode, CR disconnects during <Play> injection are expected.
+        // Don't synthesize call.ended if a hybrid play queue is active.
+        const isHybridClose =
+          this.provider.name === "twilio" &&
+          (this.provider as TwilioProvider).isHybridMode &&
+          callSid &&
+          (this.provider as TwilioProvider).hasActiveHybridQueue(callSid);
+        if (isHybridClose) {
+          console.log(
+            `[voice-call][cr][hybrid] Expected CR disconnect during play for ${callId}, not ending call`,
+          );
+          return;
+        }
+
         // Synthesize call.ended
         const call = this.manager.getCall(callId);
         if (call && !TerminalStates.has(call.state)) {
@@ -1062,13 +1192,14 @@ export class VoiceCallWebhookServer {
    * Falls back to non-streaming generateVoiceResponse when streaming setup fails.
    */
   private async handleInboundResponse(callId: string, userMessage: string): Promise<void> {
-    console.log(`[voice-call] Auto-responding to inbound call ${callId}: "${userMessage}"`);
-
     const call = this.manager.getCall(callId);
     if (!call) {
       console.warn(`[voice-call] Call ${callId} not found for auto-response`);
       return;
     }
+    console.log(
+      `[voice-call] Auto-responding to ${call.direction} call ${callId}: "${userMessage}"`,
+    );
 
     if (!this.coreConfig) {
       console.warn("[voice-call] Core config missing; skipping auto-response");
@@ -1087,10 +1218,15 @@ export class VoiceCallWebhookServer {
       transcript: call.transcript,
       userMessage,
       callReason:
-        call.direction === "outbound" && typeof call.metadata?.initialMessage === "string"
-          ? call.metadata.initialMessage.trim() || undefined
+        call.direction === "outbound" &&
+        typeof (call.metadata?.callReason ?? call.metadata?.initialMessage) === "string"
+          ? String(call.metadata?.callReason ?? call.metadata?.initialMessage).trim() || undefined
           : undefined,
     };
+
+    if (voiceParams.callReason) {
+      console.log(`[voice-call] callReason for ${callId}: "${voiceParams.callReason}"`);
+    }
 
     try {
       const genStart = Date.now();
@@ -1098,12 +1234,16 @@ export class VoiceCallWebhookServer {
       const spokenTexts: string[] = [];
 
       // Detect ConversationRelay mode: if we have an active CR WebSocket for this call
+      // In hybrid mode, CR is event-channel only — use the audio pipeline instead.
+      const isHybrid =
+        this.provider.name === "twilio" && (this.provider as TwilioProvider).isHybridMode;
       const crWs = call.providerCallId ? this.crConnections.get(call.providerCallId) : undefined;
-      const isCR = crWs && crWs.readyState === WebSocket.OPEN;
+      const isCR = !isHybrid && crWs && crWs.readyState === WebSocket.OPEN;
 
-      // In Gather mode, determine if we need to convert local audio paths to public URLs
+      // In Gather or Hybrid mode, convert local audio paths to public URLs for <Play>
       const isGather =
         !isCR && this.provider.name === "twilio" && (this.provider as TwilioProvider).isGatherMode;
+      const needsPublicUrl = isGather || isHybrid;
       const providerCallId = call?.providerCallId;
 
       if (isCR) {
@@ -1162,18 +1302,16 @@ export class VoiceCallWebhookServer {
           }
         }
       } else {
-        // ── Original pipeline: Gather mode or Media Streams ──────────────
+        // ── Original pipeline: Hybrid / Gather mode / Media Streams ──────
         const result = await generateStreamingVoiceResponse(voiceParams, async (chunk) => {
-          // In Gather mode: convert local audio path → public URL for <Play>
+          // In Gather or Hybrid mode: convert local audio path → public URL for <Play>
           let audioUrl = chunk.audioUrl;
-          if (isGather && audioUrl) {
+          if (needsPublicUrl && audioUrl) {
             const publicUrl = localPathToPublicUrl(audioUrl, this.config);
             if (publicUrl) {
               audioUrl = publicUrl;
             } else {
-              console.warn(
-                `[voice-call][gather] Failed to convert audio path to public URL: ${audioUrl}`,
-              );
+              console.warn(`[voice-call] Failed to convert audio path to public URL: ${audioUrl}`);
             }
           }
 
@@ -1224,11 +1362,18 @@ export class VoiceCallWebhookServer {
           (this.provider as TwilioProvider).markGatherSentencesDone(providerCallId, result.endCall);
         }
 
+        // In Hybrid mode, signal the play queue that generation is done.
+        // handlePlayNextAction will resume CR or <Hangup> after the last sentence.
+        if (isHybrid && providerCallId) {
+          (this.provider as TwilioProvider).markHybridSentencesDone(providerCallId, result.endCall);
+        }
+
         // Note: each manager.speak() call already adds a transcript entry via addTranscriptEntry,
         // so we don't need to add another one here.
 
-        if (result.endCall && !isGather) {
-          // In stream mode, wait then hang up. In Gather mode, the action URL chain handles this.
+        if (result.endCall && !isGather && !isHybrid) {
+          // In stream mode, wait then hang up.
+          // In Gather/Hybrid mode, the action URL chain handles end-of-call.
           console.log(`[voice-call] LLM signaled [END_CALL] for ${callId}, hanging up in 4s...`);
           await new Promise((resolve) => setTimeout(resolve, 4000));
           const endResult = await this.manager.endCall(callId);
