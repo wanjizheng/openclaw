@@ -795,8 +795,8 @@ const voiceCallPlugin = {
                   );
                 }
 
-                // --- Discord DM for inbound calls ---
-                if (isInbound) {
+                // --- Discord DM for call reports ---
+                {
                   const discordCfg = (api.config as CoreConfig & Record<string, unknown>)
                     ?.channels as Record<string, unknown> | undefined;
                   const allowFrom = (discordCfg?.discord as Record<string, unknown> | undefined)
@@ -806,15 +806,17 @@ const voiceCallPlugin = {
                     : undefined;
                   if (!ownerId) {
                     api.logger.warn(
-                      "[voice-call] No Discord owner ID found; cannot send inbound call report",
+                      "[voice-call] No Discord owner ID found; cannot send call report",
                     );
                     return;
                   }
 
                   // Discord message uses simpler format (no markdown headings)
+                  const dirLabel = isInbound ? "来电" : "去电";
+                  const partyField = isInbound ? "来电方" : "去电对象";
                   const discordLines = [
-                    `📞 **来电通话已结束**（此消息为自动通话记录，无需操作或回复）`,
-                    `**来电方：** ${callerLabel}`,
+                    `📞 **${dirLabel}通话已结束**（此消息为自动通话记录，无需操作或回复）`,
+                    `**${partyField}：** ${callerLabel}`,
                     `**时长：** ${durationStr}`,
                     `**结束原因：** ${call.endReason ?? "未知"}`,
                     ``,
@@ -830,7 +832,7 @@ const voiceCallPlugin = {
                     discordLines.join("\n"),
                   );
                   api.logger.info(
-                    `[voice-call] Sent inbound call report to Discord user ${ownerId}`,
+                    `[voice-call] Sent ${dirLabel} call report to Discord user ${ownerId}`,
                   );
                 }
               } catch (err) {
