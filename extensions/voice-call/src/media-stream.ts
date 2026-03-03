@@ -93,12 +93,6 @@ export class MediaStreamHandler {
   private ttsActiveControllers = new Map<string, AbortController>();
   /** Streams with STT suppressed (to avoid echo during greeting playback) */
   private sttSuppressed = new Set<string>();
-  /** Last mark name sent per stream (for tracking when Twilio finishes playing) */
-  private lastSentMark = new Map<string, string>();
-  /** Marks already received from Twilio (for race-safe waiting) */
-  private receivedMarks = new Set<string>();
-  /** Pending mark waiters: markName → resolve callback */
-  private markWaiters = new Map<string, () => void>();
 
   constructor(config: MediaStreamConfig) {
     this.config = config;
@@ -160,17 +154,8 @@ export class MediaStreamHandler {
 
           case "media":
             if (session && message.media?.payload) {
-              // Skip forwarding audio to STT when suppressed (during TTS playback)
-              if (!this.sttSuppressed.has(session.streamSid)) {
-                const audioBuffer = Buffer.from(message.media.payload, "base64");
-                session.sttSession.sendAudio(audioBuffer);
-              }
-            }
-            break;
-
-          case "mark":
-            if (session && message.mark?.name) {
-              this.handleMarkEvent(message.mark.name);
+              const audioBuffer = Buffer.from(message.media.payload, "base64");
+              session.sttSession.sendAudio(audioBuffer);
             }
             break;
 
@@ -234,19 +219,14 @@ export class MediaStreamHandler {
 
     // Set up transcript callbacks
     sttSession.onPartial((partial) => {
-      if (this.sttSuppressed.has(streamSid)) return;
       this.config.onPartialTranscript?.(callSid, partial);
     });
 
     sttSession.onTranscript((transcript) => {
-      // Discard transcripts while STT is suppressed (during TTS playback)
-      if (this.sttSuppressed.has(streamSid)) return;
       this.config.onTranscript?.(callSid, transcript);
     });
 
     sttSession.onSpeechStart(() => {
-      // Ignore speech-start during TTS playback to prevent barge-in
-      if (this.sttSuppressed.has(streamSid)) return;
       this.config.onSpeechStart?.(callSid);
     });
 
@@ -387,10 +367,8 @@ export class MediaStreamHandler {
 
   /**
    * Send a mark event to track audio playback position.
-   * Also records it as the last sent mark for this stream.
    */
   sendMark(streamSid: string, name: string): void {
-    this.lastSentMark.set(streamSid, name);
     this.sendToStream(streamSid, {
       event: "mark",
       streamSid,
@@ -461,51 +439,6 @@ export class MediaStreamHandler {
    */
   isTtsPlaying(streamSid: string): boolean {
     return this.ttsPlaying.get(streamSid) ?? false;
-  }
-
-  /**
-   * Wait for the last mark sent on a stream to be acknowledged by Twilio.
-   * This means Twilio has finished playing all buffered audio.
-   * Returns immediately if no mark was sent or the mark was already received.
-   */
-  waitForLastMark(streamSid: string, timeoutMs = 30000): Promise<void> {
-    const markName = this.lastSentMark.get(streamSid);
-    if (!markName) {
-      return Promise.resolve();
-    }
-    // Already received?
-    if (this.receivedMarks.has(markName)) {
-      this.receivedMarks.delete(markName);
-      this.lastSentMark.delete(streamSid);
-      return Promise.resolve();
-    }
-    return new Promise<void>((resolve) => {
-      const timer = setTimeout(() => {
-        this.markWaiters.delete(markName);
-        console.warn(`[MediaStream] Mark wait timeout for ${markName} on ${streamSid}`);
-        resolve();
-      }, timeoutMs);
-      timer.unref?.();
-      this.markWaiters.set(markName, () => {
-        clearTimeout(timer);
-        this.lastSentMark.delete(streamSid);
-        resolve();
-      });
-    });
-  }
-
-  /**
-   * Handle a mark event received from Twilio (audio reached that position).
-   */
-  private handleMarkEvent(markName: string): void {
-    const waiter = this.markWaiters.get(markName);
-    if (waiter) {
-      this.markWaiters.delete(markName);
-      waiter();
-    } else {
-      // Mark arrived before anyone waited for it — record for later
-      this.receivedMarks.add(markName);
-    }
   }
 
   /**
@@ -583,13 +516,6 @@ export class MediaStreamHandler {
     this.ttsPlaying.delete(streamSid);
     this.ttsQueues.delete(streamSid);
     this.sttSuppressed.delete(streamSid);
-    // Clean up mark tracking state
-    const lastMark = this.lastSentMark.get(streamSid);
-    if (lastMark) {
-      this.markWaiters.delete(lastMark);
-      this.receivedMarks.delete(lastMark);
-      this.lastSentMark.delete(streamSid);
-    }
   }
 }
 

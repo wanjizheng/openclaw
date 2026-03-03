@@ -12,7 +12,6 @@ import path from "node:path";
 import type { VoiceCallConfig } from "./config.js";
 import { findContactByPhone, loadContactsFileAsync } from "./contact-file.js";
 import { loadCoreAgentDeps, loadCoreTtsDeps, type CoreConfig } from "./core-bridge.js";
-import { computeVoiceVisibleText } from "./utils.js";
 
 /**
  * Strip DeepSeek DSML function-call markup from LLM output.
@@ -97,6 +96,14 @@ export async function loadPersonaContext(workspaceDir: string): Promise<string> 
     }
   }
   return sections.join("\n\n");
+}
+
+function extractDiscordUserId(text?: string): string | null {
+  if (!text) return null;
+  const match = text.match(
+    /discord[^\n]{0,80}?(?:user\s*id|id|用户id|用户编号)?[^\d]{0,10}(\d{15,22})/i,
+  );
+  return match?.[1] ?? null;
 }
 
 export type VoiceResponseParams = {
@@ -221,6 +228,9 @@ export async function generateVoiceResponse(
     voiceSystemPrompt ??
     `You are ${agentName}, a helpful voice assistant on a phone call. Keep responses brief and conversational (1-2 sentences max). Be natural and friendly. The caller's phone number is ${from}. You have access to tools - use them when helpful.`;
 
+  const toolGroundingRules =
+    "【工具一致性规则】1) 只有在工具明确成功返回后，才能说“已发送/已完成/已查到”。2) 若工具失败（例如浏览器未连接、权限不足、网络错误），必须明确告知失败原因，不能编造成功结果。3) 对时间/距离/路线等事实数据，只能引用工具返回值；若未获取到真实结果，必须说“暂时无法确认”。";
+
   // Prepend caller context so the LLM always knows who it is speaking with
   const callerLabel = callerName ? `${callerName} (${from})` : from;
   const directionLabel = direction === "inbound" ? "来电（对方打给你的）" : "去电（你打给对方的）";
@@ -228,12 +238,19 @@ export async function generateVoiceResponse(
 
   // Load persona context (IDENTITY.md, SOUL.md, USER.md)
   const personaContext = await loadPersonaContext(workspaceDir);
+  const defaultDiscordUserId = extractDiscordUserId(personaContext);
 
   // Build the stable (non-history) part of the system prompt
   let systemCore = basePrompt;
   if (personaContext) {
     systemCore += `\n\n${personaContext}`;
   }
+  if (defaultDiscordUserId) {
+    systemCore +=
+      `\n\n【Discord发送默认规则】当用户要求“发到我的Discord私信”且未提供其他目标时，默认目标为 user:${defaultDiscordUserId}。` +
+      ` 调用 message 工具时使用：action="send", channel="discord", target="user:${defaultDiscordUserId}"。`;
+  }
+  systemCore += `\n\n${toolGroundingRules}`;
   systemCore += `\n\n${callerContextLine}`;
   if (callerInfo) {
     systemCore += `\n\n${callerName ?? from}的个人信息：\n${callerInfo}`;
@@ -260,7 +277,7 @@ export async function generateVoiceResponse(
       sessionId,
       sessionKey,
       messageProvider: "voice",
-      disableTools: true,
+      disableTools: false,
       promptMode: "none",
       sessionFile,
       workspaceDir,
@@ -290,11 +307,6 @@ export async function generateVoiceResponse(
     // Strip any DSML markup the model may have hallucinated
     if (text) {
       text = stripDsmlMarkup(text) || null;
-    }
-
-    // Strip <think>/reasoning blocks and <final> wrapper tags from thinking models
-    if (text) {
-      text = computeVoiceVisibleText(text, true) || null;
     }
 
     // Detect and strip [END_CALL] marker before TTS (don't speak the tag aloud)
@@ -436,10 +448,6 @@ export async function generateGreetingText(params: {
     if (text) {
       text = stripDsmlMarkup(text) || null;
     }
-    // Strip <think>/reasoning blocks and <final> wrapper tags from thinking models
-    if (text) {
-      text = computeVoiceVisibleText(text, true) || null;
-    }
     if (text) {
       console.log(`[voice-call] LLM-generated greeting for ${callerLabel}: "${text}"`);
     }
@@ -536,7 +544,7 @@ async function synthesizeWithSag(text: string, outputPath: string): Promise<bool
   });
 }
 
-function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined {
+export function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined {
   const envBase = process.env.VOICE_CALL_AUDIO_BASE_URL?.trim();
   if (envBase) {
     return envBase.replace(/\/+$/, "");
@@ -558,6 +566,20 @@ function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Convert a local audio file path to a publicly accessible URL.
+ * Used by Gather mode to serve audio via `<Play>` in TwiML.
+ */
+export function localPathToPublicUrl(
+  localPath: string,
+  config: VoiceCallConfig,
+): string | undefined {
+  const baseUrl = resolveAudioBaseUrl(config);
+  if (!baseUrl) return undefined;
+  const fileName = path.basename(localPath);
+  return `${baseUrl}/${encodeURIComponent(fileName)}`;
 }
 
 /**
