@@ -21,6 +21,7 @@ import {
   generateGreetingText,
   localPathToPublicUrl,
   maybeGenerateHostedAudioUrl,
+  deleteCallAudioFiles,
 } from "./response-generator.js";
 import { generateStreamingVoiceResponse } from "./streaming-response.js";
 import { TerminalStates, type NormalizedEvent, type WebhookContext } from "./types.js";
@@ -50,6 +51,8 @@ export class VoiceCallWebhookServer {
   private preGeneratedGreetingUrls = new Map<string, string>();
   /** Pre-generated farewell audio URL ("好的，拜拜。") so end-call can play instantly */
   private cachedFarewellAudioUrl: string | undefined;
+  /** Dynamically generated greeting audio URLs per call (Hybrid mode), keyed by callId for cleanup */
+  private dynamicGreetingUrls = new Map<string, string>();
   /** Gather mode: polling timers for detecting inbound call hangup */
   private gatherCallPollers = new Map<string, ReturnType<typeof setInterval>>();
   /** ConversationRelay: WebSocket server for CR connections */
@@ -60,6 +63,8 @@ export class VoiceCallWebhookServer {
   private crAbortControllers = new Map<string, AbortController>();
   /** Pre-generated greeting texts (for ConversationRelay welcomeGreeting), keyed by normalised phone */
   private preGeneratedGreetingTexts = new Map<string, string>();
+  /** Active LLM response sessionIds for non-CR modes, keyed by callId (for interruption) */
+  private activeResponseSessionIds = new Map<string, string>();
 
   constructor(
     config: VoiceCallConfig,
@@ -303,6 +308,29 @@ export class VoiceCallWebhookServer {
 
           twilioProvider.clearTtsQueue(providerCallId);
         }
+
+        // Abort any in-flight LLM streaming for this call
+        const call = this.manager.getCallByProviderCallId(providerCallId);
+        if (call) {
+          const sessionId = this.activeResponseSessionIds.get(call.callId);
+          if (sessionId) {
+            // Dynamically import abortEmbeddedPiRun to stop LLM generation
+            void (async () => {
+              try {
+                const { abortEmbeddedPiRun } = await import("../../../src/agents/pi-embedded.js");
+                const aborted = abortEmbeddedPiRun(sessionId);
+                if (aborted) {
+                  console.log(
+                    `[voice-call] Aborted LLM streaming for ${call.callId} on user interrupt`,
+                  );
+                }
+              } catch (err) {
+                console.warn(`[voice-call] Failed to abort LLM streaming:`, err);
+              }
+            })();
+          }
+        }
+
         // If user barges in during greeting, stop discarding transcripts
         // so the follow-up real transcript is processed normally.
         if (this.greetingCalls.has(providerCallId)) {
@@ -332,29 +360,55 @@ export class VoiceCallWebhookServer {
 
         if (isHybrid) {
           // In hybrid mode, the <Start><Stream> fork only provides STT.
-          // Greeting is spoken by CR's welcomeGreeting; lifecycle is managed by CR setup.
           (this.provider as TwilioProvider).registerCallStream(callId, streamSid);
 
-          // Synthesize call.answered — the fork connects after the call is live
-          if (call && call.state === "ringing") {
-            const answeredEvent: NormalizedEvent = {
-              id: `stream-answered-${Date.now()}`,
-              type: "call.answered" as const,
-              callId: call.callId,
-              providerCallId: callId,
-              timestamp: Date.now(),
-            };
-            this.manager.processEvent(answeredEvent);
-          }
-
-          // Suppress echo transcripts during the CR greeting period
-          this.greetingCalls.add(callId);
-          setTimeout(() => {
-            if (this.greetingCalls.has(callId)) {
-              this.greetingCalls.delete(callId);
-              console.log(`[voice-call][hybrid] Greeting period ended, resuming STT for ${callId}`);
+          // ── INBOUND: Synthesize answered, greeting will be spoken via CR after setup ────
+          if (call && call.direction === "inbound") {
+            // Synthesize call.answered — the call is now active
+            if (call.state === "ringing") {
+              const answeredEvent: NormalizedEvent = {
+                id: `stream-answered-${Date.now()}`,
+                type: "call.answered" as const,
+                callId: call.callId,
+                providerCallId: callId,
+                timestamp: Date.now(),
+              };
+              this.manager.processEvent(answeredEvent);
             }
-          }, 5000);
+
+            // Echo suppression during greeting playback
+            this.greetingCalls.add(callId);
+            setTimeout(() => {
+              if (this.greetingCalls.has(callId)) {
+                this.greetingCalls.delete(callId);
+                console.log(`[voice-call][hybrid] Greeting done, resuming STT for ${callId}`);
+              }
+            }, 8000);
+          } else if (call && call.direction === "outbound") {
+            // ── OUTBOUND: TTS warmup already done during webhook handler.
+            // Just synthesize call.answered and set up echo suppression.
+            this.greetingCalls.add(callId);
+            if (call.state === "ringing") {
+              console.log(`[voice-call][hybrid-outbound] Stream connected for ${call.callId}`);
+              const answeredEvent: NormalizedEvent = {
+                id: `stream-answered-${Date.now()}`,
+                type: "call.answered" as const,
+                callId: call.callId,
+                providerCallId: callId,
+                timestamp: Date.now(),
+              };
+              this.manager.processEvent(answeredEvent);
+            }
+            // Echo suppression during greeting playback
+            setTimeout(() => {
+              if (this.greetingCalls.has(callId)) {
+                this.greetingCalls.delete(callId);
+                console.log(
+                  `[voice-call][hybrid] Outbound greeting done, resuming STT for ${callId}`,
+                );
+              }
+            }, 8000);
+          }
           return;
         }
 
@@ -629,6 +683,12 @@ export class VoiceCallWebhookServer {
               (this.provider as TwilioProvider).clearGatherQueue(event.providerCallId);
               (this.provider as TwilioProvider).clearHybridQueue(event.providerCallId);
             }
+            // Clean up dynamically generated greeting audio (Hybrid mode)
+            const greetingUrl = this.dynamicGreetingUrls.get(event.callId);
+            this.dynamicGreetingUrls.delete(event.callId);
+            if (greetingUrl) {
+              void deleteCallAudioFiles(event.callId, [greetingUrl]);
+            }
             // Audio file cleanup is handled by the onCallEnded hook.
           }
 
@@ -690,42 +750,98 @@ export class VoiceCallWebhookServer {
       }
     }
 
-    // ── Hybrid mode: embed welcomeGreeting in initial TwiML ───────────────
+    // ── Hybrid mode: build initial TwiML ───────────────────────────────────
+    // For INBOUND calls we delay the webhook response while generating greeting
+    // text + TTS audio (the caller hears ringing during this time, ~5-6s). Then
+    // we return a single TwiML: <Start><Stream> + <Play greeting.mp3> + <Connect CR>.
+    // TwiML executes sequentially: Stream forks (background), greeting plays
+    // (blocking), then CR connects. No conflicting Call Updates needed.
     if (this.provider.name === "twilio" && (this.provider as TwilioProvider).isHybridMode) {
       for (const event of result.events) {
         if (event.type === "call.ringing" && event.providerCallId) {
           const call = this.manager.getCall(event.callId);
           if (!call) continue;
 
+          const twilio = this.provider as TwilioProvider;
           let greetingText: string | undefined;
 
           if (call.direction === "inbound") {
-            // Inbound: use pre-generated greeting text
-            const callerKey = normalizePhoneNumber(call.from);
-            greetingText =
-              this.preGeneratedGreetingTexts.get(callerKey) ??
-              this.preGeneratedGreetingTexts.get("__global__") ??
-              this.config.inboundGreeting;
+            // Generate greeting text + audio using our own TTS pipeline (ElevenLabs/SAG).
+            // This generation IS the TTS warmup. The audio will be played through the
+            // normal hybrid playback mechanism (CR → speakInitialMessage → playTts → hybrid queue)
+            // after CR connects.
+            try {
+              const callerKey = normalizePhoneNumber(call.from);
+              const contacts = await loadContactsFileAsync();
+              const contact = contacts.find((c) => normalizePhoneNumber(c.phone) === callerKey);
+
+              const template = contact?.greeting ?? this.config.inboundGreeting;
+              const generatedText = await generateGreetingText({
+                voiceConfig: this.config,
+                coreConfig: this.coreConfig!,
+                from: call.from,
+                callerName: contact?.name,
+                greetingHint: template,
+                callerInfo: contact?.info,
+              });
+
+              greetingText = generatedText || template || "您好";
+
+              // Strip emotion markers
+              if (greetingText) {
+                greetingText = greetingText.replace(/\[[\w-]+\]\s*/g, "").trim();
+              }
+
+              // Generate TTS audio file (this IS the warmup)
+              const audioLocalPath = await maybeGenerateHostedAudioUrl({
+                text: greetingText,
+                coreConfig: this.coreConfig!,
+                voiceConfig: this.config,
+                callId: call.callId,
+              });
+
+              // Store in metadata so speakInitialMessage can use the pre-generated audio
+              if (call.metadata) {
+                call.metadata.initialMessage = greetingText;
+                if (audioLocalPath) {
+                  this.dynamicGreetingUrls.set(call.callId, audioLocalPath);
+                  const publicUrl = localPathToPublicUrl(audioLocalPath, this.config);
+                  if (publicUrl) {
+                    call.metadata.initialMessageAudioUrl = publicUrl;
+                  }
+                }
+              }
+
+              console.log(
+                `[voice-call][hybrid] Inbound warmup done for ${call.callId}: text="${greetingText?.slice(0, 60)}", audioUrl=${audioLocalPath ? "yes" : "no"}`,
+              );
+            } catch (err) {
+              console.warn(
+                `[voice-call][hybrid] Inbound warmup failed, proceeding without greeting:`,
+                err,
+              );
+            }
           } else {
-            // Outbound: use initial message from metadata as greeting
+            // Outbound: LLM greeting + TTS audio were pre-generated BEFORE dialing
+            // (in the initiate_call tool handler) so audio is ready immediately.
+            // Just read from metadata — no generation needed here.
             greetingText =
               typeof call.metadata?.initialMessage === "string"
-                ? call.metadata.initialMessage
+                ? call.metadata.initialMessage.replace(/\[[\w-]+\]\s*/g, "").trim()
                 : undefined;
+
+            console.log(
+              `[voice-call][hybrid] Outbound using pre-generated greeting for ${call.callId}: text="${greetingText?.slice(0, 60) || "none"}", audioUrl=${call.metadata?.initialMessageAudioUrl ? "yes" : "no"}`,
+            );
           }
 
-          // Strip emotion markers
-          if (greetingText) {
-            greetingText = greetingText.replace(/\[[\w-]+\]\s*/g, "").trim();
-          }
-
-          const twilio = this.provider as TwilioProvider;
+          // Both inbound and outbound: no welcomeGreeting — greeting is played via
+          // hybrid queue after CR connects (same mechanism as conversation responses).
           result.providerResponseBody = twilio.buildHybridInitialTwiml({
             callSid: event.providerCallId,
-            welcomeGreeting: greetingText || undefined,
           });
           console.log(
-            `[voice-call][hybrid] Embedded greeting in initial TwiML for ${call.callId}: "${greetingText?.slice(0, 60)}"`,
+            `[voice-call][hybrid] Initial TwiML for ${call.callId} (dir: ${call.direction}, greeting: "${greetingText?.slice(0, 60) || "none"}")`,
           );
         }
       }
@@ -1014,6 +1130,34 @@ export class VoiceCallWebhookServer {
                 this.manager.processEvent(answeredEvent);
                 console.log(`[voice-call][cr] Synthesized call.answered for ${callId}`);
               }
+
+              // In hybrid mode, speak the pre-generated greeting via the normal
+              // hybrid playback mechanism (same as conversation responses).
+              // speakInitialMessage reads call.metadata.initialMessage + initialMessageAudioUrl
+              // and calls speak() -> playTts() -> hybrid queue -> Call Update <Play> -> resume CR.
+              // Works for BOTH inbound and outbound — both pre-generate during webhook.
+              if (typeof call.metadata?.initialMessage === "string") {
+                this.greetingCalls.add(callSid);
+                setTimeout(async () => {
+                  try {
+                    await this.manager.speakInitialMessage(callSid);
+                    console.log(
+                      `[voice-call][cr] Greeting playback initiated for ${callId} (${call.direction})`,
+                    );
+                  } catch (err) {
+                    console.warn(`[voice-call][cr] Failed to speak greeting:`, err);
+                  } finally {
+                    setTimeout(() => {
+                      if (this.greetingCalls.has(callSid)) {
+                        this.greetingCalls.delete(callSid);
+                        console.log(
+                          `[voice-call][cr] Greeting echo suppression ended for ${callSid}`,
+                        );
+                      }
+                    }, 5000);
+                  }
+                }, 300);
+              }
             } else {
               console.warn(`[voice-call][cr] No call record found for callSid ${callSid}`);
             }
@@ -1201,6 +1345,11 @@ export class VoiceCallWebhookServer {
       `[voice-call] Auto-responding to ${call.direction} call ${callId}: "${userMessage}"`,
     );
 
+    // Track sessionId for this call (will be set inside generateStreamingVoiceResponse)
+    // but we need to import it to access the sessionId after generation starts.
+    // For now, we'll rely on the fact that sessionKey = `voice:${callId}` and
+    // sessionId is derived from session store lookup.
+
     if (!this.coreConfig) {
       console.warn("[voice-call] Core config missing; skipping auto-response");
       return;
@@ -1250,6 +1399,25 @@ export class VoiceCallWebhookServer {
         // ── ConversationRelay pipeline: stream text, no TTS ──────────────
         console.log(`[voice-call][cr] Starting text-only LLM response for ${callId}`);
 
+        // Extract sessionId from voiceParams to track active response
+        const sessionKey = `voice:${callId}`;
+        try {
+          const { loadCoreAgentDeps } = await import("./core-bridge.js");
+          const deps = await loadCoreAgentDeps();
+          const storePath = deps.resolveStorePath(this.coreConfig?.session?.store, {
+            agentId: "main",
+          });
+          const sessionStore = deps.loadSessionStore(storePath);
+          const sessionEntry = sessionStore[sessionKey] as
+            | { sessionId: string; updatedAt: number }
+            | undefined;
+          if (sessionEntry?.sessionId) {
+            this.activeResponseSessionIds.set(callId, sessionEntry.sessionId);
+          }
+        } catch {
+          // Non-fatal — session tracking is best-effort for interruption
+        }
+
         const result = await generateStreamingVoiceResponse(
           voiceParams,
           async (chunk) => {
@@ -1291,6 +1459,9 @@ export class VoiceCallWebhookServer {
             `total=${totalMs}ms${result.endCall ? " [END_CALL]" : ""}`,
         );
 
+        // Clean up session tracking after response completes
+        this.activeResponseSessionIds.delete(callId);
+
         if (result.endCall) {
           console.log(
             `[voice-call][cr] LLM signaled [END_CALL] for ${callId}, hanging up in 4s...`,
@@ -1303,6 +1474,25 @@ export class VoiceCallWebhookServer {
         }
       } else {
         // ── Original pipeline: Hybrid / Gather mode / Media Streams ──────
+        // Extract sessionId from voiceParams to track active response
+        const sessionKey = `voice:${callId}`;
+        try {
+          const { loadCoreAgentDeps } = await import("./core-bridge.js");
+          const deps = await loadCoreAgentDeps();
+          const storePath = deps.resolveStorePath(this.coreConfig?.session?.store, {
+            agentId: "main",
+          });
+          const sessionStore = deps.loadSessionStore(storePath);
+          const sessionEntry = sessionStore[sessionKey] as
+            | { sessionId: string; updatedAt: number }
+            | undefined;
+          if (sessionEntry?.sessionId) {
+            this.activeResponseSessionIds.set(callId, sessionEntry.sessionId);
+          }
+        } catch {
+          // Non-fatal — session tracking is best-effort for interruption
+        }
+
         const result = await generateStreamingVoiceResponse(voiceParams, async (chunk) => {
           // In Gather or Hybrid mode: convert local audio path → public URL for <Play>
           let audioUrl = chunk.audioUrl;
@@ -1355,6 +1545,9 @@ export class VoiceCallWebhookServer {
             `TTFA=${result.timeToFirstAudioMs}ms, total=${totalMs}ms` +
             `${result.endCall ? " [END_CALL]" : ""}`,
         );
+
+        // Clean up session tracking after response completes
+        this.activeResponseSessionIds.delete(callId);
 
         // In Gather mode, signal the sentence queue that generation is done.
         // If endCall is true, handleGatherAction will issue <Hangup> after draining.

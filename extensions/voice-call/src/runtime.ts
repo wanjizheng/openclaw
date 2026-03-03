@@ -199,7 +199,8 @@ export async function createVoiceCallRuntime(params: {
 
   // WORKFLOW_AUTO: Pre-generate inbound greeting audio for instant playback
   // when someone calls the bot.  Fire-and-forget so it doesn't block startup.
-  webhookServer.preGenerateInboundGreeting();
+  // DISABLED: Now generating greetings on-demand when calls connect (saves resources, warms up TTS)
+  // webhookServer.preGenerateInboundGreeting();
 
   const stop = async () => {
     // Always stop the webhook server last, even if tunnel/tailscale

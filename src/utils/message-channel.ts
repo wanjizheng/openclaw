@@ -73,7 +73,21 @@ export function normalizeMessageChannel(raw?: string | null): string | undefined
       (alias) => alias.trim().toLowerCase() === normalized,
     );
   });
-  return pluginMatch?.plugin.id ?? normalized;
+  if (pluginMatch?.plugin.id) {
+    return pluginMatch.plugin.id;
+  }
+
+  // Fuzzy fallback: tolerate natural-language channel hints like
+  // "discord dm", "发到discord私信" and map to a known channel when unique.
+  const knownChannels = listGatewayMessageChannels();
+  const matchedChannels = knownChannels.filter((channel) =>
+    normalized.includes(String(channel).toLowerCase()),
+  );
+  if (matchedChannels.length === 1) {
+    return matchedChannels[0];
+  }
+
+  return normalized;
 }
 
 const listPluginChannelIds = (): string[] => {

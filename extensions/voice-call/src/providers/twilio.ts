@@ -1130,7 +1130,7 @@ ${nextStepXml}
     return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <ConversationRelay url="${escapeXml(wsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true"${greetingAttr} />
+    <ConversationRelay url="${escapeXml(wsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true" inactivityTimeout="30"${greetingAttr} />
   </Connect>
 </Response>`;
   }
@@ -1140,10 +1140,15 @@ ${nextStepXml}
   /**
    * Build TwiML for Hybrid mode initial call setup.
    * Forks inbound audio via <Start><Stream> for our own OpenAI STT,
+   * optionally plays a greeting audio file via <Play>,
    * then hands the call to ConversationRelay for session/event management.
-   * TTS is injected later via Call Update with <Play>.
    */
-  buildHybridInitialTwiml(options: { callSid: string; welcomeGreeting?: string }): string {
+  buildHybridInitialTwiml(options: {
+    callSid: string;
+    welcomeGreeting?: string;
+    /** Public URL of a pre-generated greeting audio file to <Play> before connecting CR */
+    playUrl?: string;
+  }): string {
     // Stream URL (fork inbound audio for STT)
     const streamUrl = this.getStreamUrlForCall(options.callSid);
     if (!streamUrl) return TwilioProvider.PAUSE_TWIML;
@@ -1165,14 +1170,19 @@ ${nextStepXml}
       ? ` welcomeGreeting="${escapeXml(options.welcomeGreeting)}"`
       : "";
 
+    // When playUrl is provided, insert <Play> between <Start><Stream> and <Connect CR>.
+    // TwiML executes sequentially: Stream starts (non-blocking background fork),
+    // then <Play> plays the greeting audio (blocking), then <Connect CR> connects.
+    const playElement = options.playUrl ? `\n  <Play>${escapeXml(options.playUrl)}</Play>` : "";
+
     return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Start>
     <Stream url="${escapeXml(cleanStreamUrl)}" track="inbound_track">${tokenParam}
     </Stream>
-  </Start>
+  </Start>${playElement}
   <Connect>
-    <ConversationRelay url="${escapeXml(crWsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true"${greetingAttr} />
+    <ConversationRelay url="${escapeXml(crWsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true" inactivityTimeout="30"${greetingAttr} />
   </Connect>
 </Response>`;
   }
@@ -1186,8 +1196,9 @@ ${nextStepXml}
     if (!crWsUrl) return TwilioProvider.PAUSE_TWIML;
     return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Pause length="1"/>
   <Connect>
-    <ConversationRelay url="${escapeXml(crWsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true" />
+    <ConversationRelay url="${escapeXml(crWsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true" inactivityTimeout="30" />
   </Connect>
 </Response>`;
   }
