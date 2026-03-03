@@ -211,7 +211,9 @@ is_legacy_autoupdate_subject() {
   [[ "$subject" == "feat(release): add stable integrate/build pipeline for custom releases" ]] \
     || [[ "$subject" == "fix(auto-update): fallback continue when cherry-pick hooks/lint block" ]] \
     || [[ "$subject" == "fix(auto-update): tolerate rebase conflicts in integration pipeline" ]] \
-    || [[ "$subject" == "custom: auto-run gateway install after deploy" ]]
+    || [[ "$subject" == "custom: auto-run gateway install after deploy" ]] \
+    || [[ "$subject" == "version change" ]] \
+    || [[ "$subject" == "Revert \"version change\"" ]]
 }
 
 is_protected_custom_script_path() {
