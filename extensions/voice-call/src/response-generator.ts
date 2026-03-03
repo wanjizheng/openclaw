@@ -12,6 +12,7 @@ import path from "node:path";
 import type { VoiceCallConfig } from "./config.js";
 import { findContactByPhone, loadContactsFileAsync } from "./contact-file.js";
 import { loadCoreAgentDeps, loadCoreTtsDeps, type CoreConfig } from "./core-bridge.js";
+import { stripLlmReasoningTags } from "./llm-tag-cleanup.js";
 
 /**
  * Strip DeepSeek DSML function-call markup from LLM output.
@@ -307,6 +308,8 @@ export async function generateVoiceResponse(
     // Strip any DSML markup the model may have hallucinated
     if (text) {
       text = stripDsmlMarkup(text) || null;
+      text = text ? stripLlmReasoningTags(text, { isFinal: true }) : null;
+      text = text?.trim() || null;
     }
 
     // Detect and strip [END_CALL] marker before TTS (don't speak the tag aloud)
@@ -447,6 +450,8 @@ export async function generateGreetingText(params: {
     // Strip any DSML markup the model may have hallucinated
     if (text) {
       text = stripDsmlMarkup(text) || null;
+      text = text ? stripLlmReasoningTags(text, { isFinal: true }) : null;
+      text = text?.trim() || null;
     }
     if (text) {
       console.log(`[voice-call] LLM-generated greeting for ${callerLabel}: "${text}"`);
