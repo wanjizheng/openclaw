@@ -275,6 +275,8 @@ export type OutboundCallOptions = {
   message?: string;
   /** Call mode (overrides config default) */
   mode?: CallMode;
+  /** Pre-generated LLM greeting text (overrides raw message for TTS). */
+  initialMessage?: string;
   /** Pre-generated audio URL for the initial message (SAG TTS). */
   initialMessageAudioUrl?: string;
 };
