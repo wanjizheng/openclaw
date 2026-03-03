@@ -1058,6 +1058,15 @@ export class VoiceCallWebhookServer {
         // Clean up session tracking after response completes
         this.activeResponseSessionIds.delete(callId);
 
+        // If LLM signaled end-call, stop processing any pending responses
+        // LLM owns the conversation flow completely — don't add any system-generated messages
+        if (result.endCall) {
+          this.pendingAutoResponses.delete(callId);
+          console.log(
+            `[voice-call] End-call signaled for ${callId}; cleared pending responses to prevent extra messages`,
+          );
+        }
+
         // In Hybrid mode, signal the play queue that generation is done.
         // handlePlayNextAction will resume CR or <Hangup> after the last sentence.
         if (isHybrid && providerCallId) {
