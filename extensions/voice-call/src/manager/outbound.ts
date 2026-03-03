@@ -1,6 +1,5 @@
 import crypto from "node:crypto";
 import type { CallMode } from "../config.js";
-import { findContactByPhone, loadContactsFileAsync } from "../contact-file.js";
 import {
   TerminalStates,
   type CallId,
@@ -155,10 +154,6 @@ export async function initiateCall(
     return { callId: "", success: false, error: "fromNumber not configured" };
   }
 
-  // If a pre-generated LLM greeting is provided, use that as the initialMessage.
-  // The raw `message` is kept as callReason for context.
-  const effectiveInitialMessage = opts.initialMessage || initialMessage;
-
   const callRecord: CallRecord = {
     callId,
     provider: ctx.provider.name,
@@ -171,7 +166,7 @@ export async function initiateCall(
     transcript: [],
     processedEventIds: [],
     metadata: {
-      ...(effectiveInitialMessage && { initialMessage: effectiveInitialMessage }),
+      ...(initialMessage && { initialMessage }),
       // Keep callReason as a separate field so it survives speakInitialMessage
       // which deletes initialMessage after speaking to prevent re-speaking on reconnect.
       ...(initialMessage && { callReason: initialMessage }),
@@ -179,17 +174,6 @@ export async function initiateCall(
       mode,
     },
   };
-
-  // Resolve callee name from VOICE_CONTACTS.md so the LLM knows who it's talking to
-  try {
-    const contacts = await loadContactsFileAsync();
-    const contact = findContactByPhone(to, contacts);
-    if (contact?.name) {
-      callRecord.metadata!.callerName = contact.name;
-    }
-  } catch {
-    // Contact lookup is best-effort
-  }
 
   ctx.activeCalls.set(callId, callRecord);
   persistCallRecord(ctx.storePath, callRecord);

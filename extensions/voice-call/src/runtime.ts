@@ -199,35 +199,13 @@ export async function createVoiceCallRuntime(params: {
 
   // WORKFLOW_AUTO: Pre-generate inbound greeting audio for instant playback
   // when someone calls the bot.  Fire-and-forget so it doesn't block startup.
-  // DISABLED: Now generating greetings on-demand when calls connect (saves resources, warms up TTS)
-  // webhookServer.preGenerateInboundGreeting();
+  webhookServer.preGenerateInboundGreeting();
 
   const stop = async () => {
-    // Always stop the webhook server last, even if tunnel/tailscale
-    // cleanup fails.  Previous code let an upstream error skip
-    // webhookServer.stop(), leaving port 3334 bound while the
-    // runtime reference was already cleared → EADDRINUSE on the
-    // next ensureRuntime() call.
-    try {
-      if (tunnelResult) {
-        await tunnelResult.stop();
-      }
-    } catch (err) {
-      log.warn(
-        `[voice-call] Tunnel cleanup error (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
+    if (tunnelResult) {
+      await tunnelResult.stop();
     }
-    try {
-      await cleanupTailscaleExposure(config);
-    } catch (err) {
-      log.warn(
-        `[voice-call] Tailscale cleanup error (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
+    await cleanupTailscaleExposure(config);
     await webhookServer.stop();
   };
 
