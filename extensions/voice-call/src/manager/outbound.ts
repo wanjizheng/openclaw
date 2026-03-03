@@ -155,6 +155,10 @@ export async function initiateCall(
     return { callId: "", success: false, error: "fromNumber not configured" };
   }
 
+  // If a pre-generated LLM greeting is provided, use that as the initialMessage.
+  // The raw `message` is kept as callReason for context.
+  const effectiveInitialMessage = opts.initialMessage || initialMessage;
+
   const callRecord: CallRecord = {
     callId,
     provider: ctx.provider.name,
@@ -167,7 +171,7 @@ export async function initiateCall(
     transcript: [],
     processedEventIds: [],
     metadata: {
-      ...(initialMessage && { initialMessage }),
+      ...(effectiveInitialMessage && { initialMessage: effectiveInitialMessage }),
       // Keep callReason as a separate field so it survives speakInitialMessage
       // which deletes initialMessage after speaking to prevent re-speaking on reconnect.
       ...(initialMessage && { callReason: initialMessage }),
