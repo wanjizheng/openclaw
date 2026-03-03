@@ -122,7 +122,14 @@ export class TwilioProvider implements VoiceCallProvider {
   /** Per-call sentence audio URL queue for hybrid mode <Play> injection. */
   private readonly hybridPlayQueues = new Map<
     string,
-    { urls: string[]; drained: number; done: boolean; endCall: boolean; callId?: string }
+    {
+      urls: string[];
+      drained: number;
+      done: boolean;
+      endCall: boolean;
+      callId?: string;
+      generation: number;
+    }
   >();
 
   /** Tracks callSids that just interrupted during hybrid playback. */
@@ -1216,7 +1223,7 @@ ${nextStepXml}
   enqueueHybridSentence(callSid: string, publicUrl: string, callId?: string): void {
     let q = this.hybridPlayQueues.get(callSid);
     if (!q) {
-      q = { urls: [], drained: 0, done: false, endCall: false, callId };
+      q = { urls: [], drained: 0, done: false, endCall: false, callId, generation: 0 };
       this.hybridPlayQueues.set(callSid, q);
     }
     q.urls.push(publicUrl);
@@ -1260,8 +1267,18 @@ ${nextStepXml}
     // Mark this call as interrupted so the transcript that triggered the interrupt can be ignored
     this.hybridInterruptedCalls.add(callSid);
 
-    // Clear the queue to prevent future redirects
-    this.clearHybridQueue(callSid);
+    // Increment generation to invalidate any pending Redirect requests
+    // This prevents a race condition where a Redirect for the next sentence
+    // arrives after abortHybridPlay() has been called
+    q.generation++;
+    console.log(
+      `[voice-call][hybrid] Incremented generation to ${q.generation} for ${callSid} to invalidate pending Redirect requests`,
+    );
+
+    // Clear queued sentences but keep the queue object alive so handlePlayNextAction
+    // can detect the generation mismatch
+    q.urls = [];
+    q.drained = 0;
 
     // Use Call Update to switch back to CR immediately
     const twiml = this.buildResumeRelayTwiml();
@@ -1321,8 +1338,18 @@ ${nextStepXml}
     const q = this.hybridPlayQueues.get(callSid);
     console.log(
       `[voice-call][hybrid] handlePlayNextAction callSid=${callSid} ` +
-        `queueLen=${q?.urls.length ?? "none"} drained=${q?.drained ?? "N/A"} done=${q?.done ?? "N/A"}`,
+        `queueLen=${q?.urls.length ?? "none"} drained=${q?.drained ?? "N/A"} done=${q?.done ?? "N/A"} generation=${q?.generation ?? "N/A"}`,
     );
+
+    // Check if the queue was aborted (interrupt flag set) after the Redirect was issued.
+    // If so, ignore this redirect and resume ConversationRelay.
+    if (q && this.hybridInterruptedCalls.has(callSid)) {
+      console.log(
+        `[voice-call][hybrid] Ignoring stale Redirect request for interrupted call ${callSid}, resuming CR`,
+      );
+      this.clearHybridQueue(callSid);
+      return this.buildResumeRelayTwiml();
+    }
 
     // More sentences queued → play next
     if (q && q.drained < q.urls.length) {
