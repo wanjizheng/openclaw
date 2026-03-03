@@ -1,5 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import type { GatewayRequestHandlerOptions, OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { normalizePhoneNumber } from "./src/allowlist.js";
 import { registerVoiceCallCli } from "./src/cli.js";
 import {
   VoiceCallConfigSchema,
@@ -7,8 +8,14 @@ import {
   validateProviderConfig,
   type VoiceCallConfig,
 } from "./src/config.js";
+import { findContactByPhone, loadContactsFileAsync } from "./src/contact-file.js";
 import type { CoreConfig } from "./src/core-bridge.js";
-import { deleteCallAudioFiles, maybeGenerateHostedAudioUrl } from "./src/response-generator.js";
+import {
+  deleteCallAudioFiles,
+  generateGreetingText,
+  localPathToPublicUrl,
+  maybeGenerateHostedAudioUrl,
+} from "./src/response-generator.js";
 import { createVoiceCallRuntime, type VoiceCallRuntime } from "./src/runtime.js";
 
 // ── Module-level singleton state ──────────────────────────────────────
@@ -410,23 +417,51 @@ const voiceCallPlugin = {
                   throw new Error("to required");
                 }
 
-                // Pre-generate SAG audio for the initial greeting so it plays
-                // immediately when the call connects (no TTS delay).
+                // Pre-generate LLM greeting + TTS audio BEFORE dialing so the
+                // audio is ready when the callee answers (true warmup — no silence).
+                let initialMessage: string | undefined;
                 let initialMessageAudioUrl: string | undefined;
                 try {
                   const preGenStart = Date.now();
-                  initialMessageAudioUrl = await maybeGenerateHostedAudioUrl({
-                    text: message,
+
+                  // Resolve callee contact for LLM context
+                  const calleeKey = normalizePhoneNumber(to);
+                  const contacts = await loadContactsFileAsync();
+                  const contact = contacts.find((c) => normalizePhoneNumber(c.phone) === calleeKey);
+
+                  // Generate LLM greeting based on callReason
+                  const generatedText = await generateGreetingText({
+                    voiceConfig: config,
+                    coreConfig: api.config as CoreConfig,
+                    from: to,
+                    callerName: contact?.name,
+                    greetingHint: `你正在给${contact?.name ?? to}打电话。通话目的：${message}\n请生成一句自然的开场白（直接说明来意，不要只是问好）。`,
+                    callerInfo: contact?.info,
+                  });
+
+                  const ttsText = (generatedText || message || "您好")
+                    .replace(/\[[\w-]+\]\s*/g, "")
+                    .trim();
+                  initialMessage = ttsText;
+
+                  // Generate TTS audio
+                  const audioLocalPath = await maybeGenerateHostedAudioUrl({
+                    text: ttsText,
                     coreConfig: api.config as CoreConfig,
                     voiceConfig: config,
                   });
+                  if (audioLocalPath) {
+                    initialMessageAudioUrl =
+                      localPathToPublicUrl(audioLocalPath, config) || undefined;
+                  }
+
                   const preGenMs = Date.now() - preGenStart;
                   console.log(
-                    `[voice-call] Pre-generated initial message audio in ${preGenMs}ms (url: ${initialMessageAudioUrl ? "yes" : "no"})`,
+                    `[voice-call] Pre-generated outbound greeting in ${preGenMs}ms: "${ttsText.slice(0, 60)}" (audio: ${initialMessageAudioUrl ? "yes" : "no"})`,
                   );
                 } catch (err) {
                   console.warn(
-                    `[voice-call] Failed to pre-generate initial message audio:`,
+                    `[voice-call] Failed to pre-generate outbound greeting:`,
                     err instanceof Error ? err.message : String(err),
                   );
                 }
@@ -438,6 +473,7 @@ const voiceCallPlugin = {
                       ? params.mode
                       : undefined,
                   initialMessageAudioUrl,
+                  ...(initialMessage && { initialMessage }),
                 });
                 if (!result.success) {
                   throw new Error(result.error || "initiate failed");
@@ -449,10 +485,9 @@ const voiceCallPlugin = {
                   const callRecord = await rt.manager.waitForCallEnd(result.callId);
 
                   // Clean up all audio files generated during this call.
-                  void deleteCallAudioFiles(
-                    result.callId,
-                    initialMessageAudioUrl ? [initialMessageAudioUrl] : [],
-                  ).catch(() => {});
+                  // Include the pre-generated greeting URL (which has no callId prefix)
+                  const extraUrls = initialMessageAudioUrl ? [initialMessageAudioUrl] : [];
+                  void deleteCallAudioFiles(result.callId, extraUrls).catch(() => {});
 
                   const durationMs =
                     callRecord.endedAt && callRecord.startedAt
@@ -636,9 +671,25 @@ const voiceCallPlugin = {
                 const nodeFsp = require("node:fs/promises") as typeof import("node:fs/promises");
                 const nodeOs = require("node:os") as typeof import("node:os");
 
-                const callerName = call.metadata?.callerName as string | undefined;
+                // Try to resolve contact name from metadata first, then from contacts file
+                let callerName = call.metadata?.callerName as string | undefined;
                 // For outbound calls, the "other party" is call.to; for inbound, call.from
                 const otherPartyPhone = call.direction === "inbound" ? call.from : call.to;
+
+                if (!callerName && otherPartyPhone) {
+                  try {
+                    const { findContactByPhone: findContact, loadContactsFileAsync } =
+                      await import("./src/contact-file.js");
+                    const contacts = await loadContactsFileAsync();
+                    const contact = findContact(otherPartyPhone, contacts);
+                    if (contact?.name) {
+                      callerName = contact.name;
+                    }
+                  } catch {
+                    // Contact lookup is best-effort; if it fails, just use the phone number
+                  }
+                }
+
                 const callerLabel = callerName
                   ? `${callerName} (${otherPartyPhone})`
                   : otherPartyPhone;
