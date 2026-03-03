@@ -671,9 +671,25 @@ const voiceCallPlugin = {
                 const nodeFsp = require("node:fs/promises") as typeof import("node:fs/promises");
                 const nodeOs = require("node:os") as typeof import("node:os");
 
-                const callerName = call.metadata?.callerName as string | undefined;
+                // Try to resolve contact name from metadata first, then from contacts file
+                let callerName = call.metadata?.callerName as string | undefined;
                 // For outbound calls, the "other party" is call.to; for inbound, call.from
                 const otherPartyPhone = call.direction === "inbound" ? call.from : call.to;
+
+                if (!callerName && otherPartyPhone) {
+                  try {
+                    const { findContactByPhone: findContact, loadContactsFileAsync } =
+                      await import("./src/contact-file.js");
+                    const contacts = await loadContactsFileAsync();
+                    const contact = findContact(otherPartyPhone, contacts);
+                    if (contact?.name) {
+                      callerName = contact.name;
+                    }
+                  } catch {
+                    // Contact lookup is best-effort; if it fails, just use the phone number
+                  }
+                }
+
                 const callerLabel = callerName
                   ? `${callerName} (${otherPartyPhone})`
                   : otherPartyPhone;
