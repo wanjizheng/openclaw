@@ -360,7 +360,7 @@ export class VoiceCallWebhookServer {
 
         if (isHybrid) {
           // In hybrid mode, the <Start><Stream> fork only provides STT.
-          (this.provider as TwilioProvider).registerCallStream(callId, streamSid);
+          // (registerCallStream was already called above)
 
           // ── INBOUND: Synthesize answered, greeting will be spoken via CR after setup ────
           if (call && call.direction === "inbound") {
@@ -1136,11 +1136,21 @@ export class VoiceCallWebhookServer {
               // speakInitialMessage reads call.metadata.initialMessage + initialMessageAudioUrl
               // and calls speak() -> playTts() -> hybrid queue -> Call Update <Play> -> resume CR.
               // Works for BOTH inbound and outbound — both pre-generate during webhook.
-              if (typeof call.metadata?.initialMessage === "string") {
+              if (typeof call.metadata?.initialMessage === "string" && callSid) {
                 this.greetingCalls.add(callSid);
+                const sid = callSid; // capture for closure (non-null)
                 setTimeout(async () => {
                   try {
-                    await this.manager.speakInitialMessage(callSid);
+                    await this.manager.speakInitialMessage(sid);
+                    // Mark hybrid queue done so handlePlayNextAction resumes CR
+                    // after the greeting finishes playing, instead of entering a
+                    // Pause/Redirect polling loop.
+                    if (
+                      this.provider.name === "twilio" &&
+                      (this.provider as TwilioProvider).isHybridMode
+                    ) {
+                      (this.provider as TwilioProvider).markHybridSentencesDone(sid, false);
+                    }
                     console.log(
                       `[voice-call][cr] Greeting playback initiated for ${callId} (${call.direction})`,
                     );
@@ -1148,11 +1158,9 @@ export class VoiceCallWebhookServer {
                     console.warn(`[voice-call][cr] Failed to speak greeting:`, err);
                   } finally {
                     setTimeout(() => {
-                      if (this.greetingCalls.has(callSid)) {
-                        this.greetingCalls.delete(callSid);
-                        console.log(
-                          `[voice-call][cr] Greeting echo suppression ended for ${callSid}`,
-                        );
+                      if (this.greetingCalls.has(sid)) {
+                        this.greetingCalls.delete(sid);
+                        console.log(`[voice-call][cr] Greeting echo suppression ended for ${sid}`);
                       }
                     }, 5000);
                   }
@@ -1607,15 +1615,20 @@ export class VoiceCallWebhookServer {
       }
     }
 
-    // In Gather mode, convert local audio path to public URL
+    // In Gather or Hybrid mode, convert local audio path to public URL
     const isGather =
       this.provider.name === "twilio" && (this.provider as TwilioProvider).isGatherMode;
-    if (isGather && audioUrl) {
+    const isHybridFallback =
+      this.provider.name === "twilio" && (this.provider as TwilioProvider).isHybridMode;
+    if ((isGather || isHybridFallback) && audioUrl) {
       const publicUrl = localPathToPublicUrl(audioUrl, this.config);
       if (publicUrl) {
         audioUrl = publicUrl;
       }
     }
+
+    const call = this.manager.getCall(callId);
+    const providerCallId = call?.providerCallId;
 
     const result = await this.manager.speak(callId, text, {
       audioUrl,
@@ -1623,6 +1636,11 @@ export class VoiceCallWebhookServer {
     if (!result.success) {
       console.warn(`[voice-call] Failed to speak fallback for ${callId}: ${result.error}`);
       return;
+    }
+
+    // Mark hybrid queue done so handlePlayNextAction resumes CR after playback
+    if (isHybridFallback && providerCallId) {
+      (this.provider as TwilioProvider).markHybridSentencesDone(providerCallId, endAfterSpeak);
     }
 
     if (endAfterSpeak) {
