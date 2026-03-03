@@ -188,7 +188,7 @@ export class VoiceCallWebhookServer {
                 `[voice-call][hybrid] User interrupted during playback for ${providerCallId}`,
               );
               twilioProvider.abortHybridPlay(providerCallId);
-              return; // Don't clear regular TTS queue in hybrid PLAYING state
+              // Fall through to also abort LLM generation below
             }
           }
 
