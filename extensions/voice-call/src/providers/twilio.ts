@@ -97,6 +97,37 @@ export class TwilioProvider implements VoiceCallProvider {
   /** Track notify-mode calls to avoid streaming on follow-up callbacks */
   private readonly notifyCalls = new Set<string>();
 
+  // ── ConversationRelay mode (Twilio handles STT+TTS) ─────────────────
+  /** When true, use Twilio ConversationRelay (Deepgram STT + ElevenLabs TTS handled by Twilio) */
+  private readonly useConversationRelay = false;
+
+  // ── Hybrid mode: <Start><Stream> (STT) + <Connect><ConversationRelay> (events) + <Play> (TTS) ──
+  /**
+   * When true, combine inbound Media Stream fork for OpenAI STT,
+   * ConversationRelay for conversation events/interrupts, and Call Update
+   * <Play> injection for externally-generated TTS audio.
+   */
+  private readonly useHybridMode = true;
+
+  // ── Gather mode (turn-taking without media stream) ─────────────────────
+  /** When true, use <Gather>+<Play> instead of media streams for playback */
+  private readonly useGatherMode = false;
+  /** Per-call sentence queue for Gather mode. Sentences are queued as public URLs. */
+  private readonly gatherQueues = new Map<
+    string,
+    { urls: string[]; drained: number; done: boolean; endCall: boolean; callId?: string }
+  >();
+
+  // ── Hybrid play queue (for hybrid STT+CR+Play mode) ─────────────────────
+  /** Per-call sentence audio URL queue for hybrid mode <Play> injection. */
+  private readonly hybridPlayQueues = new Map<
+    string,
+    { urls: string[]; drained: number; done: boolean; endCall: boolean; callId?: string }
+  >();
+
+  /** Tracks callSids that just interrupted during hybrid playback. */
+  private readonly hybridInterruptedCalls = new Set<string>();
+
   /**
    * Delete stored TwiML for a given `callId`.
    *
@@ -217,37 +248,6 @@ export class TwilioProvider implements VoiceCallProvider {
   }
 
   /**
-   * Suppress STT for a call (stop forwarding audio to STT, discard transcripts).
-   */
-  suppressSTTForCall(callSid: string): void {
-    const streamSid = this.callStreamMap.get(callSid);
-    if (streamSid && this.mediaStreamHandler) {
-      this.mediaStreamHandler.suppressSTT(streamSid);
-    }
-  }
-
-  /**
-   * Resume STT for a call.
-   */
-  resumeSTTForCall(callSid: string): void {
-    const streamSid = this.callStreamMap.get(callSid);
-    if (streamSid && this.mediaStreamHandler) {
-      this.mediaStreamHandler.resumeSTT(streamSid);
-    }
-  }
-
-  /**
-   * Wait for Twilio to finish playing all buffered TTS audio for a call.
-   * Uses Twilio's mark events to know when audio has actually been rendered.
-   */
-  async waitForTtsComplete(callSid: string): Promise<void> {
-    const streamSid = this.callStreamMap.get(callSid);
-    if (streamSid && this.mediaStreamHandler) {
-      await this.mediaStreamHandler.waitForLastMark(streamSid);
-    }
-  }
-
-  /**
    * Make an authenticated request to the Twilio API.
    */
   private async apiRequest<T = unknown>(
@@ -319,11 +319,33 @@ export class TwilioProvider implements VoiceCallProvider {
           ? ctx.query.turnToken.trim()
           : undefined;
       const dedupeKey = createTwilioRequestDedupeKey(ctx, options?.verifiedRequestKey);
-      const event = this.normalizeEvent(params, {
-        callIdOverride: callIdFromQuery,
-        dedupeKey,
-        turnToken: turnTokenFromQuery,
-      });
+
+      // For Gather/Play action callbacks without SpeechResult (sentence chaining),
+      // skip event creation to avoid duplicate call.answered events — but
+      // always allow terminal statuses (completed, failed, busy, etc.) through.
+      const isGatherAction =
+        typeof ctx.query?.gatherAction === "string" && ctx.query.gatherAction === "1";
+      const isPlayAction =
+        typeof ctx.query?.playAction === "string" && ctx.query.playAction === "1";
+      const hasSpeechInBody = !!params.get("SpeechResult");
+      const callStatus = params.get("CallStatus");
+      const isTerminalStatus =
+        callStatus === "completed" ||
+        callStatus === "failed" ||
+        callStatus === "busy" ||
+        callStatus === "no-answer" ||
+        callStatus === "canceled";
+      let event: NormalizedEvent | null = null;
+      if (
+        !(isGatherAction && !hasSpeechInBody && !isTerminalStatus) &&
+        !(isPlayAction && !isTerminalStatus)
+      ) {
+        event = this.normalizeEvent(params, {
+          callIdOverride: callIdFromQuery,
+          dedupeKey,
+          turnToken: turnTokenFromQuery,
+        });
+      }
 
       // For Twilio, we must return TwiML. Most actions are driven by Calls API updates,
       // so the webhook response is typically a pause to keep the call alive.
@@ -436,7 +458,8 @@ export class TwilioProvider implements VoiceCallProvider {
 
   /**
    * Generate TwiML response for webhook.
-   * When a call is answered, connects to media stream for bidirectional audio.
+   * In Gather mode: uses <Gather> + <Play> for turn-based conversation.
+   * In stream mode: connects to media stream for bidirectional audio.
    */
   private generateTwimlResponse(ctx?: WebhookContext): string {
     if (!ctx) {
@@ -446,6 +469,8 @@ export class TwilioProvider implements VoiceCallProvider {
     const params = new URLSearchParams(ctx.rawBody);
     const type = typeof ctx.query?.type === "string" ? ctx.query.type.trim() : undefined;
     const isStatusCallback = type === "status";
+    const isGatherAction =
+      typeof ctx.query?.gatherAction === "string" && ctx.query.gatherAction === "1";
     const callStatus = params.get("CallStatus");
     const direction = params.get("Direction");
     const isOutbound = direction?.startsWith("outbound") ?? false;
@@ -455,11 +480,22 @@ export class TwilioProvider implements VoiceCallProvider {
         ? ctx.query.callId.trim()
         : undefined;
 
-    // Avoid logging webhook params/TwiML (may contain PII).
-
     // Status callbacks should not receive TwiML.
     if (isStatusCallback) {
       return TwilioProvider.EMPTY_TWIML;
+    }
+
+    // ── Gather mode action callback ────────────────────────────────────────
+    if (this.useGatherMode && isGatherAction && callSid) {
+      const hasSpeech = !!params.get("SpeechResult");
+      const twiml = this.handleGatherAction(callSid, hasSpeech, callIdFromQuery);
+      return twiml ?? TwilioProvider.PAUSE_TWIML;
+    }
+
+    // ── Hybrid mode: playAction redirect callback ────────────────────────────
+    const isPlayAction = typeof ctx.query?.playAction === "string" && ctx.query.playAction === "1";
+    if (this.useHybridMode && isPlayAction && callSid) {
+      return this.handlePlayNextAction(callSid, callIdFromQuery);
     }
 
     // Handle initial TwiML request (when Twilio first initiates the call)
@@ -467,7 +503,6 @@ export class TwilioProvider implements VoiceCallProvider {
     if (callIdFromQuery) {
       const storedTwiml = this.twimlStorage.get(callIdFromQuery);
       if (storedTwiml) {
-        // Clean up after serving (one-time use)
         this.deleteStoredTwiml(callIdFromQuery);
         return storedTwiml;
       }
@@ -475,23 +510,52 @@ export class TwilioProvider implements VoiceCallProvider {
         return TwilioProvider.EMPTY_TWIML;
       }
 
-      // Conversation mode: return streaming TwiML immediately for outbound calls.
+      // Conversation mode outbound calls
       if (isOutbound) {
+        if (this.useHybridMode && callSid) {
+          return this.buildHybridInitialTwiml({ callSid });
+        }
+        if (this.useConversationRelay) {
+          return this.buildConversationRelayTwiml();
+        }
+        if (this.useGatherMode && callSid) {
+          // Gather mode: return <Gather> listening TwiML. Greeting will be
+          // played via Call Update once audio is ready.
+          return this.buildGatherListenTwiml(callSid, callIdFromQuery);
+        }
         const streamUrl = callSid ? this.getStreamUrlForCall(callSid) : null;
         return streamUrl ? this.getStreamConnectXml(streamUrl) : TwilioProvider.PAUSE_TWIML;
       }
     }
 
-    // Handle subsequent webhook requests (status callbacks, etc.)
-    // For inbound calls, answer immediately with stream
+    // For inbound calls, answer immediately
     if (direction === "inbound") {
+      if (this.useHybridMode && callSid) {
+        return this.buildHybridInitialTwiml({ callSid });
+      }
+      if (this.useConversationRelay) {
+        return this.buildConversationRelayTwiml();
+      }
+      if (this.useGatherMode && callSid) {
+        // Gather mode: return <Gather> listening. Greeting audio is injected
+        // via Call Update by the webhook greeting flow.
+        return this.buildGatherListenTwiml(callSid, callSid);
+      }
       const streamUrl = callSid ? this.getStreamUrlForCall(callSid) : null;
       return streamUrl ? this.getStreamConnectXml(streamUrl) : TwilioProvider.PAUSE_TWIML;
     }
 
-    // For outbound calls, non-status callbacks should keep the call alive and
-    // connect to stream whenever possible, even if query params are missing.
+    // For outbound calls, keep alive
     if (isOutbound) {
+      if (this.useHybridMode && callSid) {
+        return this.buildHybridInitialTwiml({ callSid });
+      }
+      if (this.useConversationRelay) {
+        return this.buildConversationRelayTwiml();
+      }
+      if (this.useGatherMode && callSid) {
+        return this.buildGatherListenTwiml(callSid, callIdFromQuery);
+      }
       const streamUrl = callSid ? this.getStreamUrlForCall(callSid) : null;
       if (streamUrl) {
         return this.getStreamConnectXml(streamUrl);
@@ -501,8 +565,17 @@ export class TwilioProvider implements VoiceCallProvider {
       }
     }
 
-    // For non-outbound/non-inbound callbacks, only connect when explicitly in-progress.
+    // For non-outbound/non-inbound callbacks
     if (callStatus === "in-progress") {
+      if (this.useHybridMode && callSid) {
+        return this.buildHybridInitialTwiml({ callSid });
+      }
+      if (this.useConversationRelay) {
+        return this.buildConversationRelayTwiml();
+      }
+      if (this.useGatherMode && callSid) {
+        return this.buildGatherListenTwiml(callSid, callIdFromQuery);
+      }
       const streamUrl = callSid ? this.getStreamUrlForCall(callSid) : null;
       return streamUrl ? this.getStreamConnectXml(streamUrl) : TwilioProvider.PAUSE_TWIML;
     }
@@ -653,7 +726,10 @@ export class TwilioProvider implements VoiceCallProvider {
   /**
    * Play TTS audio via Twilio.
    *
-   * Priority order (avoids stream disconnection where possible):
+   * In Gather mode: queues the sentence. The first sentence triggers a Call
+   * Update; subsequent sentences are served via the Gather action URL chain.
+   *
+   * In stream mode (legacy):
    * 1. If audioUrl AND active media stream: download audio, convert to mu-law,
    *    stream through WebSocket (keeps stream connected, supports barge-in).
    * 2. Core TTS + Media Streams: If TTS provider and media stream are available,
@@ -662,6 +738,29 @@ export class TwilioProvider implements VoiceCallProvider {
    * 4. TwiML <Say>: Falls back to Twilio's native TTS with Polly voices.
    */
   async playTts(input: PlayTtsInput): Promise<void> {
+    // ── Hybrid mode: queue audio URL, first sentence triggers Call Update ──
+    if (this.useHybridMode && input.audioUrl) {
+      this.enqueueHybridSentence(input.providerCallId, input.audioUrl, input.callId);
+      const q = this.hybridPlayQueues.get(input.providerCallId);
+      // Trigger Call Update only for the very first sentence of this turn
+      if (q && q.urls.length === 1 && q.drained === 0) {
+        await this.triggerFirstHybridPlay(input.providerCallId);
+      }
+      return;
+    }
+
+    // ── Gather mode: queue sentence and trigger first play ─────────────────
+    if (this.useGatherMode && input.audioUrl) {
+      // audioUrl is expected to already be a public URL in Gather mode
+      this.enqueueSentenceForGather(input.providerCallId, input.audioUrl, input.callId);
+      const q = this.gatherQueues.get(input.providerCallId);
+      // Trigger Call Update only for the very first sentence of this turn
+      if (q && q.urls.length === 1 && q.drained === 0) {
+        await this.playFirstQueuedSentence(input.providerCallId);
+      }
+      return;
+    }
+
     const streamSid = this.callStreamMap.get(input.providerCallId);
 
     // Prefer streaming via WebSocket when media stream is active (no disconnect)
@@ -802,16 +901,20 @@ ${nextStepXml}
       throw new Error("Media stream handler required");
     }
 
-    // Resolve local file path from audio URL
-    // URLs look like https://voice.ontoai.com/audio/call_xxx.mp3
-    // Local files are at ~/.openclaw/workspace/voice_messages/call_xxx.mp3
-    const fileName = decodeURIComponent(audioUrl.split("/").pop() ?? "");
-    if (!fileName) {
-      throw new Error("Unable to extract filename from audio URL");
+    // Resolve local file path: accept either a local path or a URL
+    let localPath: string;
+    if (audioUrl.startsWith("/")) {
+      // Already a local file path
+      localPath = audioUrl;
+    } else {
+      // Legacy URL format — extract filename and resolve to local voice_messages dir
+      const fileName = decodeURIComponent(audioUrl.split("/").pop() ?? "");
+      if (!fileName) {
+        throw new Error("Unable to extract filename from audio URL");
+      }
+      const homeDir = process.env.HOME || process.env.USERPROFILE || "/tmp";
+      localPath = join(homeDir, ".openclaw", "workspace", "voice_messages", fileName);
     }
-
-    const homeDir = process.env.HOME || process.env.USERPROFILE || "/tmp";
-    const localPath = join(homeDir, ".openclaw", "workspace", "voice_messages", fileName);
 
     // Convert to mu-law 8kHz using ffmpeg
     const muLawAudio = await convertToMulaw8k(localPath);
@@ -847,6 +950,438 @@ ${nextStepXml}
         handler.sendMark(streamSid, `hosted-audio-${Date.now()}`);
       }
     });
+  }
+
+  // ── Gather-mode helpers ──────────────────────────────────────────────────
+
+  /** Build a Gather action URL that Twilio will POST speech results to. */
+  private getGatherActionUrl(callSid: string, callId?: string): string | null {
+    if (!this.currentPublicUrl) return null;
+    const url = new URL(this.currentPublicUrl);
+    if (callId) url.searchParams.set("callId", callId);
+    url.searchParams.set("gatherAction", "1");
+    return url.toString();
+  }
+
+  /** Produce TwiML: <Gather input="speech" ...><Play>url</Play></Gather> */
+  buildGatherPlayTwiml(
+    audioUrl: string,
+    callSid: string,
+    callId?: string,
+    opts: { speechTimeout?: number; timeout?: number } = {},
+  ): string {
+    const actionUrl = this.getGatherActionUrl(callSid, callId);
+    if (!actionUrl) return TwilioProvider.PAUSE_TWIML;
+    const st = opts.speechTimeout ?? 3;
+    const to = opts.timeout ?? 2;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" speechModel="deepgram_nova-3" language="zh" speechTimeout="${st}" timeout="${to}" actionOnEmptyResult="true" action="${escapeXml(actionUrl)}" method="POST">
+    <Play>${escapeXml(audioUrl)}</Play>
+  </Gather>
+</Response>`;
+  }
+
+  /** Produce TwiML: bare <Gather> for listening (no nested Play). */
+  buildGatherListenTwiml(callSid: string, callId?: string): string {
+    const actionUrl = this.getGatherActionUrl(callSid, callId);
+    if (!actionUrl) return TwilioProvider.PAUSE_TWIML;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" speechModel="deepgram_nova-3" language="zh" speechTimeout="3" timeout="12" actionOnEmptyResult="true" action="${escapeXml(actionUrl)}" method="POST">
+  </Gather>
+  <Redirect method="POST">${escapeXml(actionUrl)}</Redirect>
+</Response>`;
+  }
+
+  /** Queue a sentence's public audio URL for Gather playback. */
+  enqueueSentenceForGather(callSid: string, publicUrl: string, callId?: string): void {
+    let q = this.gatherQueues.get(callSid);
+    if (!q) {
+      q = { urls: [], drained: 0, done: false, endCall: false, callId };
+      this.gatherQueues.set(callSid, q);
+    }
+    q.urls.push(publicUrl);
+    console.log(
+      `[voice-call][gather] Queued sentence #${q.urls.length - 1} for ${callSid}: ${publicUrl}`,
+    );
+  }
+
+  /** Mark all sentences queued — no more will follow for this turn. */
+  markGatherSentencesDone(callSid: string, endCall = false): void {
+    const q = this.gatherQueues.get(callSid);
+    if (q) {
+      q.done = true;
+      q.endCall = endCall;
+    }
+  }
+
+  /** Clear the sentence queue for a call. */
+  clearGatherQueue(callSid: string): void {
+    this.gatherQueues.delete(callSid);
+  }
+
+  /**
+   * Trigger the first queued sentence via Call Update.
+   * Subsequent sentences are played when Gather's action URL fires without SpeechResult.
+   */
+  async playFirstQueuedSentence(callSid: string): Promise<void> {
+    const q = this.gatherQueues.get(callSid);
+    if (!q || q.drained >= q.urls.length) return;
+    const url = q.urls[q.drained];
+    q.drained++;
+    const hasMore = q.drained < q.urls.length || !q.done;
+    const twiml = this.buildGatherPlayTwiml(url, callSid, q.callId, {
+      timeout: hasMore ? 1 : 2,
+    });
+    console.log(
+      `[voice-call][gather] Playing sentence #${q.drained - 1} via Call Update for ${callSid}`,
+    );
+    await this.apiRequest(`/Calls/${callSid}.json`, { Twiml: twiml });
+  }
+
+  /**
+   * Called by the webhook when Gather's action fires (with or without SpeechResult).
+   * Returns TwiML for the next sentence, or bare <Gather> if all done.
+   * Returns null if SpeechResult was present (caller spoke — process as new speech).
+   */
+  handleGatherAction(callSid: string, hasSpeechResult: boolean, callId?: string): string | null {
+    const q = this.gatherQueues.get(callSid);
+    console.log(
+      `[voice-call][gather] handleGatherAction callSid=${callSid} hasSpeech=${hasSpeechResult} queueLen=${q?.urls.length ?? "none"} drained=${q?.drained ?? "N/A"} done=${q?.done ?? "N/A"}`,
+    );
+    if (hasSpeechResult) {
+      // New user speech — clear remaining queue, let the webhook process it.
+      this.clearGatherQueue(callSid);
+      // Return <Pause> to keep call alive while LLM processes.
+      return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Pause length="30"/>
+</Response>`;
+    }
+
+    // No speech — serve next queued sentence or start listening.
+    if (q && q.drained < q.urls.length) {
+      // More sentences to play.
+      const url = q.urls[q.drained];
+      q.drained++;
+      const hasMore = q.drained < q.urls.length || !q.done;
+      return this.buildGatherPlayTwiml(url, callSid, callId ?? q.callId, {
+        timeout: hasMore ? 1 : 2,
+      });
+    }
+
+    if (q?.done && q?.endCall) {
+      // LLM signalled [END_CALL] — hang up after last sentence.
+      this.clearGatherQueue(callSid);
+      return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Hangup/>
+</Response>`;
+    }
+
+    if (q?.done) {
+      // All sentences played, enter listening mode.
+      this.clearGatherQueue(callSid);
+      return this.buildGatherListenTwiml(callSid, callId ?? q?.callId);
+    }
+
+    // No queue at all (e.g. after initial greeting served inline) — listen.
+    if (!q) {
+      return this.buildGatherListenTwiml(callSid, callId);
+    }
+
+    // Queue not yet marked done — LLM is still generating. Short pause, then come back.
+    const actionUrl = this.getGatherActionUrl(callSid, callId ?? q?.callId);
+    if (!actionUrl) return TwilioProvider.PAUSE_TWIML;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Pause length="1"/>
+  <Redirect method="POST">${escapeXml(actionUrl)}</Redirect>
+</Response>`;
+  }
+
+  /** Whether Gather mode is active. */
+  get isGatherMode(): boolean {
+    return this.useGatherMode;
+  }
+
+  /** Whether ConversationRelay mode is active. */
+  get isConversationRelayMode(): boolean {
+    return this.useConversationRelay;
+  }
+
+  /** Whether Hybrid mode is active (Media Stream STT + CR events + <Play> TTS). */
+  get isHybridMode(): boolean {
+    return this.useHybridMode;
+  }
+
+  /**
+   * Build TwiML for Twilio ConversationRelay.
+   * Twilio handles STT (Deepgram Nova-3) and TTS (ElevenLabs) internally.
+   * Our server only receives/sends text via WebSocket.
+   */
+  buildConversationRelayTwiml(options?: { welcomeGreeting?: string }): string {
+    const wsUrl = this.getConversationRelayWsUrl();
+    if (!wsUrl) return TwilioProvider.PAUSE_TWIML;
+    const greetingAttr = options?.welcomeGreeting
+      ? ` welcomeGreeting="${escapeXml(options.welcomeGreeting)}"`
+      : "";
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <ConversationRelay url="${escapeXml(wsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true" inactivityTimeout="30"${greetingAttr} />
+  </Connect>
+</Response>`;
+  }
+
+  // ── Hybrid mode: <Start><Stream> + <Connect><ConversationRelay> + <Play> ──
+
+  /**
+   * Build TwiML for Hybrid mode initial call setup.
+   * Forks inbound audio via <Start><Stream> for our own OpenAI STT,
+   * optionally plays a greeting audio file via <Play>,
+   * then hands the call to ConversationRelay for session/event management.
+   */
+  buildHybridInitialTwiml(options: {
+    callSid: string;
+    welcomeGreeting?: string;
+    /** Public URL of a pre-generated greeting audio file to <Play> before connecting CR */
+    playUrl?: string;
+  }): string {
+    // Stream URL (fork inbound audio for STT)
+    const streamUrl = this.getStreamUrlForCall(options.callSid);
+    if (!streamUrl) return TwilioProvider.PAUSE_TWIML;
+
+    // Parse stream URL and extract token as <Parameter>
+    const parsed = new URL(streamUrl);
+    const token = parsed.searchParams.get("token");
+    parsed.searchParams.delete("token");
+    const cleanStreamUrl = parsed.toString();
+    const tokenParam = token
+      ? `\n      <Parameter name="token" value="${escapeXml(token)}" />`
+      : "";
+
+    // CR URL
+    const crWsUrl = this.getConversationRelayWsUrl();
+    if (!crWsUrl) return TwilioProvider.PAUSE_TWIML;
+
+    const greetingAttr = options.welcomeGreeting
+      ? ` welcomeGreeting="${escapeXml(options.welcomeGreeting)}"`
+      : "";
+
+    // When playUrl is provided, insert <Play> between <Start><Stream> and <Connect CR>.
+    // TwiML executes sequentially: Stream starts (non-blocking background fork),
+    // then <Play> plays the greeting audio (blocking), then <Connect CR> connects.
+    const playElement = options.playUrl ? `\n  <Play>${escapeXml(options.playUrl)}</Play>` : "";
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Start>
+    <Stream url="${escapeXml(cleanStreamUrl)}" track="inbound_track">${tokenParam}
+    </Stream>
+  </Start>${playElement}
+  <Connect>
+    <ConversationRelay url="${escapeXml(crWsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true" inactivityTimeout="30"${greetingAttr} />
+  </Connect>
+</Response>`;
+  }
+
+  /**
+   * Build TwiML to resume ConversationRelay after <Play> finishes.
+   * No welcomeGreeting — this is a reconnection, not first contact.
+   */
+  buildResumeRelayTwiml(): string {
+    const crWsUrl = this.getConversationRelayWsUrl();
+    if (!crWsUrl) return TwilioProvider.PAUSE_TWIML;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Pause length="1"/>
+  <Connect>
+    <ConversationRelay url="${escapeXml(crWsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true" inactivityTimeout="30" />
+  </Connect>
+</Response>`;
+  }
+
+  /** Build redirect URL for hybrid play-next chaining. */
+  private getPlayNextUrl(callSid: string, callId?: string): string | null {
+    if (!this.currentPublicUrl) return null;
+    const url = new URL(this.currentPublicUrl);
+    if (callId) url.searchParams.set("callId", callId);
+    url.searchParams.set("playAction", "1");
+    return url.toString();
+  }
+
+  /** Queue a sentence's public audio URL for hybrid mode playback. */
+  enqueueHybridSentence(callSid: string, publicUrl: string, callId?: string): void {
+    let q = this.hybridPlayQueues.get(callSid);
+    if (!q) {
+      q = { urls: [], drained: 0, done: false, endCall: false, callId };
+      this.hybridPlayQueues.set(callSid, q);
+    }
+    q.urls.push(publicUrl);
+    console.log(
+      `[voice-call][hybrid] Queued sentence #${q.urls.length - 1} for ${callSid}: ${publicUrl}`,
+    );
+  }
+
+  /** Mark all sentences queued — no more will follow for this turn. */
+  markHybridSentencesDone(callSid: string, endCall = false): void {
+    const q = this.hybridPlayQueues.get(callSid);
+    if (q) {
+      q.done = true;
+      q.endCall = endCall;
+    }
+  }
+
+  /** Clear the hybrid sentence queue for a call. */
+  clearHybridQueue(callSid: string): void {
+    this.hybridPlayQueues.delete(callSid);
+    this.hybridInterruptedCalls.delete(callSid);
+  }
+
+  /** Whether a hybrid queue exists (call is in or about to be in PLAYING mode). */
+  hasActiveHybridQueue(callSid: string): boolean {
+    return this.hybridPlayQueues.has(callSid);
+  }
+
+  /**
+   * Abort hybrid playback immediately when user interrupts.
+   * Clears the queue and switches back to ConversationRelay mode.
+   */
+  async abortHybridPlay(callSid: string): Promise<void> {
+    const q = this.hybridPlayQueues.get(callSid);
+    if (!q) return;
+
+    console.log(
+      `[voice-call][hybrid] User interrupted playback for ${callSid}, aborting play queue`,
+    );
+
+    // Mark this call as interrupted so the transcript that triggered the interrupt can be ignored
+    this.hybridInterruptedCalls.add(callSid);
+
+    // Clear the queue to prevent future redirects
+    this.clearHybridQueue(callSid);
+
+    // Use Call Update to switch back to CR immediately
+    const twiml = this.buildResumeRelayTwiml();
+
+    try {
+      await this.updateCallTwiml(callSid, twiml);
+      console.log(
+        `[voice-call][hybrid] Switched from PLAYING to RELAY for ${callSid} due to interrupt`,
+      );
+    } catch (error: any) {
+      console.error(`[voice-call][hybrid] Failed to abort play for ${callSid}:`, error.message);
+    }
+  }
+
+  /**
+   * Check if this callSid just interrupted hybrid playback.
+   * Automatically clears the flag after checking (single-use).
+   */
+  consumeHybridInterruptFlag(callSid: string): boolean {
+    if (this.hybridInterruptedCalls.has(callSid)) {
+      this.hybridInterruptedCalls.delete(callSid);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Trigger the first queued sentence via Call Update.
+   * Twilio replaces active TwiML (<Connect><CR>) with <Play> + <Redirect>.
+   * This disconnects the CR WebSocket — expected in hybrid mode.
+   */
+  async triggerFirstHybridPlay(callSid: string): Promise<void> {
+    const q = this.hybridPlayQueues.get(callSid);
+    if (!q || q.drained >= q.urls.length) return;
+    const url = q.urls[q.drained];
+    q.drained++;
+
+    const redirectUrl = this.getPlayNextUrl(callSid, q.callId);
+    if (!redirectUrl) return;
+
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${escapeXml(url)}</Play>
+  <Redirect method="POST">${escapeXml(redirectUrl)}</Redirect>
+</Response>`;
+
+    console.log(`[voice-call][hybrid] Playing first sentence via Call Update for ${callSid}`);
+    await this.apiRequest(`/Calls/${callSid}.json`, { Twiml: twiml });
+  }
+
+  /**
+   * Handle the playAction redirect callback.
+   * Returns TwiML for the next sentence, or resumes ConversationRelay
+   * when all sentences have been played.
+   */
+  handlePlayNextAction(callSid: string, callId?: string): string {
+    const q = this.hybridPlayQueues.get(callSid);
+    console.log(
+      `[voice-call][hybrid] handlePlayNextAction callSid=${callSid} ` +
+        `queueLen=${q?.urls.length ?? "none"} drained=${q?.drained ?? "N/A"} done=${q?.done ?? "N/A"}`,
+    );
+
+    // More sentences queued → play next
+    if (q && q.drained < q.urls.length) {
+      const url = q.urls[q.drained];
+      q.drained++;
+      const redirectUrl = this.getPlayNextUrl(callSid, callId ?? q.callId);
+      if (!redirectUrl) return TwilioProvider.PAUSE_TWIML;
+      return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${escapeXml(url)}</Play>
+  <Redirect method="POST">${escapeXml(redirectUrl)}</Redirect>
+</Response>`;
+    }
+
+    // All sentences played + end call → hang up
+    if (q?.done && q?.endCall) {
+      this.clearHybridQueue(callSid);
+      return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Hangup/>
+</Response>`;
+    }
+
+    // All sentences played → resume ConversationRelay
+    if (q?.done) {
+      this.clearHybridQueue(callSid);
+      console.log(`[voice-call][hybrid] All sentences played, resuming CR for ${callSid}`);
+      return this.buildResumeRelayTwiml();
+    }
+
+    // No queue at all → resume relay
+    if (!q) {
+      return this.buildResumeRelayTwiml();
+    }
+
+    // Queue not yet marked done — LLM is still generating. Short pause, then redirect.
+    const redirectUrl = this.getPlayNextUrl(callSid, callId ?? q?.callId);
+    if (!redirectUrl) return TwilioProvider.PAUSE_TWIML;
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Pause length="1"/>
+  <Redirect method="POST">${escapeXml(redirectUrl)}</Redirect>
+</Response>`;
+  }
+
+  /**
+   * Update a live call's TwiML via Call Resource API.
+   * Used by hybrid mode for interrupt recovery (switch back to CR mid-play).
+   */
+  async updateCallTwiml(callSid: string, twiml: string): Promise<void> {
+    await this.apiRequest(`/Calls/${callSid}.json`, { Twiml: twiml });
+  }
+
+  /** Get the WebSocket URL for ConversationRelay. */
+  private getConversationRelayWsUrl(): string | null {
+    if (!this.currentPublicUrl) return null;
+    const url = new URL(this.currentPublicUrl);
+    const wsOrigin = url.origin.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://");
+    return `${wsOrigin}/voice/cr`;
   }
 
   /**
