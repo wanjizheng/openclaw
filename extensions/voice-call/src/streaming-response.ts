@@ -17,6 +17,7 @@ import type { VoiceCallConfig } from "./config.js";
 import { loadContactsFileAsync, findContactByPhone } from "./contact-file.js";
 import type { CoreConfig } from "./core-bridge.js";
 import { loadCoreAgentDeps, loadCoreTtsDeps } from "./core-bridge.js";
+import { stripLlmReasoningTags } from "./llm-tag-cleanup.js";
 import type { VoiceResponseParams, VoiceResponseResult } from "./response-generator.js";
 import { maybeGenerateHostedAudioUrl, loadPersonaContext } from "./response-generator.js";
 
@@ -179,6 +180,10 @@ export class TagAwareSentenceBuffer {
   }
 
   private processTagsAndFlush(isFinal: boolean): void {
+    // 0. Strip LLM reasoning tags (<think>/<final> variants) while preserving
+    //    ElevenLabs square-bracket tags like [pause], [laughs], etc.
+    this.buffer = stripLlmReasoningTags(this.buffer, { isFinal });
+
     // 1. Detect & strip complete [END_CALL] tags
     if (/\[END_CALL\]/i.test(this.buffer)) {
       this.endCallDetected = true;
@@ -397,7 +402,7 @@ export async function generateStreamingVoiceResponse(
   const skipTts = options?.skipTts ?? false;
 
   const enqueueTtsChunk = (text: string) => {
-    const trimmed = text.trim();
+    const trimmed = stripLlmReasoningTags(text, { isFinal: true }).trim();
     if (!trimmed) return; // Skip empty / whitespace-only chunks
     if (/^[，,、。！？!?…；;:：\-~\s]+$/.test(trimmed)) return; // Skip punctuation-only chunks
     const idx = chunkIndex++;
