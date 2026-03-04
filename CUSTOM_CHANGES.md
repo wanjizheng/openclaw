@@ -381,3 +381,33 @@ Each entry should explain:
 - User-visible behavior:
   - AI assistants now have full project context before suggesting changes.
   - Documentation serves as onboarding material for new contributors.
+
+### Voice-call: Twilio XML warning + status callback hardening
+
+- What changed:
+  - Removed unsupported `inactivityTimeout` attribute from all Twilio `<ConversationRelay>` TwiML templates.
+  - Rebuilt and redeployed runtime artifacts to the active global OpenClaw install used by systemd services.
+  - Restarted `openclaw-gateway` and `openclaw-node` services after deployment.
+- Why:
+  - Twilio was returning `12200 XML Validation warning` because `inactivityTimeout` is not allowed on `ConversationRelay`.
+  - Runtime needed redeploy to ensure the fix applied to the actual running instance.
+- Files:
+  - `extensions/voice-call/src/providers/twilio.ts`
+- User-visible behavior:
+  - Twilio Debugger should stop creating new `12200` warnings for ConversationRelay requests.
+
+### Docs: enforce UI build before deploy/restart
+
+- What changed:
+  - Updated instruction docs to require explicit `pnpm ui:build` before deploy/restart.
+  - Updated workflow text to: `pnpm build -> pnpm ui:build -> deploy -> restart`.
+  - Corrected outdated wording that implied `pnpm build` alone always covers Control UI assets.
+- Why:
+  - Prevent runtime failure: `Control UI assets not found. Build them with 'pnpm ui:build'`.
+- Files:
+  - `AGENTS.md`
+  - `.github/copilot-instructions.md`
+  - `.github/instructions/copilot.instructions.md`
+  - `PROJECT_CONTEXT.md`
+- User-visible behavior:
+  - Deployment/restart instructions now consistently include the required UI build step, reducing startup/runtime asset errors.
