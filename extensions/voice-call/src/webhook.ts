@@ -45,8 +45,14 @@ export class VoiceCallWebhookServer {
   private mediaStreamHandler: MediaStreamHandler | null = null;
   private inFlightAutoResponses = new Set<string>();
   private pendingAutoResponses = new Map<string, string>();
+  /** Per-call abort controllers for the currently in-flight handleInboundResponse LLM run */
+  private inFlightAbortControllers = new Map<string, AbortController>();
   /** Provider call IDs currently playing initial greeting — transcripts are discarded to avoid echo */
-  private greetingCalls = new Set<string>();
+  // Maps providerCallId -> timestamp when greeting audio playback started.
+  // Used to distinguish AEC-warmup echo (first ~2s) from real user barge-in.
+  private greetingPlayStart = new Map<string, number>();
+  /** When a speech-start is suppressed during AEC warmup, flag it so the resulting transcript is also discarded */
+  private aecSuppressedSpeech = new Set<string>();
   /** Dynamically generated greeting audio URLs per call (Hybrid mode), keyed by callId for cleanup */
   private dynamicGreetingUrls = new Map<string, string>();
   /** ConversationRelay: WebSocket server for CR connections */
@@ -144,9 +150,26 @@ export class VoiceCallWebhookServer {
 
         // Discard transcripts during initial greeting playback — they are
         // echo of the bot's own voice picked up by Twilio before AEC warms up.
-        if (this.greetingCalls.has(providerCallId)) {
+        // Also discard if the speech-start that produced this transcript was suppressed.
+        const greetingStart = this.greetingPlayStart.get(providerCallId);
+        if (greetingStart) {
+          const elapsed = Date.now() - greetingStart;
+          if (elapsed < 5000) {
+            // Also consume the suppressed-speech flag so it doesn't linger
+            // and accidentally kill the NEXT (real) transcript.
+            this.aecSuppressedSpeech.delete(providerCallId);
+            console.log(
+              `[voice-call] Discarding echo transcript during AEC warmup for ${providerCallId} (${elapsed}ms): "${transcript}"`,
+            );
+            return;
+          }
+        }
+        // If the speech-start that led to this transcript was suppressed during AEC,
+        // discard the transcript too (STT processing delay means transcript arrives later)
+        if (this.aecSuppressedSpeech.has(providerCallId)) {
+          this.aecSuppressedSpeech.delete(providerCallId);
           console.log(
-            `[voice-call] Discarding echo transcript during greeting for ${providerCallId}: "${transcript}"`,
+            `[voice-call] Discarding echo transcript (suppressed speech-start) for ${providerCallId}: "${transcript}"`,
           );
           return;
         }
@@ -178,6 +201,27 @@ export class VoiceCallWebhookServer {
         }
       },
       onSpeechStart: (providerCallId) => {
+        // During AEC warmup (~first 2s of greeting playback), ignore speech-start.
+        // The phone's AEC hasn't adapted yet, so the STT stream picks up the
+        // bot's own greeting audio as echo. After warmup, allow normal barge-in
+        // just like any other hybrid+CR turn.
+        const greetingStart = this.greetingPlayStart.get(providerCallId);
+        if (greetingStart) {
+          const elapsed = Date.now() - greetingStart;
+          if (elapsed < 5000) {
+            console.log(
+              `[voice-call] Ignoring speech-start during AEC warmup for ${providerCallId} (${elapsed}ms since greeting start)`,
+            );
+            this.aecSuppressedSpeech.add(providerCallId);
+            return;
+          }
+          // AEC warmed up, allow barge-in. Clean up the greeting marker.
+          this.greetingPlayStart.delete(providerCallId);
+          console.log(
+            `[voice-call] Greeting barge-in allowed for ${providerCallId} (${elapsed}ms since greeting start)`,
+          );
+        }
+
         if (this.provider.name === "twilio") {
           const twilioProvider = this.provider as TwilioProvider;
 
@@ -198,16 +242,26 @@ export class VoiceCallWebhookServer {
         // Abort any in-flight LLM streaming for this call
         const call = this.manager.getCallByProviderCallId(providerCallId);
         if (call) {
+          // 1) Abort via crAbortControllers (if used)
+          const controller = this.crAbortControllers.get(call.callId);
+          if (controller) {
+            controller.abort();
+            this.crAbortControllers.delete(call.callId);
+            console.log(
+              `[voice-call] Aborted LLM generation for ${call.callId} via AbortController`,
+            );
+          }
+          // 2) Abort via abortEmbeddedPiRun (session-level abort)
           const sessionId = this.activeResponseSessionIds.get(call.callId);
           if (sessionId) {
-            // Dynamically import abortEmbeddedPiRun to stop LLM generation
             void (async () => {
               try {
-                const { abortEmbeddedPiRun } = await import("../../../src/agents/pi-embedded.js");
-                const aborted = abortEmbeddedPiRun(sessionId);
+                const { loadCoreAgentDeps } = await import("./core-bridge.js");
+                const deps = await loadCoreAgentDeps();
+                const aborted = deps.abortEmbeddedPiRun(sessionId);
                 if (aborted) {
                   console.log(
-                    `[voice-call] Aborted LLM streaming for ${call.callId} on user interrupt`,
+                    `[voice-call] Aborted LLM streaming for ${call.callId} (sessionId=${sessionId})`,
                   );
                 }
               } catch (err) {
@@ -215,15 +269,6 @@ export class VoiceCallWebhookServer {
               }
             })();
           }
-        }
-
-        // If user barges in during greeting, stop discarding transcripts
-        // so the follow-up real transcript is processed normally.
-        if (this.greetingCalls.has(providerCallId)) {
-          console.log(
-            `[voice-call] Barge-in during greeting for ${providerCallId}, resuming transcript processing`,
-          );
-          this.greetingCalls.delete(providerCallId);
         }
       },
       onPartialTranscript: (providerCallId, partial) => {
@@ -262,18 +307,18 @@ export class VoiceCallWebhookServer {
               this.manager.processEvent(answeredEvent);
             }
 
-            // Echo suppression during greeting playback
-            this.greetingCalls.add(callId);
+            // Record greeting playback start for AEC warmup tracking
+            this.greetingPlayStart.set(callId, Date.now());
             setTimeout(() => {
-              if (this.greetingCalls.has(callId)) {
-                this.greetingCalls.delete(callId);
-                console.log(`[voice-call][hybrid] Greeting done, resuming STT for ${callId}`);
+              if (this.greetingPlayStart.has(callId)) {
+                this.greetingPlayStart.delete(callId);
+                console.log(`[voice-call][hybrid] Greeting AEC guard expired for ${callId}`);
               }
             }, 8000);
           } else if (call && call.direction === "outbound") {
             // ── OUTBOUND: TTS warmup already done during webhook handler.
-            // Just synthesize call.answered and set up echo suppression.
-            this.greetingCalls.add(callId);
+            // Just synthesize call.answered and set up AEC warmup tracking.
+            this.greetingPlayStart.set(callId, Date.now());
             if (call.state === "ringing") {
               console.log(`[voice-call][hybrid-outbound] Stream connected for ${call.callId}`);
               const answeredEvent: NormalizedEvent = {
@@ -285,12 +330,12 @@ export class VoiceCallWebhookServer {
               };
               this.manager.processEvent(answeredEvent);
             }
-            // Echo suppression during greeting playback
+            // AEC warmup guard auto-expires
             setTimeout(() => {
-              if (this.greetingCalls.has(callId)) {
-                this.greetingCalls.delete(callId);
+              if (this.greetingPlayStart.has(callId)) {
+                this.greetingPlayStart.delete(callId);
                 console.log(
-                  `[voice-call][hybrid] Outbound greeting done, resuming STT for ${callId}`,
+                  `[voice-call][hybrid] Outbound greeting AEC guard expired for ${callId}`,
                 );
               }
             }, 8000);
@@ -554,11 +599,14 @@ export class VoiceCallWebhookServer {
             // normal hybrid playback mechanism (CR → speakInitialMessage → playTts → hybrid queue)
             // after CR connects.
             try {
+              const greetPipelineStart = Date.now();
               const callerKey = normalizePhoneNumber(call.from);
               const contacts = await loadContactsFileAsync();
               const contact = contacts.find((c) => normalizePhoneNumber(c.phone) === callerKey);
+              const contactLookupMs = Date.now() - greetPipelineStart;
 
               const template = contact?.greeting ?? this.config.inboundGreeting;
+              const llmStart = Date.now();
               const generatedText = await generateGreetingText({
                 voiceConfig: this.config,
                 coreConfig: this.coreConfig!,
@@ -567,6 +615,7 @@ export class VoiceCallWebhookServer {
                 greetingHint: template,
                 callerInfo: contact?.info,
               });
+              const llmMs = Date.now() - llmStart;
 
               greetingText = generatedText || template || "您好";
 
@@ -576,12 +625,21 @@ export class VoiceCallWebhookServer {
               }
 
               // Generate TTS audio file (this IS the warmup)
+              const ttsStart = Date.now();
               const audioLocalPath = await maybeGenerateHostedAudioUrl({
                 text: greetingText,
                 coreConfig: this.coreConfig!,
                 voiceConfig: this.config,
                 callId: call.callId,
               });
+              const ttsMs = Date.now() - ttsStart;
+              const totalMs = Date.now() - greetPipelineStart;
+              console.log(
+                `[voice-call][pipeline-metrics] GREETING call=${call.callId} ` +
+                  `contactLookup=${contactLookupMs}ms llmGenerate=${llmMs}ms ttsGenerate=${ttsMs}ms ` +
+                  `total=${totalMs}ms textLen=${greetingText?.length ?? 0} ` +
+                  `usedLLM=${!!generatedText} usedTemplate=${!generatedText}`,
+              );
 
               // Store in metadata so speakInitialMessage can use the pre-generated audio
               if (call.metadata) {
@@ -734,7 +792,7 @@ export class VoiceCallWebhookServer {
               // and calls speak() -> playTts() -> hybrid queue -> Call Update <Play> -> resume CR.
               // Works for BOTH inbound and outbound — both pre-generate during webhook.
               if (typeof call.metadata?.initialMessage === "string" && callSid) {
-                this.greetingCalls.add(callSid);
+                this.greetingPlayStart.set(callSid, Date.now());
                 const sid = callSid; // capture for closure (non-null)
                 setTimeout(async () => {
                   try {
@@ -755,9 +813,9 @@ export class VoiceCallWebhookServer {
                     console.warn(`[voice-call][cr] Failed to speak greeting:`, err);
                   } finally {
                     setTimeout(() => {
-                      if (this.greetingCalls.has(sid)) {
-                        this.greetingCalls.delete(sid);
-                        console.log(`[voice-call][cr] Greeting echo suppression ended for ${sid}`);
+                      if (this.greetingPlayStart.has(sid)) {
+                        this.greetingPlayStart.delete(sid);
+                        console.log(`[voice-call][cr] Greeting AEC guard expired for ${sid}`);
                       }
                     }, 5000);
                   }
@@ -889,21 +947,57 @@ export class VoiceCallWebhookServer {
       return;
     }
 
+    const enqueueTs = Date.now();
     this.pendingAutoResponses.set(callId, normalized);
     if (this.inFlightAutoResponses.has(callId)) {
+      // A response is already in-flight. Abort it so the new message is
+      // processed immediately instead of waiting 30+ seconds.
+      const ac = this.inFlightAbortControllers.get(callId);
+      if (ac) {
+        console.log(
+          `[voice-call] New user message while LLM in-flight for ${callId} — aborting stale response`,
+        );
+        ac.abort();
+      }
+      // Also abort the underlying LLM engine run
+      const sessionId = this.activeResponseSessionIds.get(callId);
+      if (sessionId) {
+        void (async () => {
+          try {
+            const { loadCoreAgentDeps } = await import("./core-bridge.js");
+            const deps = await loadCoreAgentDeps();
+            deps.abortEmbeddedPiRun(sessionId);
+          } catch {
+            /* best effort */
+          }
+        })();
+      }
+      // Abort hybrid playback of stale response
+      if (this.provider.name === "twilio") {
+        const call = this.manager.getCall(callId);
+        const providerCallId = call?.providerCallId;
+        if (providerCallId) {
+          const twilioProvider = this.provider as TwilioProvider;
+          if (twilioProvider.isHybridMode && twilioProvider.hasActiveHybridQueue(providerCallId)) {
+            twilioProvider.abortHybridPlay(providerCallId);
+          }
+          twilioProvider.clearTtsQueue(providerCallId);
+        }
+      }
       return;
     }
 
     this.inFlightAutoResponses.add(callId);
-    void this.drainInboundResponseQueue(callId).finally(() => {
+    void this.drainInboundResponseQueue(callId, enqueueTs).finally(() => {
       this.inFlightAutoResponses.delete(callId);
+      this.inFlightAbortControllers.delete(callId);
       if (this.pendingAutoResponses.has(callId)) {
         this.enqueueInboundResponse(callId, this.pendingAutoResponses.get(callId) || "");
       }
     });
   }
 
-  private async drainInboundResponseQueue(callId: string): Promise<void> {
+  private async drainInboundResponseQueue(callId: string, enqueueTs?: number): Promise<void> {
     while (true) {
       const nextMessage = this.pendingAutoResponses.get(callId);
       if (!nextMessage) {
@@ -911,10 +1005,28 @@ export class VoiceCallWebhookServer {
       }
       this.pendingAutoResponses.delete(callId);
 
+      // Create an AbortController so enqueueInboundResponse can cancel us
+      // if a newer message arrives from the user.
+      const ac = new AbortController();
+      this.inFlightAbortControllers.set(callId, ac);
+
+      const queueWaitMs = enqueueTs ? Date.now() - enqueueTs : 0;
+      if (queueWaitMs > 50) {
+        console.log(
+          `[voice-call][pipeline-metrics] QUEUE_WAIT call=${callId} waited=${queueWaitMs}ms`,
+        );
+      }
+
       try {
-        await this.handleInboundResponse(callId, nextMessage);
+        await this.handleInboundResponse(callId, nextMessage, ac.signal);
       } catch (err) {
-        console.warn(`[voice-call] Failed to auto-respond:`, err);
+        if (ac.signal.aborted) {
+          console.log(
+            `[voice-call] Stale LLM response aborted for ${callId}, processing newer message`,
+          );
+        } else {
+          console.warn(`[voice-call] Failed to auto-respond:`, err);
+        }
       }
     }
   }
@@ -929,7 +1041,12 @@ export class VoiceCallWebhookServer {
    *
    * Falls back to non-streaming generateVoiceResponse when streaming setup fails.
    */
-  private async handleInboundResponse(callId: string, userMessage: string): Promise<void> {
+  private async handleInboundResponse(
+    callId: string,
+    userMessage: string,
+    abortSignal?: AbortSignal,
+  ): Promise<void> {
+    const responseStart = Date.now();
     const call = this.manager.getCall(callId);
     if (!call) {
       console.warn(`[voice-call] Call ${callId} not found for auto-response`);
@@ -1002,7 +1119,20 @@ export class VoiceCallWebhookServer {
           // Non-fatal — session tracking is best-effort for interruption
         }
 
+        // Check for abort before starting the expensive LLM call
+        if (abortSignal?.aborted) {
+          console.log(`[voice-call] Skipping stale LLM call for ${callId} (aborted before start)`);
+          return;
+        }
+
+        const setupMs = Date.now() - responseStart;
+        console.log(
+          `[voice-call][pipeline-metrics] RESPONSE_SETUP call=${callId} setup=${setupMs}ms (session+config resolution)`,
+        );
+
         const result = await generateStreamingVoiceResponse(voiceParams, async (chunk) => {
+          // If aborted mid-stream, stop speaking further chunks
+          if (abortSignal?.aborted) return;
           // In Hybrid mode: convert local audio path → public URL for <Play>
           let audioUrl = chunk.audioUrl;
           if (isHybrid && audioUrl) {
@@ -1034,6 +1164,13 @@ export class VoiceCallWebhookServer {
         });
 
         const totalMs = Date.now() - genStart;
+        const e2eMs = Date.now() - responseStart;
+        console.log(
+          `[voice-call][pipeline-metrics] RESPONSE call=${callId} ` +
+            `setup=${setupMs}ms llm=${result.totalStreamMs}ms ttfa=${result.timeToFirstAudioMs}ms ` +
+            `chunks=${result.chunksStreamed} total=${totalMs}ms e2e=${e2eMs}ms ` +
+            `model=${this.config.responseModel || "default"} textLen=${result.text?.length ?? 0}`,
+        );
 
         if (result.error && !result.text) {
           console.error(`[voice-call] Streaming response error (${totalMs}ms): ${result.error}`);

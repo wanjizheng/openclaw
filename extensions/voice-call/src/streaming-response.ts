@@ -446,8 +446,15 @@ export async function generateStreamingVoiceResponse(
   // Accumulate full LLM text for logging / transcript
   let fullRawText = "";
   let dsmlDetected = false;
+  let llmFirstTokenAt = 0;
 
   try {
+    console.log(
+      `[voice-call][prompt-metrics] streaming call=${callId} ` +
+        `systemPromptChars=${extraSystemPrompt.length} userPromptChars=${userMessage.length} ` +
+        `historyTurns=${transcript.length} provider=${provider}/${model}`,
+    );
+
     const llmStart = Date.now();
 
     const result = await deps.runEmbeddedPiAgent({
@@ -471,6 +478,12 @@ export async function generateStreamingVoiceResponse(
       agentDir,
       onPartialReply: (payload) => {
         if (!payload.text) return;
+        if (!llmFirstTokenAt) {
+          llmFirstTokenAt = Date.now();
+          console.log(
+            `[voice-call][pipeline-metrics] LLM_FIRST_TOKEN call=${callId} elapsed=${llmFirstTokenAt - streamStart}ms`,
+          );
+        }
 
         const prevLen = fullRawText.length;
         // When the agent calls a tool and then continues generating,
@@ -507,7 +520,12 @@ export async function generateStreamingVoiceResponse(
     });
 
     const llmMs = Date.now() - llmStart;
-    console.log(`[voice-call] Streaming LLM completed in ${llmMs}ms (${provider}/${model})`);
+    const llmFirstTokenMs = llmFirstTokenAt > 0 ? llmFirstTokenAt - llmStart : llmMs;
+    console.log(
+      `[voice-call] Streaming LLM completed in ${llmMs}ms (${provider}/${model}) ` +
+        `firstToken=${llmFirstTokenMs}ms chunks=${chunkIndex} ` +
+        `promptChars=${extraSystemPrompt.length + userMessage.length}`,
+    );
 
     // Handle DSML response: extract clean text and push to sentence buffer
     if (dsmlDetected && fullRawText) {
