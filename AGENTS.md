@@ -1,5 +1,84 @@
 # Repository Guidelines
 
+> This file governs all AI assistants editing this repository.
+> Read `PROJECT_CONTEXT.md` and `ARCHITECTURE.md` before making changes.
+
+---
+
+## ⚠️ CRITICAL: Directory Safety Rules（目录安全规则）
+
+**This repository is a custom fork of OpenClaw. Three directories exist on this machine:**
+
+### STRICT RULES — VIOLATION = BREAKAGE
+
+1. **NEVER edit the deployment directory:**
+
+   ```
+   /home/linuxbrew/.linuxbrew/lib/node_modules/openclaw
+   ```
+
+   This is the **production runtime**. Direct edits will be overwritten and may corrupt the running system.
+
+2. **ALWAYS make code changes in the development repository:**
+
+   ```
+   /home/wanjizheng/openclaw-fork
+   ```
+
+   This is the Git-tracked source. All modifications, fixes, and features go here.
+
+3. **NEVER edit the configuration directory programmatically** unless explicitly requested:
+
+   ```
+   /home/wanjizheng/.openclaw
+   ```
+
+   Contains runtime config, secrets, and session data. Use `openclaw config set ...` for config changes.
+
+4. **Deployment MUST follow the build pipeline:**
+
+   ```
+   Edit openclaw-fork → pnpm build → sync dist/ to deployment → restart services
+   ```
+
+   Never shortcut this by editing deployed files directly.
+
+5. **NEVER edit `node_modules`** in any location (global, Homebrew, npm, git installs). Updates overwrite everything.
+
+6. **NEVER commit real API keys, tokens, or credentials.** The `service.env` and `.env` files are local-only.
+
+### Service Restart Protocol
+
+After deploying built artifacts:
+
+```bash
+systemctl --user restart openclaw-gateway.service
+systemctl --user restart openclaw-node.service
+```
+
+Verify:
+
+```bash
+systemctl --user status openclaw-gateway.service
+openclaw channels status --probe
+```
+
+---
+
+## Custom Fork Rules（自定义分支规则）
+
+- Current branch: `custom-main` (fork of upstream `main`)
+- Track all custom changes in `CUSTOM_CHANGES.md`
+- Use `tools/custom/new-change.sh` to scaffold entries
+- Before upstream merges, review conflict-prone zones listed in `CUSTOM_CHANGES.md`
+- Git `rerere` is enabled — it remembers conflict resolutions
+- The dev gateway guard (`tools/custom/gateway-dev-guard.sh`) prevents running dev + prod simultaneously
+- Override with `OPENCLAW_ALLOW_DEV_GATEWAY=1` only when intentional
+
+---
+
+## Upstream Repository Guidelines
+
 - Repo: https://github.com/openclaw/openclaw
 - In chat replies, file references must be repo-root relative only (example: `extensions/bluebubbles/src/channel.ts:80`); never absolute paths or `~/...`.
 - GitHub issues/comments/PR comments: use literal multiline strings or `-F - <<'EOF'` (or $'...') for real newlines; never embed "\\n".
