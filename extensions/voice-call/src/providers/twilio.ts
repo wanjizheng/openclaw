@@ -1137,7 +1137,7 @@ ${nextStepXml}
     return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <ConversationRelay url="${escapeXml(wsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true" inactivityTimeout="30"${greetingAttr} />
+    <ConversationRelay url="${escapeXml(wsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true"${greetingAttr} />
   </Connect>
 </Response>`;
   }
@@ -1189,7 +1189,7 @@ ${nextStepXml}
     </Stream>
   </Start>${playElement}
   <Connect>
-    <ConversationRelay url="${escapeXml(crWsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true" inactivityTimeout="30"${greetingAttr} />
+    <ConversationRelay url="${escapeXml(crWsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true"${greetingAttr} />
   </Connect>
 </Response>`;
   }
@@ -1205,7 +1205,7 @@ ${nextStepXml}
 <Response>
   <Pause length="1"/>
   <Connect>
-    <ConversationRelay url="${escapeXml(crWsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true" inactivityTimeout="30" />
+    <ConversationRelay url="${escapeXml(crWsUrl)}" language="multi" ttsProvider="ElevenLabs" voice="bhJUNIXWQQ94l8eI2VUf" transcriptionProvider="Deepgram" speechModel="nova-3-general" interruptible="true" dtmfDetection="true" />
   </Connect>
 </Response>`;
   }

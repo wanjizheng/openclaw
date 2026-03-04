@@ -38,10 +38,13 @@
 4. **Deployment MUST follow the build pipeline:**
 
    ```
-   Edit openclaw-fork → pnpm build → sync dist/ to deployment → restart services
+   Edit openclaw-fork → pnpm build → pnpm ui:build → sync dist/ to deployment → restart services
    ```
 
-   Never shortcut this by editing deployed files directly.
+`pnpm ui:build` is mandatory before deploy/restart. If skipped, runtime may fail with:
+`Control UI assets not found. Build them with 'pnpm ui:build'`.
+
+Never shortcut this by editing deployed files directly.
 
 5. **NEVER edit `node_modules`** in any location (global, Homebrew, npm, git installs). Updates overwrite everything.
 
@@ -198,6 +201,7 @@ openclaw channels status --probe
 - Node remains supported for running built output (`dist/*`) and production installs.
 - Mac packaging (dev): `scripts/package-mac-app.sh` defaults to current arch. Release checklist: `docs/platforms/mac/release.md`.
 - Type-check/build: `pnpm build`
+- Control UI assets build (required before deploy/restart): `pnpm ui:build`
 - TypeScript checks: `pnpm tsgo`
 - Lint/format: `pnpm check`
 - Format check: `pnpm format` (oxfmt --check)

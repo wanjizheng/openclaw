@@ -144,20 +144,21 @@ This is a **custom fork** (`openclaw-fork`) of the upstream [openclaw/openclaw](
 ## Development Workflow（开发流程）
 
 ```
-openclaw-fork (source) → pnpm build → deploy to runtime → restart services
+openclaw-fork (source) → pnpm build → pnpm ui:build → deploy to runtime → restart services
 ```
 
 ### Step-by-step:
 
 1. **Edit** code in `/home/wanjizheng/openclaw-fork`
 2. **Build**: `pnpm build`
-3. **Deploy**: Sync `dist/`, `openclaw.mjs`, `package.json` to deployment directory
-4. **Restart** services:
+3. **Build UI assets (required)**: `pnpm ui:build`
+4. **Deploy**: Sync `dist/`, `openclaw.mjs`, `package.json` to deployment directory
+5. **Restart** services:
    ```bash
    systemctl --user restart openclaw-gateway.service
    systemctl --user restart openclaw-node.service
    ```
-5. **Validate**: `systemctl --user status openclaw-gateway.service`
+6. **Validate**: `systemctl --user status openclaw-gateway.service`
 
 ### Custom release+deploy script:
 
@@ -172,7 +173,8 @@ tools/custom/release-integrate-and-build.sh
 | Command                                   | Description                                         |
 | ----------------------------------------- | --------------------------------------------------- |
 | `pnpm install`                            | Install dependencies                                |
-| `pnpm build`                              | Full build (tsdown + plugin SDK + UI)               |
+| `pnpm build`                              | Core build (tsdown + plugin SDK)                    |
+| `pnpm ui:build`                           | Build Control UI assets (required before deploy)    |
 | `pnpm dev`                                | Run CLI in dev mode                                 |
 | `pnpm test`                               | Run test suite (Vitest)                             |
 | `pnpm test:coverage`                      | Run tests with coverage                             |

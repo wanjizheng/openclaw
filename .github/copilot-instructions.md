@@ -11,7 +11,8 @@
 - **NEVER suggest edits** to `/home/linuxbrew/.linuxbrew/lib/node_modules/openclaw/` — this is the deployment runtime
 - **ALWAYS** target `/home/wanjizheng/openclaw-fork/` for code changes
 - **NEVER** commit or expose API keys, tokens, or credentials
-- Changes require: edit source → `pnpm build` → deploy → restart services
+- Changes require: edit source → `pnpm build` → `pnpm ui:build` → deploy → restart services
+- `pnpm ui:build` is mandatory before deploy/restart to avoid `Control UI assets not found` runtime errors.
 
 ## When Suggesting Code
 
@@ -27,6 +28,7 @@
 - **Runtime**: Node.js ≥ 22
 - **Package Manager**: pnpm 10.x (monorepo via `pnpm-workspace.yaml`)
 - **Build**: `pnpm build` (tsdown → `dist/`)
+- **UI Build**: `pnpm ui:build` (required before deploy/restart)
 - **Test**: `pnpm test` (Vitest, 70% V8 coverage threshold)
 - **Lint**: `pnpm check` (Oxlint + Oxfmt)
 - **Entry**: `openclaw.mjs` → `dist/index.js`
