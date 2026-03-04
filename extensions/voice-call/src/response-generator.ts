@@ -273,6 +273,12 @@ export async function generateVoiceResponse(
   const runId = `voice:${callId}:${Date.now()}`;
 
   try {
+    console.log(
+      `[voice-call][prompt-metrics] response call=${callId} ` +
+        `systemPromptChars=${extraSystemPrompt.length} userPromptChars=${userMessage.length} ` +
+        `historyTurns=${transcript.length} provider=${provider}/${model}`,
+    );
+
     const llmStart = Date.now();
     const result = await deps.runEmbeddedPiAgent({
       sessionId,
@@ -419,6 +425,13 @@ export async function generateGreetingText(params: {
   const sessionFile = deps.resolveSessionFilePath(sessionId, sessionEntry, { agentId });
 
   try {
+    console.log(
+      `[voice-call][prompt-metrics] greeting call=${from} ` +
+        `systemPromptChars=${systemCore.length} userPromptChars=${userMessage.length} ` +
+        `provider=${provider}/${model}`,
+    );
+
+    const greetLlmStart = Date.now();
     const result = await deps.runEmbeddedPiAgent({
       sessionId,
       sessionKey: `voice:greeting:${from.replace(/\D/g, "")}`,
@@ -440,6 +453,11 @@ export async function generateGreetingText(params: {
       extraSystemPrompt: systemCore,
       agentDir,
     });
+    const greetLlmMs = Date.now() - greetLlmStart;
+    console.log(
+      `[voice-call][pipeline-metrics] GREETING_LLM from=${from} llm=${greetLlmMs}ms ` +
+        `promptChars=${systemCore.length + userMessage.length} model=${provider}/${model}`,
+    );
 
     const texts = (result.payloads ?? [])
       .filter((p: { text?: string; isError?: boolean }) => p.text && !p.isError)
