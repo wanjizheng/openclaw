@@ -227,3 +227,157 @@ Each entry should explain:
 - User-visible behavior:
   - Running `pnpm gateway:dev` now fails fast with a clear instruction when prod gateway is active.
   - Accidental creation of parallel dev/prod gateway instances is prevented by default.
+
+## 2026-03-01
+
+### Voice-call: streaming LLM + incremental TTS pipeline
+
+- What changed:
+  - Implemented streaming LLM response generation with incremental TTS via ElevenLabs.
+  - Added TAG-aware sentence buffer that avoids splitting ElevenLabs SSML tags mid-stream.
+  - Added LLM-based end-call detection — the LLM can now detect conversational cues that the caller wants to hang up, instead of relying solely on Twilio signals.
+  - Outbound call prompts now include the call reason; tools are disabled during calls to prevent unwanted side effects.
+  - Added per-call session isolation: each voice call gets its own session context, persona markdown injection from `IDENTITY.md`, and post-call session cleanup.
+  - Added startup reconciliation: on gateway boot, active calls are reconciled against the provider to catch orphaned sessions.
+  - Added module-level singleton to prevent `EADDRINUSE` from duplicate `register()` calls during hot-reload.
+- Why:
+  - Reduce voice response latency by starting TTS before the full LLM response completes.
+  - TAG-aware buffering prevents "tag soup" audio artifacts.
+  - LLM-based end-call produces more natural call termination.
+  - Session isolation prevents conversation bleed between calls and memory leaks.
+  - Startup reconciliation catches zombie calls left over from unclean restarts.
+- Files:
+  - `extensions/voice-call/index.ts`
+  - `extensions/voice-call/src/core-bridge.ts`
+  - `extensions/voice-call/src/manager.ts`
+  - `extensions/voice-call/src/manager/outbound.ts`
+  - `extensions/voice-call/src/providers/base.ts`
+  - `extensions/voice-call/src/providers/twilio.ts`
+  - `extensions/voice-call/src/providers/twilio/api.ts`
+  - `extensions/voice-call/src/response-generator.ts`
+  - `extensions/voice-call/src/runtime.ts`
+  - `extensions/voice-call/src/streaming-response.ts`
+  - `extensions/voice-call/src/webhook.ts`
+- User-visible behavior:
+  - Voice responses start playing significantly faster (streaming, not wait-for-full).
+  - Calls end more naturally when caller signals goodbye.
+  - Each call is fully isolated; previous call context does not bleed through.
+
+## 2026-03-02
+
+### Voice-call: STT suppression, tag stripping hardening, and auto-update version fix
+
+- What changed:
+  - Added STT (speech-to-text) suppression during TTS playback — microphone input is now muted while the bot is speaking to prevent echo feedback.
+  - Fixed `callReason` not being passed correctly to outbound call prompts.
+  - Improved outbound call reporting.
+  - Hardened tag stripping in the streaming response pipeline to prevent partial `</` and `</final` leakage when DeepSeek reasoning tags span chunk boundaries.
+  - Fixed think output handling for DeepSeek models in the streaming voice path.
+  - Fixed auto-update version normalization: `package.json` version is now normalized for stable releases to prevent the auto-update system from miscomparing versions.
+  - Documented the auto-update version mismatch issue in `AUTO_UPDATE_VERSION_ISSUE.md`.
+- Why:
+  - STT suppression eliminates echo loops where the bot hears itself talking.
+  - Tag stripping hardening prevents garbled audio artifacts from partial HTML/XML tags.
+  - Version normalization prevents update-loop where the system repeatedly thinks an update is available.
+- Files:
+  - `extensions/voice-call/index.ts`
+  - `extensions/voice-call/src/manager/outbound.ts`
+  - `extensions/voice-call/src/media-stream.ts`
+  - `extensions/voice-call/src/providers/twilio.ts`
+  - `extensions/voice-call/src/response-generator.ts`
+  - `extensions/voice-call/src/streaming-response.ts`
+  - `extensions/voice-call/src/utils.ts`
+  - `extensions/voice-call/src/webhook.ts`
+  - `tools/custom/release-integrate-and-build.sh`
+  - `AUTO_UPDATE_VERSION_ISSUE.md` (new)
+- User-visible behavior:
+  - No more echo during voice calls (bot doesn't hear itself).
+  - Cleaner voice output without garbled tag fragments.
+  - Auto-update no longer incorrectly reports updates available.
+
+## 2026-03-03
+
+### Voice-call: hybrid mode restoration, generation-based queue versioning, and interrupt hardening
+
+- What changed:
+  - Restored hybrid mode (streaming LLM + TTS) and removed dead old-mode code paths.
+  - Hybrid interrupt now also aborts the in-flight LLM generation (not just TTS playback), preventing the system from generating a stale response after the user interrupts.
+  - Implemented generation-based queue versioning to prevent a race condition between `abortHybridPlay` and pending Redirect requests — each generation gets a version ID so stale redirects are discarded.
+  - Fixed a bug where the system could process additional LLM responses after the LLM had already signaled end-call, causing duplicate or ghost responses.
+  - Extracted dedicated tag-cleaning logic into `llm-tag-cleanup.ts` with its own test file.
+  - Improved DeepSeek reasoning tag stripping to preserve ElevenLabs SSML tags — previous logic was over-aggressively stripping `<` characters, breaking ElevenLabs `<break>` and `<prosody>` tags.
+- Why:
+  - Hybrid mode provides the best latency/quality balance for voice.
+  - Generation versioning eliminates a class of race conditions that caused audio glitches or stale playback.
+  - Post-end-call guard prevents confusing ghost responses after hang-up.
+  - Separated tag-cleaning logic is easier to test and maintain across upstream merges.
+- Files:
+  - `extensions/voice-call/index.ts`
+  - `extensions/voice-call/src/llm-tag-cleanup.ts` (new)
+  - `extensions/voice-call/src/llm-tag-cleanup.test.ts` (new)
+  - `extensions/voice-call/src/streaming-response.ts`
+  - `extensions/voice-call/src/streaming-response.tag-cleaning.test.ts`
+  - `extensions/voice-call/src/manager/outbound.ts`
+  - `extensions/voice-call/src/media-stream.ts`
+  - `extensions/voice-call/src/providers/twilio.ts`
+  - `extensions/voice-call/src/response-generator.ts`
+  - `extensions/voice-call/src/runtime.ts`
+  - `extensions/voice-call/src/types.ts`
+  - `extensions/voice-call/src/utils.ts`
+  - `extensions/voice-call/src/webhook.ts`
+- When merging from upstream:
+  - `extensions/voice-call/src/llm-tag-cleanup.ts` is new — no upstream conflict expected.
+  - `extensions/voice-call/src/streaming-response.ts` has heavy changes around hybrid mode — manual merge likely.
+  - `extensions/voice-call/src/webhook.ts` generation versioning — check for upstream changes to `onConnect`/redirect logic.
+- User-visible behavior:
+  - Interrupting the bot mid-sentence now immediately stops both audio and LLM processing.
+  - No more ghost responses after hanging up.
+  - ElevenLabs voice quality preserved (SSML tags intact).
+  - Cleaner DeepSeek reasoning tag removal without collateral damage.
+
+## 2026-03-04
+
+### Voice-call: echo suppression fix, queue abort, pipeline metrics, and extensionAPI export
+
+- What changed:
+  - Fixed echo suppression not activating correctly in certain edge cases.
+  - Added queue abort capability — when a new user utterance arrives, any pending/in-flight TTS queue items from the previous response are aborted.
+  - Added pipeline metrics tracking for voice call performance monitoring.
+  - Exported `abortEmbeddedPiRun` from `src/extensionAPI.ts` so the voice-call extension can properly abort in-flight LLM generation when the user interrupts.
+- Why:
+  - Echo suppression edge cases caused occasional feedback loops.
+  - Queue abort ensures the user isn't forced to listen to the tail end of a previous response when they've already said something new.
+  - Pipeline metrics provide visibility into latency bottlenecks (STT → LLM → TTS → playback).
+  - The extensionAPI export was required because voice-call needs to call `abortEmbeddedPiRun` to cleanly cancel LLM runs.
+- Files:
+  - `extensions/voice-call/src/core-bridge.ts`
+  - `extensions/voice-call/src/response-generator.ts`
+  - `extensions/voice-call/src/streaming-response.ts`
+  - `extensions/voice-call/src/webhook.ts`
+  - `src/extensionAPI.ts`
+- User-visible behavior:
+  - Echo issues further reduced.
+  - Interrupting the bot is now fully responsive — old audio stops, new response begins.
+  - No user-visible metric output (internal monitoring only).
+
+### Docs: add project memory and architecture documentation
+
+- What changed:
+  - Created `PROJECT_CONTEXT.md` — system overview with tech stack, three-directory layout, commands, ports, known pitfalls (with Chinese section headers).
+  - Created `ARCHITECTURE.md` — ASCII architecture diagrams, module map, plugin structure, data flow, build pipeline, branch strategy.
+  - Updated `AGENTS.md` — prepended critical directory safety rules and custom fork rules while preserving all upstream guidelines.
+  - Created `.github/copilot-instructions.md` — Copilot behavior and safety rules.
+  - Created `.project-memory/decisions.md` — 14 decision entries extracted from commit history and repo structure.
+- Why:
+  - Provide persistent project memory for AI assistants and human developers.
+  - Prevent accidental edits to the deployment directory.
+  - Document architecture decisions that were previously only implicit in code.
+- Files:
+  - `PROJECT_CONTEXT.md` (new)
+  - `ARCHITECTURE.md` (new)
+  - `AGENTS.md` (updated)
+  - `.github/copilot-instructions.md` (new)
+  - `.project-memory/decisions.md` (new)
+- User-visible behavior:
+  - AI assistants now have full project context before suggesting changes.
+  - Documentation serves as onboarding material for new contributors.

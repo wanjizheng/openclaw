@@ -75,6 +75,27 @@ openclaw channels status --probe
 - The dev gateway guard (`tools/custom/gateway-dev-guard.sh`) prevents running dev + prod simultaneously
 - Override with `OPENCLAW_ALLOW_DEV_GATEWAY=1` only when intentional
 
+### MANDATORY: Update `CUSTOM_CHANGES.md` on every commit
+
+**Before committing**, update `CUSTOM_CHANGES.md` with an entry for each logical change. This is **not optional** — it is a required step in every commit workflow.
+
+**When to update:**
+
+- Every commit that changes code, configuration, scripts, or documentation
+- Group related commits under one date heading if they share the same day
+
+**How to update:**
+
+1. Check the current date section exists (e.g. `## 2026-03-04`); add it if missing
+2. Add a subsection `### <concise title>` under the date
+3. Fill in these fields based on what you actually changed:
+   - **What changed** — describe the modifications made
+   - **Why** — explain the motivation / problem being solved
+   - **Files** — list all files touched (repo-root relative paths)
+   - **User-visible behavior** — what the user sees differently (or "No user-visible change" for internal-only)
+   - **When merging from upstream** (optional) — if the change touches conflict-prone areas, document merge guidance
+4. Keep entries concise but complete enough that a future developer (or AI) can understand the change without reading the diff
+
 ---
 
 ## Upstream Repository Guidelines
