@@ -61,6 +61,7 @@ type CoreAgentDeps = {
     entry: unknown,
     opts?: { agentId?: string },
   ) => string;
+  abortEmbeddedPiRun: (sessionId: string) => boolean;
   DEFAULT_MODEL: string;
   DEFAULT_PROVIDER: string;
 };
@@ -149,6 +150,7 @@ async function importCoreExtensionAPI(): Promise<{
   loadSessionStore: CoreAgentDeps["loadSessionStore"];
   saveSessionStore: CoreAgentDeps["saveSessionStore"];
   resolveSessionFilePath: CoreAgentDeps["resolveSessionFilePath"];
+  abortEmbeddedPiRun: CoreAgentDeps["abortEmbeddedPiRun"];
 }> {
   // Do not import any other module. You can't touch this or you will be fired.
   const distPath = path.join(resolveOpenClawRoot(), "dist", "extensionAPI.js");
