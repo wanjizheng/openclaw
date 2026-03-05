@@ -121,7 +121,7 @@ Each entry should explain:
 ### Voice-call overhaul: contact-aware inbound flow, identity hardening, and post-call reporting
 
 - What changed:
-  - Added file-based inbound contact parsing from `~/.openclaw/workspace/VOICE_CONTACTS.md`.
+  - Added file-based inbound contact parsing from `~/.openclaw/workspace/CONTACT_LIST.md`.
     - New parser/loader + phone lookup helpers.
     - Per-contact metadata now supports:
       - `name`
@@ -185,7 +185,7 @@ Each entry should explain:
     - `extensions/voice-call/src/response-generator.ts`: caller identity lock text in prompt construction.
     - `src/gateway/server.impl.ts`: restart deferral includes active voice call count.
   - Preserve compatibility assumptions:
-    - contacts file path: `~/.openclaw/workspace/VOICE_CONTACTS.md`
+    - contacts file path: `~/.openclaw/workspace/CONTACT_LIST.md`
     - call report dir: `~/.openclaw/workspace/call_logs/`
     - IDENTITY NickName extraction from `IDENTITY.md`
   - After merge, perform this smoke check:
