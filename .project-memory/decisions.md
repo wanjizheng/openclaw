@@ -59,7 +59,7 @@
 ## Decision #006 — Voice-call: contact-aware inbound flow with personalized greetings
 
 - **Date**: 2026-02-28
-- **Decision**: Implemented file-based inbound contact parsing from `~/.openclaw/workspace/VOICE_CONTACTS.md` with per-contact name, phone, greeting template, and info block.
+- **Decision**: Implemented file-based inbound contact parsing from `~/.openclaw/workspace/CONTACT_LIST.md` with per-contact name, phone, greeting template, and info block.
 - **Reason**: Support personalized call handling for known contacts. Reduce inbound greeting latency via pre-generated audio. Prevent identity spoofing.
 - **Impact**: Known callers get personalized greetings. Unknown callers use fallback. Post-call reports generated in `~/.openclaw/workspace/call_logs/`. Gateway restart deferred during active calls.
 - **Source**: Commit `5bd423eff` — "feat(voice-call): contact-aware inbound flow and robust post-call reporting"

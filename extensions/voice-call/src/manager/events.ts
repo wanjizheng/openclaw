@@ -84,7 +84,7 @@ function createInboundCall(params: {
     metadata: {},
   };
 
-  // Resolve personalised greeting + caller name from VOICE_CONTACTS.md
+  // Resolve personalised greeting + caller name from CONTACT_LIST.md
   const contacts = loadContactsFileSync();
   const { greeting, callerName } = resolveInboundGreeting(
     params.from,

@@ -191,7 +191,7 @@ export async function generateVoiceResponse(
     // File not present — use config value
   }
 
-  // Load caller personal info from VOICE_CONTACTS.md (if any)
+  // Load caller personal info from CONTACT_LIST.md (if any)
   const allContacts = await loadContactsFileAsync();
   const callerContact = findContactByPhone(from, allContacts);
   const callerInfo = callerContact?.info;
@@ -353,7 +353,7 @@ export async function generateVoiceResponse(
 
 /**
  * Use the LLM (with VOICE_SYSTEM_PROMPT) to generate the opening greeting text
- * for an inbound call.  The `greetingHint` from VOICE_CONTACTS.md is passed as
+ * for an inbound call.  The `greetingHint` from CONTACT_LIST.md is passed as
  * a style guide rather than printed verbatim, so岚岚's personality and TTS tags
  * are naturally applied.
  *

@@ -137,7 +137,7 @@ This is a **custom fork** (`openclaw-fork`) of the upstream [openclaw/openclaw](
 - `extensions/` — Extension config
 - `logs/` — Runtime logs
 - `voice-calls/` — Voice call data/recordings
-- `workspace/` — Workspace files (VOICE_CONTACTS.md, call_logs/, IDENTITY.md)
+- `workspace/` — Workspace files (CONTACT_LIST.md, call_logs/, IDENTITY.md)
 
 ---
 
