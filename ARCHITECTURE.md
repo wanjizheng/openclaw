@@ -280,7 +280,7 @@ extensions/
           ▼
   Voice-call webhook handler
           │
-          ├── Contact lookup (VOICE_CONTACTS.md)
+          ├── Contact lookup (CONTACT_LIST.md)
           ├── Greeting selection (personalized or fallback)
           │
           ▼

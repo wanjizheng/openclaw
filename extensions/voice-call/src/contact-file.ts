@@ -1,12 +1,13 @@
 /**
- * File-based contacts loader for VOICE_CONTACTS.md.
+ * File-based contacts loader for CONTACT_LIST.md.
  *
  * Format expected in the markdown file:
  *
- *   # 通话联系人
+ *   # 联系人列表
  *
  *   ## 基正
  *   - 电话: +447393866686
+ *   - 邮箱: someone@example.com
  *   - 问候语: 宝贝～是{name}来啦！岚岚好想你～
  *
  *   基正是林若岚的主人和男友。喜欢编程、音乐。
@@ -16,10 +17,11 @@
  *   ## 朋友
  *   - 电话: +447544852225
  *
- * Each `## Name` section becomes one contact.  The optional `- 电话:` and
- * `- 问候语:` bullet lines are parsed as structured metadata.  Any remaining
- * non-blank text below the metadata is treated as free-form `info` and will be
- * injected verbatim into the LLM system prompt when that caller connects.
+ * Each `## Name` section becomes one contact.  The optional `- 电话:`,
+ * `- 邮箱:`, and `- 问候语:` bullet lines are parsed as structured metadata.
+ * Any remaining non-blank text below the metadata is treated as free-form
+ * `info` and will be injected verbatim into the LLM system prompt when that
+ * caller connects.
  */
 
 import fs from "node:fs";
@@ -33,25 +35,22 @@ export type ParsedContact = {
   name: string;
   /** E.164 (or any) phone number */
   phone: string;
+  /** Email address */
+  email?: string;
   /** Per-contact greeting template (supports {name} placeholder) */
   greeting?: string;
   /** Free-form personal info to inject into the LLM system prompt */
   info?: string;
 };
 
-const DEFAULT_CONTACTS_PATH = path.join(
-  os.homedir(),
-  ".openclaw",
-  "workspace",
-  "VOICE_CONTACTS.md",
-);
+const DEFAULT_CONTACTS_PATH = path.join(os.homedir(), ".openclaw", "workspace", "CONTACT_LIST.md");
 
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
 
 /**
- * Parse the text of a VOICE_CONTACTS.md file into an array of contacts.
+ * Parse the text of a CONTACT_LIST.md file into an array of contacts.
  */
 export function parseContactsFile(content: string): ParsedContact[] {
   const contacts: ParsedContact[] = [];
@@ -71,6 +70,7 @@ export function parseContactsFile(content: string): ParsedContact[] {
     if (!name) continue;
 
     let phone = "";
+    let email: string | undefined;
     let greeting: string | undefined;
     const infoLines: string[] = [];
 
@@ -87,9 +87,12 @@ export function parseContactsFile(content: string): ParsedContact[] {
         if (line.startsWith("- ")) {
           // Structured metadata bullet
           const phoneMatch = line.match(/^- 电话[:：]\s*(.+)/);
+          const emailMatch = line.match(/^- 邮箱[:：]\s*(.+)/);
           const greetingMatch = line.match(/^- 问候语[:：]\s*(.+)/);
           if (phoneMatch) {
             phone = phoneMatch[1]!.trim();
+          } else if (emailMatch) {
+            email = emailMatch[1]!.trim();
           } else if (greetingMatch) {
             greeting = greetingMatch[1]!.trim();
           }
@@ -111,8 +114,8 @@ export function parseContactsFile(content: string): ParsedContact[] {
 
     const info = infoLines.join("\n").trim() || undefined;
 
-    if (phone) {
-      contacts.push({ name, phone, greeting, info });
+    if (phone || email) {
+      contacts.push({ name, phone, email, greeting, info });
     }
   }
 
@@ -124,7 +127,7 @@ export function parseContactsFile(content: string): ParsedContact[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Synchronously load contacts from VOICE_CONTACTS.md.
+ * Synchronously load contacts from CONTACT_LIST.md.
  * Returns an empty array if the file is missing or unreadable.
  */
 export function loadContactsFileSync(filePath = DEFAULT_CONTACTS_PATH): ParsedContact[] {
@@ -137,7 +140,7 @@ export function loadContactsFileSync(filePath = DEFAULT_CONTACTS_PATH): ParsedCo
 }
 
 /**
- * Asynchronously load contacts from VOICE_CONTACTS.md.
+ * Asynchronously load contacts from CONTACT_LIST.md.
  * Returns an empty array if the file is missing or unreadable.
  */
 export async function loadContactsFileAsync(
