@@ -180,7 +180,7 @@ export async function initiateCall(
     },
   };
 
-  // Resolve callee name from VOICE_CONTACTS.md so the LLM knows who it's talking to
+  // Resolve callee name from CONTACT_LIST.md so the LLM knows who it's talking to
   try {
     const contacts = await loadContactsFileAsync();
     const contact = findContactByPhone(to, contacts);
