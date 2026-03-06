@@ -38,3 +38,28 @@ export function isReasoningTagProvider(provider: string | undefined | null): boo
 
   return false;
 }
+
+/**
+ * Returns true if the provider uses <final> tags to wrap its actual output,
+ * meaning text NOT inside <final> tags should be discarded.
+ *
+ * This is a subset of reasoning-tag providers: DeepSeek emits <think> tags
+ * but does NOT use <final> tags, so enforcing <final> would discard all output.
+ */
+export function isEnforceFinalTagProvider(provider: string | undefined | null): boolean {
+  if (!provider) {
+    return false;
+  }
+  const normalized = provider.trim().toLowerCase();
+  if (
+    normalized === "google" ||
+    normalized === "google-gemini-cli" ||
+    normalized === "google-generative-ai"
+  ) {
+    return true;
+  }
+  if (normalized.includes("minimax")) {
+    return true;
+  }
+  return false;
+}
