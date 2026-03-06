@@ -411,3 +411,35 @@ Each entry should explain:
   - `PROJECT_CONTEXT.md`
 - User-visible behavior:
   - Deployment/restart instructions now consistently include the required UI build step, reducing startup/runtime asset errors.
+
+## 2026-03-06
+
+### Discord reply pipeline: DeepSeek final-tag fix, duplicate-reply guard, and fallback hardening
+
+- What changed:
+  - Split provider capabilities so DeepSeek keeps reasoning-tag handling but does not enable `<final>`-only enforcement.
+    - Added `isEnforceFinalTagProvider()` and switched final-tag gating to this new helper.
+    - Kept `isReasoningTagProvider()` behavior for stripping `<think>` content.
+  - Hardened message-end fallback path when parsed assistant text is empty.
+    - Removed the guard that disabled fallback under `enforceFinalTag`.
+    - Added defensive stripping of `<think>...</think>` and `<final>` markers before fallback parse.
+  - Fixed duplicate assistant sends when the messaging tool already delivered similar text.
+    - `buildReplyPayloads()` now always applies text-level dedupe against `messagingToolSentTexts`.
+    - Media dedupe behavior remains target-aware (unchanged intent).
+  - Added provider utility tests for final-tag enforcement behavior.
+- Why:
+  - DeepSeek Chat does not wrap user-facing output with `<final>...</final>` tags.
+  - Enforcing `<final>` for DeepSeek could collapse valid output to empty text and skip normal delivery.
+  - In mixed tool + default reply paths, target-metadata mismatch could bypass dedupe and produce duplicated user-visible replies.
+  - Fallback hardening prevents silent drops when tag parsing and model output format diverge.
+- Files:
+  - `src/utils/provider-utils.ts`
+  - `src/utils/utils-misc.test.ts`
+  - `src/auto-reply/reply/agent-runner-utils.ts`
+  - `src/auto-reply/reply/get-reply-run.ts`
+  - `src/agents/pi-embedded-subscribe.handlers.messages.ts`
+  - `src/auto-reply/reply/agent-runner-payloads.ts`
+- User-visible behavior:
+  - Default Discord replies from DeepSeek no longer disappear due to `<final>` enforcement mismatch.
+  - Duplicate identical replies (message tool + default send) are suppressed more reliably.
+  - Fewer silent empty-reply outcomes when provider output formatting is inconsistent.

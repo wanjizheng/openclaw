@@ -294,10 +294,14 @@ export function handleMessageEnd(
   let mediaUrls = parsedText?.mediaUrls;
   let hasMedia = Boolean(mediaUrls && mediaUrls.length > 0);
 
-  if (!cleanedText && !hasMedia && !ctx.params.enforceFinalTag) {
+  if (!cleanedText && !hasMedia) {
     const rawTrimmed = rawText.trim();
-    const rawStrippedFinal = rawTrimmed.replace(/<\s*\/?\s*final\s*>/gi, "").trim();
-    const rawCandidate = rawStrippedFinal || rawTrimmed;
+    // Strip both <think>...</think> blocks and <final> tags to avoid leaking reasoning.
+    const rawStrippedTags = rawTrimmed
+      .replace(/<think>[\s\S]*?<\/think>/gi, "")
+      .replace(/<\s*\/?\s*final\s*>/gi, "")
+      .trim();
+    const rawCandidate = rawStrippedTags || rawTrimmed;
     if (rawCandidate) {
       const parsedFallback = parseReplyDirectives(stripTrailingDirective(rawCandidate));
       cleanedText = parsedFallback.text ?? rawCandidate;
