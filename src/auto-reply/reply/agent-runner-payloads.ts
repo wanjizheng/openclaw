@@ -104,18 +104,19 @@ export function buildReplyPayloads(params: {
       originatingAccountId: params.accountId,
     }),
   });
-  // Only dedupe against messaging tool sends for the same origin target.
+  // Only dedupe media against messaging tool sends for the same origin target.
   // Cross-target sends (for example posting to another channel) must not
   // suppress the current conversation's final reply.
   // If target metadata is unavailable, keep legacy dedupe behavior.
   const dedupeMessagingToolPayloads =
     suppressMessagingToolReplies || messagingToolSentTargets.length === 0;
-  const dedupedPayloads = dedupeMessagingToolPayloads
-    ? filterMessagingToolDuplicates({
-        payloads: replyTaggedPayloads,
-        sentTexts: messagingToolSentTexts,
-      })
-    : replyTaggedPayloads;
+  // Always deduplicate text payloads against messaging tool sent texts to
+  // prevent double-delivery when the messaging tool targets the same channel
+  // but target format comparison is inexact.
+  const dedupedPayloads = filterMessagingToolDuplicates({
+    payloads: replyTaggedPayloads,
+    sentTexts: messagingToolSentTexts,
+  });
   const mediaFilteredPayloads = dedupeMessagingToolPayloads
     ? filterMessagingToolMediaDuplicates({
         payloads: dedupedPayloads,
