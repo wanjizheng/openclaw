@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { parseBooleanValue } from "./boolean.js";
-import { isReasoningTagProvider } from "./provider-utils.js";
+import { isReasoningTagProvider, isEnforceFinalTagProvider } from "./provider-utils.js";
 import { splitShellArgs } from "./shell-argv.js";
 
 describe("parseBooleanValue", () => {
@@ -89,6 +89,36 @@ describe("isReasoningTagProvider", () => {
       expect(isReasoningTagProvider(testCase.value)).toBe(testCase.expected);
     });
   }
+});
+
+describe("isEnforceFinalTagProvider", () => {
+  it("returns true for google providers", () => {
+    expect(isEnforceFinalTagProvider("google")).toBe(true);
+    expect(isEnforceFinalTagProvider("google-gemini-cli")).toBe(true);
+    expect(isEnforceFinalTagProvider("google-generative-ai")).toBe(true);
+  });
+
+  it("returns true for minimax", () => {
+    expect(isEnforceFinalTagProvider("minimax")).toBe(true);
+    expect(isEnforceFinalTagProvider("minimax-cn")).toBe(true);
+  });
+
+  it("returns false for deepseek — uses <think> but not <final> tags", () => {
+    expect(isEnforceFinalTagProvider("deepseek")).toBe(false);
+    expect(isEnforceFinalTagProvider("DeepSeek")).toBe(false);
+  });
+
+  it("returns false for null/undefined/empty", () => {
+    expect(isEnforceFinalTagProvider(null)).toBe(false);
+    expect(isEnforceFinalTagProvider(undefined)).toBe(false);
+    expect(isEnforceFinalTagProvider("")).toBe(false);
+  });
+
+  it("returns false for non-reasoning providers", () => {
+    expect(isEnforceFinalTagProvider("anthropic")).toBe(false);
+    expect(isEnforceFinalTagProvider("openai")).toBe(false);
+    expect(isEnforceFinalTagProvider("ollama")).toBe(false);
+  });
 });
 
 describe("splitShellArgs", () => {
