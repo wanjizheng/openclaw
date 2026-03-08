@@ -224,6 +224,7 @@ export async function sendDiscordVoiceMessage(
   request: RetryRunner,
   token: string,
   silent?: boolean,
+  ..._compat: unknown[]
 ): Promise<{ id: string; channel_id: string }> {
   const filename = "voice-message.ogg";
   const flags = silent
