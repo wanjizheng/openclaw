@@ -234,8 +234,10 @@ class OpenAIRealtimeSTTSession implements RealtimeSTTSession {
         break;
 
       case "conversation.item.input_audio_transcription.completed":
+        console.log(
+          `[RealtimeSTT] Transcript completed: "${event.transcript || ""}" (length=${event.transcript?.length ?? 0})`,
+        );
         if (event.transcript) {
-          console.log(`[RealtimeSTT] Transcript: ${event.transcript}`);
           this.onTranscriptCallback?.(event.transcript);
         }
         this.pendingTranscript = "";
@@ -249,6 +251,13 @@ class OpenAIRealtimeSTTSession implements RealtimeSTTSession {
 
       case "error":
         console.error("[RealtimeSTT] Error:", event.error);
+        break;
+
+      default:
+        console.log(
+          `[RealtimeSTT] Unhandled event: ${event.type}`,
+          JSON.stringify(event).slice(0, 500),
+        );
         break;
     }
   }

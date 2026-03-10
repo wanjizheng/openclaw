@@ -197,10 +197,28 @@ export async function initiateCall(
   try {
     // For notify mode with a message, use inline TwiML with <Say>.
     let inlineTwiml: string | undefined;
+    let twilioMachineDetection: "Enable" | "DetectMessageEnd" | undefined;
+    let voicemailTwiml: string | undefined;
     if (mode === "notify" && initialMessage) {
       const pollyVoice = mapVoiceToPolly(ctx.config.tts?.openai?.voice);
       inlineTwiml = generateNotifyTwiml(initialMessage, pollyVoice);
       console.log(`[voice-call] Using inline TwiML for notify mode (voice: ${pollyVoice})`);
+    }
+
+    if (ctx.provider.name === "twilio") {
+      const amdMode = ctx.config.outbound.twilioAmdMode;
+      if (amdMode === "enable") {
+        twilioMachineDetection = "Enable";
+      } else if (amdMode === "detect-message-end") {
+        twilioMachineDetection = "DetectMessageEnd";
+      }
+
+      // In conversation mode, if we already have an initial message,
+      // reuse it as voicemail fallback when AMD identifies a machine.
+      if (mode === "conversation" && effectiveInitialMessage) {
+        const pollyVoice = mapVoiceToPolly(ctx.config.tts?.openai?.voice);
+        voicemailTwiml = generateNotifyTwiml(effectiveInitialMessage, pollyVoice);
+      }
     }
 
     const result = await ctx.provider.initiateCall({
@@ -209,6 +227,8 @@ export async function initiateCall(
       to,
       webhookUrl: ctx.webhookUrl,
       inlineTwiml,
+      twilioMachineDetection,
+      voicemailTwiml,
     });
 
     callRecord.providerCallId = result.providerCallId;
