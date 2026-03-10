@@ -572,9 +572,6 @@ export class DiscordVoiceManager {
     logVoiceVerbose(
       `capture start: guild ${entry.guildId} channel ${entry.channelId} user ${userId}`,
     );
-    if (entry.player.state.status === AudioPlayerStatus.Playing) {
-      entry.player.stop(true);
-    }
 
     const stream = entry.connection.receiver.subscribe(userId, {
       end: {
@@ -601,6 +598,10 @@ export class DiscordVoiceManager {
           `capture too short (${durationSeconds.toFixed(2)}s): guild ${entry.guildId} channel ${entry.channelId} user ${userId}`,
         );
         return;
+      }
+      // Only interrupt TTS playback after confirming this is real speech (not keyboard noise etc.)
+      if (entry.player.state.status === AudioPlayerStatus.Playing) {
+        entry.player.stop(true);
       }
       logVoiceVerbose(
         `capture ready (${durationSeconds.toFixed(2)}s): guild ${entry.guildId} channel ${entry.channelId} user ${userId}`,
