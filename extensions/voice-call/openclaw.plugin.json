@@ -48,6 +48,10 @@
       "label": "Notify Hangup Delay (sec)",
       "advanced": true
     },
+    "outbound.twilioAmdMode": {
+      "label": "Twilio AMD Mode",
+      "advanced": true
+    },
     "serve.port": {
       "label": "Webhook Port"
     },
@@ -242,6 +246,11 @@
           "notifyHangupDelaySec": {
             "type": "integer",
             "minimum": 0
+          },
+          "twilioAmdMode": {
+            "type": "string",
+            "enum": ["off", "enable", "detect-message-end"],
+            "default": "off"
           }
         }
       },
