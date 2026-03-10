@@ -94,6 +94,8 @@ export class TwilioProvider implements VoiceCallProvider {
 
   /** Storage for TwiML content (for notify mode with URL-based TwiML) */
   private readonly twimlStorage = new Map<string, string>();
+  /** Storage for voicemail TwiML content used when AMD detects a machine answer */
+  private readonly voicemailTwimlStorage = new Map<string, string>();
   /** Track notify-mode calls to avoid streaming on follow-up callbacks */
   private readonly notifyCalls = new Set<string>();
 
@@ -143,6 +145,7 @@ export class TwilioProvider implements VoiceCallProvider {
    */
   private deleteStoredTwiml(callId: string): void {
     this.twimlStorage.delete(callId);
+    this.voicemailTwimlStorage.delete(callId);
     this.notifyCalls.delete(callId);
   }
 
@@ -394,6 +397,7 @@ export class TwilioProvider implements VoiceCallProvider {
     },
   ): NormalizedEvent | null {
     const callSid = params.get("CallSid") || "";
+    const answeredBy = params.get("AnsweredBy");
     const callIdOverride = options?.callIdOverride;
 
     const baseEvent = {
@@ -426,14 +430,40 @@ export class TwilioProvider implements VoiceCallProvider {
       return { ...baseEvent, type: "call.dtmf", digits };
     }
 
-    // Handle call status changes
+    // Handle async AMD callback (has AnsweredBy but no CallStatus).
+    // With AsyncAmd=true the Url webhook fires immediately without AnsweredBy;
+    // the AMD result arrives later via AsyncAmdStatusCallback.
     const callStatus = params.get("CallStatus");
+    if (answeredBy && !callStatus) {
+      if (TwilioProvider.isMachineAnswered(answeredBy)) {
+        // Machine / voicemail detected — proactively hang up via API because
+        // the call is already connected with ConversationRelay.
+        this.hangupCall({ providerCallId: callSid }).catch(() => {});
+        this.voicemailTwimlStorage.delete(callIdOverride || callSid);
+        this.streamAuthTokens.delete(callSid);
+        if (callIdOverride) {
+          this.deleteStoredTwiml(callIdOverride);
+        }
+        return { ...baseEvent, type: "call.ended", reason: "voicemail" };
+      }
+      // Human detected — nothing to do, call is already connected.
+      return null;
+    }
+
+    // Handle call status changes
     switch (callStatus) {
       case "initiated":
         return { ...baseEvent, type: "call.initiated" };
       case "ringing":
         return { ...baseEvent, type: "call.ringing" };
       case "in-progress":
+        if (TwilioProvider.isMachineAnswered(answeredBy)) {
+          this.streamAuthTokens.delete(callSid);
+          if (callIdOverride) {
+            this.deleteStoredTwiml(callIdOverride);
+          }
+          return { ...baseEvent, type: "call.ended", reason: "voicemail" };
+        }
         return { ...baseEvent, type: "call.answered" };
       case "completed":
       case "busy":
@@ -442,6 +472,9 @@ export class TwilioProvider implements VoiceCallProvider {
         this.streamAuthTokens.delete(callSid);
         if (callIdOverride) {
           this.deleteStoredTwiml(callIdOverride);
+        }
+        if (callStatus === "completed" && TwilioProvider.isMachineAnswered(answeredBy)) {
+          return { ...baseEvent, type: "call.ended", reason: "voicemail" };
         }
         return { ...baseEvent, type: "call.ended", reason: callStatus };
       case "canceled":
@@ -463,6 +496,19 @@ export class TwilioProvider implements VoiceCallProvider {
   <Pause length="30"/>
 </Response>`;
 
+  private static readonly HANGUP_TWIML = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Hangup/>
+</Response>`;
+
+  private static isMachineAnswered(answeredBy: string | null): boolean {
+    if (!answeredBy) {
+      return false;
+    }
+    const normalized = answeredBy.toLowerCase();
+    return normalized === "fax" || normalized.startsWith("machine");
+  }
+
   /**
    * Generate TwiML response for webhook.
    * In Gather mode: uses <Gather> + <Play> for turn-based conversation.
@@ -479,6 +525,7 @@ export class TwilioProvider implements VoiceCallProvider {
     const isGatherAction =
       typeof ctx.query?.gatherAction === "string" && ctx.query.gatherAction === "1";
     const callStatus = params.get("CallStatus");
+    const answeredBy = params.get("AnsweredBy");
     const direction = params.get("Direction");
     const isOutbound = direction?.startsWith("outbound") ?? false;
     const callSid = params.get("CallSid") || undefined;
@@ -489,6 +536,13 @@ export class TwilioProvider implements VoiceCallProvider {
 
     // Status callbacks should not receive TwiML.
     if (isStatusCallback) {
+      return TwilioProvider.EMPTY_TWIML;
+    }
+
+    // Async AMD status callback (AnsweredBy present, CallStatus absent).
+    // The hangup is already handled via API in normalizeEvent(); returning
+    // voicemail TwiML here would play Polly audio to a human who answered.
+    if (answeredBy && !callStatus) {
       return TwilioProvider.EMPTY_TWIML;
     }
 
@@ -519,6 +573,10 @@ export class TwilioProvider implements VoiceCallProvider {
 
       // Conversation mode outbound calls
       if (isOutbound) {
+        if (TwilioProvider.isMachineAnswered(answeredBy)) {
+          const voicemailTwiml = this.voicemailTwimlStorage.get(callIdFromQuery);
+          return voicemailTwiml ?? TwilioProvider.HANGUP_TWIML;
+        }
         if (this.useHybridMode && callSid) {
           return this.buildHybridInitialTwiml({ callSid });
         }
@@ -554,6 +612,12 @@ export class TwilioProvider implements VoiceCallProvider {
 
     // For outbound calls, keep alive
     if (isOutbound) {
+      if (TwilioProvider.isMachineAnswered(answeredBy)) {
+        const voicemailTwiml = callIdFromQuery
+          ? this.voicemailTwimlStorage.get(callIdFromQuery)
+          : undefined;
+        return voicemailTwiml ?? TwilioProvider.HANGUP_TWIML;
+      }
       if (this.useHybridMode && callSid) {
         return this.buildHybridInitialTwiml({ callSid });
       }
@@ -690,6 +754,9 @@ export class TwilioProvider implements VoiceCallProvider {
       this.twimlStorage.set(input.callId, input.inlineTwiml);
       this.notifyCalls.add(input.callId);
     }
+    if (input.voicemailTwiml) {
+      this.voicemailTwimlStorage.set(input.callId, input.voicemailTwiml);
+    }
 
     // Build request params - always use URL-based TwiML.
     // Twilio silently ignores `StatusCallback` when using the inline `Twiml` parameter.
@@ -703,6 +770,15 @@ export class TwilioProvider implements VoiceCallProvider {
       StatusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
       Timeout: "30",
     };
+    if (input.twilioMachineDetection) {
+      params.MachineDetection = input.twilioMachineDetection;
+      // Use async AMD so the Url webhook fires immediately (no delay waiting
+      // for AMD to finish).  ConversationRelay / Hybrid connects right away;
+      // the AMD result arrives later via AsyncAmdStatusCallback.
+      params.AsyncAmd = "true";
+      params.AsyncAmdStatusCallback = statusUrl.toString();
+      params.AsyncAmdStatusCallbackMethod = "POST";
+    }
 
     const result = await this.apiRequest<TwilioCallResponse>("/Calls.json", params);
 
