@@ -214,6 +214,10 @@ export type InitiateCallInput = {
   clientState?: Record<string, string>;
   /** Inline TwiML to execute (skips webhook, used for notify mode) */
   inlineTwiml?: string;
+  /** Twilio AMD mode for outbound calls */
+  twilioMachineDetection?: "Enable" | "DetectMessageEnd";
+  /** TwiML to use when Twilio reports voicemail/machine answer */
+  voicemailTwiml?: string;
 };
 
 export type InitiateCallResult = {
