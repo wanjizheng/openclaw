@@ -47,7 +47,7 @@ const CHANNELS = 2;
 const BIT_DEPTH = 16;
 const MIN_SEGMENT_SECONDS = 0.35;
 const SILENCE_DURATION_MS = 1_000;
-const PLAYBACK_READY_TIMEOUT_MS = 30_000;
+const PLAYBACK_READY_TIMEOUT_MS = 45_000;
 const SPEAKING_READY_TIMEOUT_MS = 60_000;
 const DECRYPT_FAILURE_WINDOW_MS = 30_000;
 const DECRYPT_FAILURE_RECONNECT_THRESHOLD = 3;
@@ -491,8 +491,8 @@ export class DiscordVoiceManager {
     disconnectedHandler = async () => {
       try {
         await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+          entersState(connection, VoiceConnectionStatus.Signalling, 15_000),
+          entersState(connection, VoiceConnectionStatus.Connecting, 15_000),
         ]);
       } catch {
         clearSessionIfCurrent();
