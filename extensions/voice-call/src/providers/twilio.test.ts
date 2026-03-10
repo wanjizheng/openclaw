@@ -260,4 +260,70 @@ describe("TwilioProvider", () => {
       globalThis.fetch = originalFetch;
     }
   });
+
+  it("returns voicemail TwiML and voicemail end event when AnsweredBy is machine", () => {
+    const provider = createProvider();
+    (
+      provider as unknown as {
+        voicemailTwimlStorage: Map<string, string>;
+      }
+    ).voicemailTwimlStorage.set(
+      "call-voicemail",
+      '<?xml version="1.0" encoding="UTF-8"?><Response><Say>please call back</Say><Hangup/></Response>',
+    );
+
+    const ctx = createContext(
+      "CallStatus=in-progress&Direction=outbound-api&CallSid=CA777&AnsweredBy=machine_end_beep",
+      { callId: "call-voicemail" },
+    );
+
+    const result = provider.parseWebhookEvent(ctx);
+
+    expect(result.providerResponseBody).toContain("please call back");
+    expect(result.events[0]?.type).toBe("call.ended");
+    expect(result.events[0]).toMatchObject({ reason: "voicemail" });
+  });
+
+  it("hangs up immediately when machine is detected but voicemail TwiML is missing", () => {
+    const provider = createProvider();
+    const ctx = createContext(
+      "CallStatus=in-progress&Direction=outbound-api&CallSid=CA778&AnsweredBy=machine_start",
+      { callId: "call-no-voicemail" },
+    );
+
+    const result = provider.parseWebhookEvent(ctx);
+
+    expect(result.providerResponseBody).toContain("<Hangup/>");
+    expect(result.events[0]?.type).toBe("call.ended");
+    expect(result.events[0]).toMatchObject({ reason: "voicemail" });
+  });
+
+  it("passes MachineDetection when configured for Twilio outbound", async () => {
+    const provider = createProvider();
+    let capturedBody: URLSearchParams | null = null;
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: string, init?: RequestInit): Promise<Response> => {
+      capturedBody = init?.body as URLSearchParams;
+      return new Response(JSON.stringify({ sid: "CA900", status: "queued" }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    try {
+      const result = await provider.initiateCall({
+        callId: "call-amd",
+        from: "+15550000000",
+        to: "+15550000001",
+        webhookUrl: "https://example.ngrok.app/voice/webhook",
+        twilioMachineDetection: "DetectMessageEnd",
+      });
+
+      expect(result.providerCallId).toBe("CA900");
+      expect(capturedBody?.get("MachineDetection")).toBe("DetectMessageEnd");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
 });
