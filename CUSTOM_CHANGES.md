@@ -4,6 +4,27 @@ Track every custom behavior you add.
 Each entry should explain:
 
 - What changed
+
+## 2026-03-10
+
+### Fix: Discord voice DAVE handshake timeout
+
+- What changed:
+  - `PLAYBACK_READY_TIMEOUT_MS`: `30_000` → `45_000`
+  - Disconnected recovery race: `5_000` → `15_000` (both Signalling + Connecting)
+- Why:
+  - Discord's DAVE (E2EE audio/video encryption) MLS session setup takes 13–22s.
+  - The previous 30s timeout was too close to the edge, causing intermittent
+    "Failed to join voice channel: The operation was aborted" errors.
+  - The 5s reconnect race was also too tight when the bot briefly disconnected.
+- Files:
+  - `src/discord/voice/manager.ts`
+- User-visible behavior:
+  - Bot reliably joins and stays in voice channels with DAVE encryption enabled.
+  - `daveEncryption` must remain `true` in config — Discord requires DAVE and
+    will not send SessionDescription if `max_dave_protocol_version` is 0.
+
+- What changed:
 - Why it was needed
 - Which files were touched
 - User-visible behavior
