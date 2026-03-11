@@ -9,6 +9,7 @@ import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { resolveVoiceAgentId } from "./agent-routing.js";
 import type { VoiceCallConfig } from "./config.js";
 import { findContactByPhone, loadContactsFileAsync } from "./contact-file.js";
 import { loadCoreAgentDeps, loadCoreTtsDeps, type CoreConfig } from "./core-bridge.js";
@@ -107,6 +108,16 @@ function extractDiscordUserId(text?: string): string | null {
   return match?.[1] ?? null;
 }
 
+function inferEndCallFromUserMessage(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) return false;
+  const farewellRe = /(晚安|再见|拜拜|挂了|挂吧|先这样|回头聊|下次聊|结束通话|就到这)/i;
+  const negationRe = /(不|别|不要|先不|还不|不能).{0,4}(挂|结束|再见|晚安)/;
+  if (negationRe.test(normalized)) return false;
+  if (/[?？]\s*$/.test(normalized)) return false;
+  return farewellRe.test(normalized);
+}
+
 export type VoiceResponseParams = {
   /** Voice call config */
   voiceConfig: VoiceCallConfig;
@@ -126,6 +137,8 @@ export type VoiceResponseParams = {
   userMessage: string;
   /** Original reason/purpose for this outbound call (e.g. the instruction that triggered it) */
   callReason?: string;
+  /** Agent ID for workspace routing (falls back to main when omitted) */
+  agentId?: string;
 };
 
 export type VoiceResponseResult = {
@@ -168,7 +181,7 @@ export async function generateVoiceResponse(
 
   // Build voice-specific session key based on call ID (each call gets its own isolated session)
   const sessionKey = `voice:${callId}`;
-  const agentId = "main";
+  const agentId = resolveVoiceAgentId({ agentId: params.agentId });
 
   // Resolve paths
   const storePath = deps.resolveStorePath(cfg.session?.store, { agentId });
@@ -231,6 +244,9 @@ export async function generateVoiceResponse(
 
   const toolGroundingRules =
     "【工具一致性规则】1) 只有在工具明确成功返回后，才能说“已发送/已完成/已查到”。2) 若工具失败（例如浏览器未连接、权限不足、网络错误），必须明确告知失败原因，不能编造成功结果。3) 对时间/距离/路线等事实数据，只能引用工具返回值；若未获取到真实结果，必须说“暂时无法确认”。";
+  const voiceTagRules =
+    "【电话语音标签规则】每一轮语音回复默认在开头添加 1 个标签（从 [laughs] [whispers] [sighs] [slow] [excited] [curious] 中选择）。标签只用于语音表达，不改变语义，不要堆叠。\n" +
+    "【通话结束规则】当你明确结束对话（如“晚安”“再见”且本轮不再继续）时，必须在回复末尾追加 [END_CALL]。";
 
   // Prepend caller context so the LLM always knows who it is speaking with
   const callerLabel = callerName ? `${callerName} (${from})` : from;
@@ -252,6 +268,7 @@ export async function generateVoiceResponse(
       ` 调用 message 工具时使用：action="send", channel="discord", target="user:${defaultDiscordUserId}"。`;
   }
   systemCore += `\n\n${toolGroundingRules}`;
+  systemCore += `\n\n${voiceTagRules}`;
   systemCore += `\n\n${callerContextLine}`;
   if (callerInfo) {
     systemCore += `\n\n${callerName ?? from}的个人信息：\n${callerInfo}`;
@@ -324,6 +341,10 @@ export async function generateVoiceResponse(
       endCall = true;
       text = text.replace(/\[END_CALL\]/gi, "").trim() || null;
     }
+    if (!endCall && inferEndCallFromUserMessage(userMessage)) {
+      endCall = true;
+      console.log("[voice-call] Inferred end-call intent from user message (non-streaming)");
+    }
 
     if (!text && result.meta?.aborted) {
       return { text: null, error: "Response generation was aborted" };
@@ -366,6 +387,7 @@ export async function generateGreetingText(params: {
   callerName?: string;
   greetingHint?: string;
   callerInfo?: string;
+  agentId?: string;
 }): Promise<string | null> {
   const { voiceConfig, coreConfig: cfg, from, callerName, greetingHint, callerInfo } = params;
 
@@ -376,7 +398,7 @@ export async function generateGreetingText(params: {
     return null;
   }
 
-  const agentId = "main";
+  const agentId = resolveVoiceAgentId({ agentId: params.agentId });
   const workspaceDir = deps.resolveAgentWorkspaceDir(cfg, agentId);
   const agentDir = deps.resolveAgentDir(cfg, agentId);
 
