@@ -1,5 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import type { GatewayRequestHandlerOptions, OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { resolveVoiceAgentId } from "./src/agent-routing.js";
 import { normalizePhoneNumber } from "./src/allowlist.js";
 import { registerVoiceCallCli } from "./src/cli.js";
 import {
@@ -233,6 +234,25 @@ const voiceCallPlugin = {
       respond(false, { error: err instanceof Error ? err.message : String(err) });
     };
 
+    // Capture caller context for voice_call tool invocations so outbound calls
+    // can inherit the originating agent/session workspace.
+    const toolCallContext = new Map<string, { agentId?: string; sessionKey?: string }>();
+    api.on("before_tool_call", (event, ctx) => {
+      if (event.toolName !== "voice_call" || !event.toolCallId) {
+        return;
+      }
+      toolCallContext.set(event.toolCallId, {
+        agentId: ctx.agentId,
+        sessionKey: ctx.sessionKey,
+      });
+    });
+    api.on("after_tool_call", (event) => {
+      if (event.toolName !== "voice_call" || !event.toolCallId) {
+        return;
+      }
+      toolCallContext.delete(event.toolCallId);
+    });
+
     api.registerGatewayMethod(
       "voicecall.initiate",
       async ({ params, respond }: GatewayRequestHandlerOptions) => {
@@ -253,7 +273,11 @@ const voiceCallPlugin = {
           }
           const mode =
             params?.mode === "notify" || params?.mode === "conversation" ? params.mode : undefined;
-          const result = await rt.manager.initiateCall(to, undefined, {
+          const originSessionKey =
+            typeof params?.sessionKey === "string" && params.sessionKey.trim()
+              ? params.sessionKey.trim()
+              : undefined;
+          const result = await rt.manager.initiateCall(to, originSessionKey, {
             message,
             mode,
           });
@@ -374,7 +398,11 @@ const voiceCallPlugin = {
             return;
           }
           const rt = await ensureRuntime();
-          const result = await rt.manager.initiateCall(to, undefined, {
+          const originSessionKey =
+            typeof params?.sessionKey === "string" && params.sessionKey.trim()
+              ? params.sessionKey.trim()
+              : undefined;
+          const result = await rt.manager.initiateCall(to, originSessionKey, {
             message: message || undefined,
           });
           if (!result.success) {
@@ -397,6 +425,12 @@ const voiceCallPlugin = {
         const json = (payload: unknown) => ({
           content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
           details: payload,
+        });
+        const originCtx = toolCallContext.get(_toolCallId);
+        const originSessionKey = originCtx?.sessionKey;
+        const originAgentId = resolveVoiceAgentId({
+          agentId: originCtx?.agentId,
+          sessionKey: originSessionKey,
         });
 
         try {
@@ -437,6 +471,7 @@ const voiceCallPlugin = {
                     callerName: contact?.name,
                     greetingHint: `你正在给${contact?.name ?? to}打电话。通话目的：${message}\n请生成一句自然的开场白（直接说明来意，不要只是问好）。`,
                     callerInfo: contact?.info,
+                    agentId: originAgentId,
                   });
 
                   const ttsText = (generatedText || message || "您好")
@@ -466,7 +501,7 @@ const voiceCallPlugin = {
                   );
                 }
 
-                const result = await rt.manager.initiateCall(to, undefined, {
+                const result = await rt.manager.initiateCall(to, originSessionKey, {
                   message,
                   mode:
                     params.mode === "notify" || params.mode === "conversation"
@@ -593,7 +628,7 @@ const voiceCallPlugin = {
             }
           }
 
-          const result = await rt.manager.initiateCall(to, undefined, {
+          const result = await rt.manager.initiateCall(to, originSessionKey, {
             message: legacyMessage,
             initialMessageAudioUrl: legacyAudioUrl,
           });
@@ -643,7 +678,7 @@ const voiceCallPlugin = {
                 const nodeFsp = require("node:fs/promises") as typeof import("node:fs/promises");
                 const deps = await loadCoreAgentDeps();
                 const cfg = api.config as CoreConfig;
-                const agentId = "main";
+                const agentId = resolveVoiceAgentId({ sessionKey: call.sessionKey });
                 const storePath = deps.resolveStorePath(cfg.session?.store, { agentId });
                 const sessionStore = deps.loadSessionStore(storePath);
                 const sessionKey = `voice:${call.callId}`;
@@ -669,7 +704,12 @@ const voiceCallPlugin = {
                 const nodePath = require("node:path") as typeof import("node:path");
                 const nodeFs = require("node:fs") as typeof import("node:fs");
                 const nodeFsp = require("node:fs/promises") as typeof import("node:fs/promises");
-                const nodeOs = require("node:os") as typeof import("node:os");
+                const { loadCoreAgentDeps } = await import("./src/core-bridge.js");
+                const deps = await loadCoreAgentDeps();
+                const cfg = api.config as CoreConfig;
+                const agentId = resolveVoiceAgentId({ sessionKey: call.sessionKey });
+                const workspaceDir = deps.resolveAgentWorkspaceDir(cfg, agentId);
+                const agentDir = deps.resolveAgentDir(cfg, agentId);
 
                 // Try to resolve contact name from metadata first, then from contacts file
                 let callerName = call.metadata?.callerName as string | undefined;
@@ -697,20 +737,25 @@ const voiceCallPlugin = {
                   call.endedAt && call.startedAt ? call.endedAt - call.startedAt : undefined;
                 const durationStr = durationMs ? `${Math.round(durationMs / 1000)}秒` : "未知";
 
-                // Resolve bot display name from IDENTITY.md NickName
-                let botDisplayName = "Bot";
+                // Resolve bot display name from agent identity first, then IDENTITY.md.
+                let botDisplayName =
+                  deps.resolveAgentIdentity(cfg, agentId)?.name?.trim() || "诺岚";
                 try {
-                  const identityPath = nodePath.join(
-                    nodeOs.homedir(),
-                    ".openclaw/workspace/IDENTITY.md",
-                  );
+                  const identityPath = nodePath.join(workspaceDir, "IDENTITY.md");
                   const identityContent = nodeFs.readFileSync(identityPath, "utf-8") as string;
-                  const nickMatch = identityContent.match(/\*\*NickName[:：]?\*\*[:：]?\s*(.+)/i);
-                  if (nickMatch?.[1]?.trim()) {
-                    botDisplayName = nickMatch[1].trim();
+                  const nickMatch = identityContent.match(
+                    /^\s*-\s*\*\*NickName\*\*[:：]\s*(.+)$/im,
+                  );
+                  const nameMatch = identityContent.match(/^\s*-\s*\*\*Name\*\*[:：]\s*(.+)$/im);
+                  const nick = nickMatch?.[1]?.trim();
+                  const name = nameMatch?.[1]?.trim();
+                  if (nick) {
+                    botDisplayName = nick;
+                  } else if (name) {
+                    botDisplayName = name;
                   }
                 } catch {
-                  // IDENTITY.md not found; fall back to "Bot"
+                  // IDENTITY.md missing; keep resolved identity fallback
                 }
 
                 const isInbound = call.direction === "inbound";
@@ -730,13 +775,6 @@ const voiceCallPlugin = {
                 let summary = "";
                 if (call.transcript.length > 0) {
                   try {
-                    const { loadCoreAgentDeps } = await import("./src/core-bridge.js");
-                    const deps = await loadCoreAgentDeps();
-                    const cfg = api.config as CoreConfig;
-                    const agentId = "main";
-                    const workspaceDir = deps.resolveAgentWorkspaceDir(cfg, agentId);
-                    const agentDir = deps.resolveAgentDir(cfg, agentId);
-
                     const modelRef =
                       config.responseModel || `${deps.DEFAULT_PROVIDER}/${deps.DEFAULT_MODEL}`;
                     const slashIdx = modelRef.indexOf("/");
@@ -821,7 +859,7 @@ const voiceCallPlugin = {
 
                 // --- Save to call_logs ---
                 try {
-                  const logsDir = nodePath.join(nodeOs.homedir(), ".openclaw/workspace/call_logs");
+                  const logsDir = nodePath.join(workspaceDir, "call_logs");
                   await nodeFsp.mkdir(logsDir, { recursive: true });
 
                   const now = new Date();

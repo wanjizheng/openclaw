@@ -7,6 +7,7 @@ import {
   requestBodyErrorToText,
 } from "openclaw/plugin-sdk";
 import { WebSocket, WebSocketServer } from "ws";
+import { resolveVoiceAgentId } from "./agent-routing.js";
 import { normalizePhoneNumber } from "./allowlist.js";
 import type { VoiceCallConfig } from "./config.js";
 import { loadContactsFileAsync } from "./contact-file.js";
@@ -614,6 +615,7 @@ export class VoiceCallWebhookServer {
                 callerName: contact?.name,
                 greetingHint: template,
                 callerInfo: contact?.info,
+                agentId: resolveVoiceAgentId({ sessionKey: call.sessionKey }),
               });
               const llmMs = Date.now() - llmStart;
 
@@ -1082,6 +1084,7 @@ export class VoiceCallWebhookServer {
         typeof (call.metadata?.callReason ?? call.metadata?.initialMessage) === "string"
           ? String(call.metadata?.callReason ?? call.metadata?.initialMessage).trim() || undefined
           : undefined,
+      agentId: resolveVoiceAgentId({ sessionKey: call.sessionKey }),
     };
 
     if (voiceParams.callReason) {
@@ -1105,8 +1108,9 @@ export class VoiceCallWebhookServer {
         try {
           const { loadCoreAgentDeps } = await import("./core-bridge.js");
           const deps = await loadCoreAgentDeps();
+          const currentAgentId = resolveVoiceAgentId({ agentId: voiceParams.agentId });
           const storePath = deps.resolveStorePath(this.coreConfig?.session?.store, {
-            agentId: "main",
+            agentId: currentAgentId,
           });
           const sessionStore = deps.loadSessionStore(storePath);
           const sessionEntry = sessionStore[sessionKey] as

@@ -367,8 +367,16 @@ export class TwilioProvider implements VoiceCallProvider {
         providerResponseHeaders: { "Content-Type": "application/xml" },
         statusCode: 200,
       };
-    } catch {
-      return { events: [], statusCode: 400 };
+    } catch (error) {
+      console.error("[voice-call][twilio] Failed to parse webhook event:", error);
+      // Return safe TwiML instead of HTTP 400 to avoid Twilio saying
+      // "application error" to the callee.
+      return {
+        events: [],
+        providerResponseBody: TwilioProvider.PAUSE_TWIML,
+        providerResponseHeaders: { "Content-Type": "application/xml" },
+        statusCode: 200,
+      };
     }
   }
 
@@ -551,6 +559,20 @@ export class TwilioProvider implements VoiceCallProvider {
       const hasSpeech = !!params.get("SpeechResult");
       const twiml = this.handleGatherAction(callSid, hasSpeech, callIdFromQuery);
       return twiml ?? TwilioProvider.PAUSE_TWIML;
+    }
+
+    const isTerminalStatus =
+      callStatus === "completed" ||
+      callStatus === "failed" ||
+      callStatus === "busy" ||
+      callStatus === "no-answer" ||
+      callStatus === "canceled";
+
+    // For terminal callbacks, return empty TwiML immediately.
+    // In hybrid mode this avoids trying to reconnect ConversationRelay
+    // after Twilio already marked the call complete.
+    if (isTerminalStatus) {
+      return TwilioProvider.EMPTY_TWIML;
     }
 
     // ── Hybrid mode: playAction redirect callback ────────────────────────────

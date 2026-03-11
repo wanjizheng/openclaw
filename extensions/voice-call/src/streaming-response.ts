@@ -13,6 +13,7 @@
 import crypto from "node:crypto";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { resolveVoiceAgentId } from "./agent-routing.js";
 import type { VoiceCallConfig } from "./config.js";
 import { loadContactsFileAsync, findContactByPhone } from "./contact-file.js";
 import type { CoreConfig } from "./core-bridge.js";
@@ -128,6 +129,16 @@ function extractDiscordUserId(text?: string): string | null {
     /discord[^\n]{0,80}?(?:user\s*id|id|用户id|用户编号)?[^\d]{0,10}(\d{15,22})/i,
   );
   return match?.[1] ?? null;
+}
+
+function inferEndCallFromUserMessage(text: string): boolean {
+  const normalized = text.trim();
+  if (!normalized) return false;
+  const farewellRe = /(晚安|再见|拜拜|挂了|挂吧|先这样|回头聊|下次聊|结束通话|就到这)/i;
+  const negationRe = /(不|别|不要|先不|还不|不能).{0,4}(挂|结束|再见|晚安)/;
+  if (negationRe.test(normalized)) return false;
+  if (/[?？]\s*$/.test(normalized)) return false;
+  return farewellRe.test(normalized);
 }
 
 // ── Sentence buffer with TAG awareness ───────────────────────────────────────
@@ -307,7 +318,7 @@ export async function generateStreamingVoiceResponse(
 
   // ── Session / model resolution (identical to generateVoiceResponse) ──────
   const sessionKey = `voice:${callId}`;
-  const agentId = "main";
+  const agentId = resolveVoiceAgentId({ agentId: params.agentId });
   const storePath = deps.resolveStorePath(cfg.session?.store, { agentId });
   const agentDir = deps.resolveAgentDir(cfg, agentId);
   const workspaceDir = deps.resolveAgentWorkspaceDir(cfg, agentId);
@@ -352,6 +363,9 @@ export async function generateStreamingVoiceResponse(
 
   const toolGroundingRules =
     "【工具一致性规则】1) 只有在工具明确成功返回后，才能说“已发送/已完成/已查到”。2) 若工具失败（例如浏览器未连接、权限不足、网络错误），必须明确告知失败原因，不能编造成功结果。3) 对时间/距离/路线等事实数据，只能引用工具返回值；若未获取到真实结果，必须说“暂时无法确认”。";
+  const voiceTagRules =
+    "【电话语音标签规则】每一轮语音回复默认在开头添加 1 个标签（从 [laughs] [whispers] [sighs] [slow] [excited] [curious] 中选择）。标签只用于语音表达，不改变语义，不要堆叠。\n" +
+    "【通话结束规则】当你明确结束对话（如“晚安”“再见”且本轮不再继续）时，必须在回复末尾追加 [END_CALL]。";
 
   const callerLabel = callerName ? `${callerName} (${from})` : from;
   const directionLabel = direction === "inbound" ? "来电（对方打给你的）" : "去电（你打给对方的）";
@@ -371,6 +385,7 @@ export async function generateStreamingVoiceResponse(
       ` 调用 message 工具时使用：action="send", channel="discord", target="user:${defaultDiscordUserId}"。`;
   }
   systemCore += `\n\n${toolGroundingRules}`;
+  systemCore += `\n\n${voiceTagRules}`;
   systemCore += `\n\n${callerContextLine}`;
   if (callerInfo) {
     systemCore += `\n\n${callerName ?? from}的个人信息：\n${callerInfo}`;
@@ -567,6 +582,10 @@ export async function generateStreamingVoiceResponse(
     const totalStreamMs = Date.now() - streamStart;
     const timeToFirstAudioMs = firstAudioAt > 0 ? firstAudioAt - streamStart : totalStreamMs;
     const fullText = allTextParts.join("") || null;
+    if (!endCallSignaled && inferEndCallFromUserMessage(userMessage)) {
+      endCallSignaled = true;
+      console.log("[voice-call] Inferred end-call intent from user message (streaming)");
+    }
 
     if (!fullText && result.meta?.aborted) {
       return {
