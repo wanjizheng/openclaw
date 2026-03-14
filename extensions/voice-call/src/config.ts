@@ -196,10 +196,10 @@ export const OutboundConfigSchema = z
     /** Seconds to wait after TTS before auto-hangup in notify mode */
     notifyHangupDelaySec: z.number().int().nonnegative().default(3),
     /** Twilio AMD strategy for outbound conversation calls */
-    twilioAmdMode: z.enum(["off", "enable", "detect-message-end"]).default("off"),
+    twilioAmdMode: z.enum(["off", "enable", "detect-message-end"]).default("detect-message-end"),
   })
   .strict()
-  .default({ defaultMode: "notify", notifyHangupDelaySec: 3, twilioAmdMode: "off" });
+  .default({ defaultMode: "notify", notifyHangupDelaySec: 3, twilioAmdMode: "detect-message-end" });
 export type OutboundConfig = z.infer<typeof OutboundConfigSchema>;
 
 // -----------------------------------------------------------------------------
