@@ -117,13 +117,34 @@ slim_commit_list_by_subject() {
   done
 }
 
-has_cuda_environment() {
+has_gpu_environment() {
+  # NVIDIA GPU runtime available
   if command -v nvidia-smi >/dev/null 2>&1; then
     if nvidia-smi -L >/dev/null 2>&1; then
       return 0
     fi
   fi
 
+  # ROCm/AMD runtime available
+  if command -v rocminfo >/dev/null 2>&1; then
+    if rocminfo >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  # Linux graphics render devices (Intel/AMD/NVIDIA)
+  if [[ -e "/dev/dri/renderD128" ]] || compgen -G "/dev/dri/renderD*" >/dev/null; then
+    return 0
+  fi
+
+  # PCI-level GPU presence
+  if command -v lspci >/dev/null 2>&1; then
+    if lspci 2>/dev/null | grep -Eiq 'vga compatible controller|3d controller|display controller'; then
+      return 0
+    fi
+  fi
+
+  # CUDA artifacts are treated as one GPU signal, not the only criterion.
   if command -v nvcc >/dev/null 2>&1; then
     return 0
   fi
@@ -369,13 +390,13 @@ log "cherry-pick complete ($(elapsed))"
 # ══════════════════════════════════════════════════════════════════════════════
 if [[ "$SKIP_BUILD" != "true" ]]; then
   if [[ "$SKIP_INSTALL" != "true" ]]; then
-    if has_cuda_environment; then
-      step "pnpm install (CUDA detected)"
-      log "CUDA environment detected; enabling full node-llama-cpp postinstall"
+    if has_gpu_environment; then
+      step "pnpm install (GPU detected)"
+      log "GPU environment detected; enabling full node-llama-cpp postinstall"
       pnpm install --frozen-lockfile 2>&1 | tail -10
     else
-      step "pnpm install (no CUDA)"
-      log "CUDA not detected; set NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 to skip llama.cpp postinstall download/build"
+      step "pnpm install (no GPU)"
+      log "GPU not detected; set NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 to skip llama.cpp postinstall download/build"
       NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 pnpm install --frozen-lockfile 2>&1 | tail -10
     fi
   fi
