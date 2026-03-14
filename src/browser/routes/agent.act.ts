@@ -530,28 +530,25 @@ export function registerBrowserAgentActRoutes(
             if (!pw) {
               return;
             }
+            if (!ref) {
+              return jsonError(
+                res,
+                400,
+                "click currently requires ref targeting in this version; selector-only targeting is not supported.",
+              );
+            }
             const clickRequest: Parameters<typeof pw.clickViaPlaywright>[0] = {
               cdpUrl,
               targetId: tab.targetId,
+              ref,
               doubleClick,
+              timeoutMs: timeoutMs ?? undefined,
             };
-            if (ref) {
-              clickRequest.ref = ref;
-            }
-            if (selector) {
-              clickRequest.selector = selector;
-            }
             if (button) {
               clickRequest.button = button;
             }
             if (modifiers) {
               clickRequest.modifiers = modifiers;
-            }
-            if (delayMs) {
-              clickRequest.delayMs = delayMs;
-            }
-            if (timeoutMs) {
-              clickRequest.timeoutMs = timeoutMs;
             }
             await pw.clickViaPlaywright(clickRequest);
             return res.json({ ok: true, targetId: tab.targetId, url: tab.url });
@@ -603,22 +600,22 @@ export function registerBrowserAgentActRoutes(
             if (!pw) {
               return;
             }
+            if (!ref) {
+              return jsonError(
+                res,
+                400,
+                "type currently requires ref targeting in this version; selector-only targeting is not supported.",
+              );
+            }
             const typeRequest: Parameters<typeof pw.typeViaPlaywright>[0] = {
               cdpUrl,
               targetId: tab.targetId,
+              ref,
               text,
               submit,
               slowly,
+              timeoutMs: timeoutMs ?? undefined,
             };
-            if (ref) {
-              typeRequest.ref = ref;
-            }
-            if (selector) {
-              typeRequest.selector = selector;
-            }
-            if (timeoutMs) {
-              typeRequest.timeoutMs = timeoutMs;
-            }
             await pw.typeViaPlaywright(typeRequest);
             return res.json({ ok: true, targetId: tab.targetId });
           }
@@ -676,11 +673,17 @@ export function registerBrowserAgentActRoutes(
             if (!pw) {
               return;
             }
+            if (!ref) {
+              return jsonError(
+                res,
+                400,
+                "hover currently requires ref targeting in this version; selector-only targeting is not supported.",
+              );
+            }
             await pw.hoverViaPlaywright({
               cdpUrl,
               targetId: tab.targetId,
               ref,
-              selector,
               timeoutMs: timeoutMs ?? undefined,
             });
             return res.json({ ok: true, targetId: tab.targetId });
@@ -719,19 +722,19 @@ export function registerBrowserAgentActRoutes(
             if (!pw) {
               return;
             }
+            if (!ref) {
+              return jsonError(
+                res,
+                400,
+                "scrollIntoView currently requires ref targeting in this version; selector-only targeting is not supported.",
+              );
+            }
             const scrollRequest: Parameters<typeof pw.scrollIntoViewViaPlaywright>[0] = {
               cdpUrl,
               targetId: tab.targetId,
+              ref,
+              timeoutMs: timeoutMs ?? undefined,
             };
-            if (ref) {
-              scrollRequest.ref = ref;
-            }
-            if (selector) {
-              scrollRequest.selector = selector;
-            }
-            if (timeoutMs) {
-              scrollRequest.timeoutMs = timeoutMs;
-            }
             await pw.scrollIntoViewViaPlaywright(scrollRequest);
             return res.json({ ok: true, targetId: tab.targetId });
           }
@@ -774,13 +777,18 @@ export function registerBrowserAgentActRoutes(
             if (!pw) {
               return;
             }
+            if (!startRef || !endRef) {
+              return jsonError(
+                res,
+                400,
+                "drag currently requires startRef/endRef targeting in this version; selector-based targeting is not supported.",
+              );
+            }
             await pw.dragViaPlaywright({
               cdpUrl,
               targetId: tab.targetId,
               startRef,
-              startSelector,
               endRef,
-              endSelector,
               timeoutMs: timeoutMs ?? undefined,
             });
             return res.json({ ok: true, targetId: tab.targetId });
@@ -827,11 +835,17 @@ export function registerBrowserAgentActRoutes(
             if (!pw) {
               return;
             }
+            if (!ref) {
+              return jsonError(
+                res,
+                400,
+                "select currently requires ref targeting in this version; selector-only targeting is not supported.",
+              );
+            }
             await pw.selectOptionViaPlaywright({
               cdpUrl,
               targetId: tab.targetId,
               ref,
-              selector,
               values,
               timeoutMs: timeoutMs ?? undefined,
             });
