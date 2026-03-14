@@ -648,3 +648,15 @@ export async function setInputFilesViaPlaywright(opts: {
     // Best-effort for sites that don't react to setInputFiles alone.
   }
 }
+
+export async function batchViaPlaywright(_opts: {
+  cdpUrl: string;
+  targetId?: string;
+  actions: unknown[];
+  stopOnError?: boolean;
+  evaluateEnabled?: boolean;
+}): Promise<{ results: Array<{ ok: false; error: string }> }> {
+  throw new Error(
+    "batchViaPlaywright is not available in this build; use single actions or route-level batch handling.",
+  );
+}
