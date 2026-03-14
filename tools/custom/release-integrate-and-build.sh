@@ -4,12 +4,13 @@
 # Workflow (matches user requirement exactly):
 #   1. Save any dirty worktree changes
 #   2. Fetch upstream + tags
-#   3. Rebase custom-main onto upstream/main (keep only custom commits on top)
-#   4. Find latest stable release tag (e.g. v2026.2.26)
-#   5. Collect ONLY the custom commits (upstream/main..custom-main)
+#   3. Find latest stable release tag (e.g. v2026.2.26)
+#   4. Merge latest stable tag into custom-main (preserve custom-main history)
+#   5. Collect ONLY custom commits (<latest-tag>..custom-main), excluding
+#      upstream/main and deduplicating noisy snapshot/update commits
 #   6. Create release-custom/<tag> from that tag + cherry-pick custom commits
 #   7. Build (pnpm install + build + ui:build)
-#   8. Deploy built artifacts to global install + restart gateway
+#   8. Deploy built artifacts to global install + refresh gateway service + restart
 #   9. Merge release-custom/<tag> back into custom-main
 #  10. Push everything & switch to custom-main
 #
@@ -33,6 +34,9 @@ SKIP_INSTALL="false"
 SKIP_BUILD="false"
 SKIP_DEPLOY="false"
 CONFLICT_STRATEGY="prefer-custom"
+SYNC_CUSTOM_MAIN="false"
+MAX_CUSTOM_COMMITS="300"
+AUTO_SLIM_COMMITS="true"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -48,6 +52,9 @@ while (( $# )); do
     --skip-install)      SKIP_INSTALL="true"; shift ;;
     --skip-build)        SKIP_BUILD="true"; shift ;;
     --skip-deploy)       SKIP_DEPLOY="true"; shift ;;
+    --sync-custom-main)  SYNC_CUSTOM_MAIN="true"; shift ;;
+    --max-custom-commits) MAX_CUSTOM_COMMITS="${2:-300}"; shift 2 ;;
+    --no-auto-slim-commits) AUTO_SLIM_COMMITS="false"; shift ;;
     --conflict-strategy) CONFLICT_STRATEGY="${2:-prefer-custom}"; shift 2 ;;
     --deploy-target)     DEPLOY_TARGET="${2:?}"; shift 2 ;;
     *) die "unknown arg: $1" ;;
@@ -56,6 +63,85 @@ done
 
 [[ "$CONFLICT_STRATEGY" =~ ^(prefer-custom|stop)$ ]] \
   || die "--conflict-strategy must be prefer-custom|stop"
+
+[[ "$MAX_CUSTOM_COMMITS" =~ ^[0-9]+$ ]] \
+  || die "--max-custom-commits must be a non-negative integer"
+
+[[ "$AUTO_SLIM_COMMITS" =~ ^(true|false)$ ]] \
+  || die "--no-auto-slim-commits parse failed"
+
+slim_commit_list_by_subject() {
+  local -a input_commits=("$@")
+  local -A chosen_sha_by_subject=()
+  local -A chosen_score_by_subject=()
+  local -A emitted_subject=()
+
+  commit_change_score() {
+    local commit_sha="$1"
+    git --no-pager show --numstat --format= --no-renames "$commit_sha" \
+      | awk '{
+          add=$1; del=$2;
+          if (add == "-") add=0;
+          if (del == "-") del=0;
+          score += add + del;
+        }
+        END { print score + 0 }'
+  }
+
+  local index sha subject score current_best
+  for (( index=0; index<${#input_commits[@]}; index++ )); do
+    sha="${input_commits[$index]}"
+    subject="$(git --no-pager show -s --format=%s "$sha")"
+
+    case "$subject" in
+      "chore: snapshot WIP before release integrate ("*|"chore(auto-update): snapshot fork changes before release integrate ("*)
+        continue
+        ;;
+    esac
+
+    score="$(commit_change_score "$sha")"
+    current_best="${chosen_score_by_subject[$subject]:--1}"
+    if (( score > current_best )); then
+      chosen_score_by_subject["$subject"]="$score"
+      chosen_sha_by_subject["$subject"]="$sha"
+    fi
+  done
+
+  for sha in "${input_commits[@]}"; do
+    subject="$(git --no-pager show -s --format=%s "$sha")"
+    [[ -n "${chosen_sha_by_subject[$subject]+x}" ]] || continue
+    if [[ "${chosen_sha_by_subject[$subject]}" == "$sha" && -z "${emitted_subject[$subject]+x}" ]]; then
+      printf '%s\n' "$sha"
+      emitted_subject["$subject"]=1
+    fi
+  done
+}
+
+has_cuda_environment() {
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    if nvidia-smi -L >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  if command -v nvcc >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ -n "${CUDA_PATH:-}" && -d "${CUDA_PATH}" ]]; then
+    return 0
+  fi
+
+  if [[ -d "/usr/local/cuda" ]]; then
+    return 0
+  fi
+
+  if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q 'libcuda\.so'; then
+    return 0
+  fi
+
+  return 1
+}
 
 SECONDS=0
 ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
@@ -84,23 +170,7 @@ git fetch upstream --tags --prune --quiet
 git fetch origin --prune --quiet
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. Rebase custom-main onto upstream/main
-# ══════════════════════════════════════════════════════════════════════════════
-step "rebase custom-main onto upstream/main"
-git checkout custom-main --quiet 2>/dev/null \
-  || git checkout -b custom-main upstream/main --quiet
-
-if ! git merge-base --is-ancestor upstream/main custom-main; then
-  # Need rebase: custom-main is behind upstream/main
-  if ! git rebase upstream/main --quiet; then
-    git rebase --abort 2>/dev/null || true
-    die "rebase custom-main onto upstream/main failed — resolve manually then re-run"
-  fi
-fi
-log "custom-main is up-to-date with upstream/main"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. Find latest stable tag
+# 3. Find latest stable tag
 # ══════════════════════════════════════════════════════════════════════════════
 LATEST_TAG="$(git tag -l 'v*' \
   | grep -E '^v[0-9]+' \
@@ -110,18 +180,113 @@ LATEST_TAG="$(git tag -l 'v*' \
 log "latest stable tag: $LATEST_TAG"
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 4. Merge latest stable tag into custom-main
+# ══════════════════════════════════════════════════════════════════════════════
+git checkout custom-main --quiet 2>/dev/null \
+  || git checkout -b custom-main "$LATEST_TAG" --quiet
+
+if [[ "$SYNC_CUSTOM_MAIN" == "true" ]]; then
+  step "merge $LATEST_TAG into custom-main"
+  if ! git merge-base --is-ancestor "$LATEST_TAG" custom-main; then
+    merge_args=(--no-edit --no-ff "$LATEST_TAG")
+    if [[ "$CONFLICT_STRATEGY" == "prefer-custom" ]]; then
+      merge_args=(--no-edit --no-ff -X ours "$LATEST_TAG")
+    fi
+
+    if ! git merge "${merge_args[@]}" --quiet; then
+      log "WARN: merge $LATEST_TAG into custom-main failed; fallback to current custom-main (no merge)"
+      git merge --abort 2>/dev/null || true
+    fi
+  fi
+  log "custom-main sync attempt finished"
+else
+  log "skip latest-tag merge (use --sync-custom-main to enable)"
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 5. Collect custom-only commits
-#    These are the commits ABOVE upstream/main on custom-main.
-#    After rebase, this is exactly your custom work — typically ~11 commits,
-#    NOT hundreds. This is why the new script is fast.
+#    Use first-parent mainline only; exclude commits already reachable from
+#    upstream/main; then slim noisy repeated subjects.
 # ══════════════════════════════════════════════════════════════════════════════
 step "collecting custom commits"
 mapfile -t CUSTOM_COMMITS < <(
-  git --no-pager log --reverse --no-merges --pretty=%H upstream/main..custom-main
+  git --no-pager log --first-parent --reverse --no-merges --pretty=%H "${LATEST_TAG}..custom-main" ^upstream/main
 )
 if (( ${#CUSTOM_COMMITS[@]} == 0 )) || [[ -z "${CUSTOM_COMMITS[0]:-}" ]]; then
-  die "no custom commits found between upstream/main and custom-main"
+  die "no custom commits found between ${LATEST_TAG} and custom-main"
 fi
+
+RAW_CUSTOM_COMMIT_COUNT="${#CUSTOM_COMMITS[@]}"
+if [[ "$AUTO_SLIM_COMMITS" == "true" ]]; then
+  mapfile -t SLIMMED_COMMITS < <(slim_commit_list_by_subject "${CUSTOM_COMMITS[@]}")
+  if (( ${#SLIMMED_COMMITS[@]} == 0 )); then
+    die "auto-slim removed all commits; run with --no-auto-slim-commits to inspect full set"
+  fi
+  if (( RAW_CUSTOM_COMMIT_COUNT != ${#SLIMMED_COMMITS[@]} )); then
+    log "auto-slim result: ${RAW_CUSTOM_COMMIT_COUNT} -> ${#SLIMMED_COMMITS[@]} commit(s)"
+  fi
+  CUSTOM_COMMITS=("${SLIMMED_COMMITS[@]}")
+fi
+
+if (( ${#CUSTOM_COMMITS[@]} > MAX_CUSTOM_COMMITS )); then
+  die "custom commit set is too large (${#CUSTOM_COMMITS[@]} > ${MAX_CUSTOM_COMMITS}); increase --max-custom-commits or pre-clean custom-main"
+fi
+
+is_legacy_autoupdate_subject() {
+  local subject="$1"
+  [[ "$subject" == "feat(release): add stable integrate/build pipeline for custom releases" ]] \
+    || [[ "$subject" == "fix(auto-update): fallback continue when cherry-pick hooks/lint block" ]] \
+    || [[ "$subject" == "fix(auto-update): tolerate rebase conflicts in integration pipeline" ]] \
+    || [[ "$subject" == "custom: auto-run gateway install after deploy" ]] \
+    || [[ "$subject" == "version change" ]] \
+    || [[ "$subject" == "Revert \"version change\"" ]]
+}
+
+is_protected_custom_script_path() {
+  local file_path="$1"
+  [[ "$file_path" == "tools/custom/release-integrate-and-build.sh" ]] \
+    || [[ "$file_path" == "tools/custom/update-upstream.sh" ]] \
+    || [[ "$file_path" == "tools/custom/status.sh" ]]
+}
+
+sync_protected_scripts_from_custom_main() {
+  local changed=0
+  local script_path
+  for script_path in \
+    tools/custom/release-integrate-and-build.sh \
+    tools/custom/update-upstream.sh \
+    tools/custom/status.sh; do
+    if git ls-tree -r --name-only custom-main -- "$script_path" | grep -q .; then
+      git checkout custom-main -- "$script_path" 2>/dev/null || true
+      git add "$script_path" 2>/dev/null || true
+      changed=1
+    fi
+  done
+
+  if [[ "$changed" -eq 1 ]] && ! git diff --cached --quiet 2>/dev/null; then
+    git -c core.hooksPath=/dev/null commit \
+      -m "chore(custom): keep protected helper scripts from custom-main" \
+      --no-verify 2>/dev/null || true
+  else
+    git reset 2>/dev/null || true
+  fi
+}
+
+FILTERED_CUSTOM_COMMITS=()
+for sha in "${CUSTOM_COMMITS[@]}"; do
+  subject="$(git --no-pager show -s --format=%s "$sha")"
+  if is_legacy_autoupdate_subject "$subject"; then
+    log "  skip (legacy auto-update commit): $(git --no-pager log --oneline -1 "$sha")"
+    continue
+  fi
+  FILTERED_CUSTOM_COMMITS+=("$sha")
+done
+CUSTOM_COMMITS=("${FILTERED_CUSTOM_COMMITS[@]}")
+
+if (( ${#CUSTOM_COMMITS[@]} == 0 )); then
+  die "all candidate custom commits were filtered out as legacy auto-update commits"
+fi
+
 log "found ${#CUSTOM_COMMITS[@]} custom commit(s) to cherry-pick:"
 for sha in "${CUSTOM_COMMITS[@]}"; do
   log "  $(git --no-pager log --oneline -1 "$sha")"
@@ -169,7 +334,11 @@ cherry_pick_one() {
   if [[ -n "$conflicted" ]]; then
     while IFS= read -r f; do
       [[ -n "$f" ]] || continue
-      git checkout --theirs -- "$f" 2>/dev/null && git add "$f" 2>/dev/null
+      if is_protected_custom_script_path "$f"; then
+        git checkout --ours -- "$f" 2>/dev/null && git add "$f" 2>/dev/null
+      else
+        git checkout --theirs -- "$f" 2>/dev/null && git add "$f" 2>/dev/null
+      fi
     done <<< "$conflicted"
   fi
   # Stage any remaining non-conflicting changes
@@ -190,6 +359,9 @@ cherry_pick_one() {
 for sha in "${CUSTOM_COMMITS[@]}"; do
   cherry_pick_one "$sha"
 done
+
+sync_protected_scripts_from_custom_main
+
 log "cherry-pick complete ($(elapsed))"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -197,8 +369,15 @@ log "cherry-pick complete ($(elapsed))"
 # ══════════════════════════════════════════════════════════════════════════════
 if [[ "$SKIP_BUILD" != "true" ]]; then
   if [[ "$SKIP_INSTALL" != "true" ]]; then
-    step "pnpm install"
-    pnpm install --frozen-lockfile 2>&1 | tail -5
+    if has_cuda_environment; then
+      step "pnpm install (CUDA detected)"
+      log "CUDA environment detected; enabling full node-llama-cpp postinstall"
+      pnpm install --frozen-lockfile 2>&1 | tail -10
+    else
+      step "pnpm install (no CUDA)"
+      log "CUDA not detected; set NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 to skip llama.cpp postinstall download/build"
+      NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 pnpm install --frozen-lockfile 2>&1 | tail -10
+    fi
   fi
   step "pnpm build"
   pnpm build 2>&1 | tail -10
@@ -259,6 +438,24 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   [[ -d "$DEPLOY_TARGET/skills" ]]     && rsync -a --delete skills/ "$DEPLOY_TARGET/skills/"
   log "artifacts synced"
 
+  # ── Refresh gateway service unit/env ──
+  step "gateway install --force"
+  openclaw gateway install --force
+
+  # ── Normalize systemd unit metadata (strip version from Description only) ──
+  UNIT_FILE="$HOME/.config/systemd/user/$SERVICE_NAME"
+  if [[ -f "$UNIT_FILE" ]]; then
+    UNIT_CHANGED=0
+    if grep -qE '^Description=OpenClaw Gateway \(v[^)]*\)$' "$UNIT_FILE"; then
+      sed -i -E 's/^Description=OpenClaw Gateway \(v[^)]*\)$/Description=OpenClaw Gateway/' "$UNIT_FILE"
+      UNIT_CHANGED=1
+    fi
+    if [[ "$UNIT_CHANGED" -eq 1 ]]; then
+      log "systemd unit metadata normalized (description only)"
+      systemctl --user daemon-reload
+    fi
+  fi
+
   # ── Restart gateway service ──
   step "restart $SERVICE_NAME"
   if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
@@ -292,7 +489,11 @@ else
     if [[ -n "$conflicted" ]]; then
       while IFS= read -r f; do
         [[ -n "$f" ]] || continue
-        git checkout --theirs -- "$f" && git add "$f"
+        if is_protected_custom_script_path "$f"; then
+          git checkout --ours -- "$f" && git add "$f"
+        else
+          git checkout --theirs -- "$f" && git add "$f"
+        fi
       done <<< "$conflicted"
     fi
     git commit --no-edit --no-verify 2>/dev/null || true
