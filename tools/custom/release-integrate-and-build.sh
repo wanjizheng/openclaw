@@ -117,6 +117,32 @@ slim_commit_list_by_subject() {
   done
 }
 
+has_cuda_environment() {
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    if nvidia-smi -L >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+
+  if command -v nvcc >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [[ -n "${CUDA_PATH:-}" && -d "${CUDA_PATH}" ]]; then
+    return 0
+  fi
+
+  if [[ -d "/usr/local/cuda" ]]; then
+    return 0
+  fi
+
+  if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q 'libcuda\.so'; then
+    return 0
+  fi
+
+  return 1
+}
+
 SECONDS=0
 ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
 
@@ -343,8 +369,15 @@ log "cherry-pick complete ($(elapsed))"
 # ══════════════════════════════════════════════════════════════════════════════
 if [[ "$SKIP_BUILD" != "true" ]]; then
   if [[ "$SKIP_INSTALL" != "true" ]]; then
-    step "pnpm install"
-    pnpm install --frozen-lockfile 2>&1 | tail -5
+    if has_cuda_environment; then
+      step "pnpm install (CUDA detected)"
+      log "CUDA environment detected; enabling full node-llama-cpp postinstall"
+      pnpm install --frozen-lockfile 2>&1 | tail -10
+    else
+      step "pnpm install (no CUDA)"
+      log "CUDA not detected; set NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 to skip llama.cpp postinstall download/build"
+      NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 pnpm install --frozen-lockfile 2>&1 | tail -10
+    fi
   fi
   step "pnpm build"
   pnpm build 2>&1 | tail -10
