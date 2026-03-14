@@ -10,7 +10,7 @@ export function createVoiceCallBaseConfig(params?: {
     fromNumber: "+15550001234",
     inboundPolicy: "disabled",
     allowFrom: [],
-    outbound: { defaultMode: "notify", notifyHangupDelaySec: 3, twilioAmdMode: "off" },
+    outbound: { defaultMode: "notify", notifyHangupDelaySec: 3, twilioAmdMode: "detect-message-end" },
     maxDurationSeconds: 300,
     staleCallReaperSeconds: 600,
     silenceTimeoutMs: 800,
