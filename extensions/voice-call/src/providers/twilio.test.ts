@@ -21,12 +21,28 @@ function createContext(rawBody: string, query?: WebhookContext["query"]): Webhoo
   };
 }
 
+function expectStreamingTwiml(body: string) {
+  expect(body).toContain(STREAM_URL);
+  expect(body).toContain('<Parameter name="token" value="');
+  expect(body).toContain("<Connect>");
+}
+
 describe("TwilioProvider", () => {
   it("returns streaming TwiML for outbound conversation calls before in-progress", () => {
     const provider = createProvider();
     const ctx = createContext("CallStatus=initiated&Direction=outbound-api&CallSid=CA123", {
       callId: "call-1",
     });
+
+    const result = provider.parseWebhookEvent(ctx);
+
+    expect(result.providerResponseBody).toBeDefined();
+    expectStreamingTwiml(result.providerResponseBody ?? "");
+  });
+
+  it("returns streaming TwiML for outbound callbacks even without callId query", () => {
+    const provider = createProvider();
+    const ctx = createContext("Direction=outbound-api&CallSid=CA321");
 
     const result = provider.parseWebhookEvent(ctx);
 
@@ -66,9 +82,8 @@ describe("TwilioProvider", () => {
 
     const result = provider.parseWebhookEvent(ctx);
 
-    expect(result.providerResponseBody).toContain(STREAM_URL);
-    expect(result.providerResponseBody).toContain('<Parameter name="token" value="');
-    expect(result.providerResponseBody).toContain("<Connect>");
+    expect(result.providerResponseBody).toBeDefined();
+    expectStreamingTwiml(result.providerResponseBody ?? "");
   });
 
   it("returns queue TwiML for second inbound call when first call is active", () => {
