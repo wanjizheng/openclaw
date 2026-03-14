@@ -117,30 +117,41 @@ slim_commit_list_by_subject() {
   done
 }
 
-has_cuda_environment() {
+has_gpu_environment() {
   if command -v nvidia-smi >/dev/null 2>&1; then
     if nvidia-smi -L >/dev/null 2>&1; then
       return 0
     fi
   fi
 
-  if command -v nvcc >/dev/null 2>&1; then
+  if command -v rocm-smi >/dev/null 2>&1; then
     return 0
   fi
 
-  if [[ -n "${CUDA_PATH:-}" && -d "${CUDA_PATH}" ]]; then
+  if compgen -G "/dev/dri/card*" >/dev/null 2>&1; then
     return 0
   fi
 
-  if [[ -d "/usr/local/cuda" ]]; then
+  if command -v lspci >/dev/null 2>&1 && lspci | grep -qiE 'vga|3d controller'; then
     return 0
   fi
 
-  if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q 'libcuda\.so'; then
+  if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -qiE 'libcuda\.so|libamdocl|libOpenCL'; then
     return 0
   fi
 
   return 1
+}
+
+is_low_memory_host() {
+  local mem_total_kb="0"
+  if [[ -r /proc/meminfo ]]; then
+    mem_total_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  fi
+  [[ "$mem_total_kb" =~ ^[0-9]+$ ]] || mem_total_kb="0"
+
+  # Treat hosts below 12 GiB RAM as low-memory for this build pipeline.
+  (( mem_total_kb > 0 && mem_total_kb < 12582912 ))
 }
 
 SECONDS=0
@@ -369,20 +380,36 @@ log "cherry-pick complete ($(elapsed))"
 # ══════════════════════════════════════════════════════════════════════════════
 if [[ "$SKIP_BUILD" != "true" ]]; then
   if [[ "$SKIP_INSTALL" != "true" ]]; then
-    if has_cuda_environment; then
-      step "pnpm install (CUDA detected)"
-      log "CUDA environment detected; enabling full node-llama-cpp postinstall"
+    if has_gpu_environment; then
+      step "pnpm install (GPU detected)"
+      log "GPU environment detected; enabling full node-llama-cpp postinstall"
       pnpm install --frozen-lockfile 2>&1 | tail -10
     else
-      step "pnpm install (no CUDA)"
-      log "CUDA not detected; set NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 to skip llama.cpp postinstall download/build"
+      step "pnpm install (no GPU)"
+      log "GPU not detected; set NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 to skip llama.cpp postinstall download/build"
       NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 pnpm install --frozen-lockfile 2>&1 | tail -10
     fi
   fi
+
+  BUILD_CMD=(pnpm build)
+  UI_BUILD_CMD=(pnpm ui:build)
+  if is_low_memory_host; then
+    step "enable low-memory build guard"
+    log "low-memory host detected; using serial workspace build and capped Node heap"
+    if [[ -n "${NODE_OPTIONS:-}" ]]; then
+      export NODE_OPTIONS="${NODE_OPTIONS} --max-old-space-size=2048"
+    else
+      export NODE_OPTIONS="--max-old-space-size=2048"
+    fi
+    export npm_config_jobs=2
+    BUILD_CMD=(pnpm --workspace-concurrency=1 build)
+    UI_BUILD_CMD=(pnpm --workspace-concurrency=1 ui:build)
+  fi
+
   step "pnpm build"
-  pnpm build 2>&1 | tail -10
+  "${BUILD_CMD[@]}" 2>&1 | tail -10
   step "pnpm ui:build"
-  pnpm ui:build 2>&1 | tail -5
+  "${UI_BUILD_CMD[@]}" 2>&1 | tail -5
   log "build complete ($(elapsed))"
   
   # ── Normalize version string for stable releases ──
