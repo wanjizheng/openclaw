@@ -1,47 +1,35 @@
 #!/usr/bin/env bash
-# update-upstream.sh — Sync custom-main with upstream/main via rebase
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-log() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
-
-# Ensure clean worktree
-if [[ -n "$(git status --porcelain)" ]]; then
-  log "stashing dirty changes"
-  git stash push -m "update-upstream auto-stash $(date -u +%Y%m%d-%H%M%S)"
-  STASHED=1
-else
-  STASHED=0
+if [ "$(git branch --show-current)" != "custom-main" ]; then
+  echo "[info] switching to custom-main"
+  git checkout custom-main
 fi
 
-# Switch to custom-main
-if [[ "$(git branch --show-current)" != "custom-main" ]]; then
-  log "switching to custom-main"
-  git checkout custom-main --quiet
+echo "[step] fetch upstream"
+git fetch upstream --tags --prune
+
+LATEST_TAG="$({ git tag -l 'v*' | grep -E '^v[0-9]+' | grep -Evi 'alpha|beta|rc|pre' | sort -V | tail -n 1; } || true)"
+if [[ -z "$LATEST_TAG" ]]; then
+  echo "[error] no stable upstream tag found"
+  exit 1
 fi
 
-log "fetch upstream"
-git fetch upstream --quiet
+echo "[info] latest stable tag: $LATEST_TAG"
 
-# Check if rebase is needed
-if git merge-base --is-ancestor upstream/main custom-main; then
-  log "custom-main already contains upstream/main — no rebase needed"
+if git merge-base --is-ancestor "$LATEST_TAG" custom-main; then
+  echo "[ok] custom-main already contains $LATEST_TAG"
 else
-  log "rebase custom-main onto upstream/main"
-  if ! git rebase upstream/main --quiet; then
-    log "ERROR: rebase failed — aborting"
-    git rebase --abort 2>/dev/null || true
-    # Restore stash if we made one
-    (( STASHED )) && git stash pop --quiet
+  echo "[step] merge $LATEST_TAG into custom-main (preserve custom history)"
+  if ! git merge --no-edit --no-ff -X ours "$LATEST_TAG"; then
+    echo "[error] merge failed; aborting"
+    git merge --abort || true
     exit 1
   fi
 fi
 
-# Restore stash
-(( STASHED )) && { log "restoring stash"; git stash pop --quiet; }
-
-AHEAD="$(git rev-list --count upstream/main..custom-main)"
-log "done — custom-main has $AHEAD custom commit(s) on top of upstream/main"
+echo "[ok] update complete"
 git --no-pager log --oneline --decorate --max-count=8
