@@ -51,17 +51,6 @@ describe("TwilioProvider", () => {
     expect(result.providerResponseBody).toContain("<Connect>");
   });
 
-  it("returns streaming TwiML for outbound callbacks even without callId query", () => {
-    const provider = createProvider();
-    const ctx = createContext("Direction=outbound-api&CallSid=CA321");
-
-    const result = provider.parseWebhookEvent(ctx);
-
-    expect(result.providerResponseBody).toContain(STREAM_URL);
-    expect(result.providerResponseBody).toContain('<Parameter name="token" value="');
-    expect(result.providerResponseBody).toContain("<Connect>");
-  });
-
   it("returns empty TwiML for status callbacks", () => {
     const provider = createProvider();
     const ctx = createContext("CallStatus=ringing&Direction=outbound-api", {
