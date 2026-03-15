@@ -17,6 +17,9 @@ declare module "node-llama-cpp" {
     loadModel: (params: { modelPath: string }) => Promise<LlamaModel>;
   };
 
-  export function getLlama(params: { logLevel: LlamaLogLevel }): Promise<Llama>;
+  export function getLlama(params: {
+    logLevel: LlamaLogLevel;
+    gpu?: string | false;
+  }): Promise<Llama>;
   export function resolveModelFile(modelPath: string, cacheDir?: string): Promise<string>;
 }

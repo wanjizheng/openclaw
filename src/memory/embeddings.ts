@@ -126,7 +126,18 @@ async function createLocalEmbeddingProvider(
     initPromise = (async () => {
       try {
         if (!llama) {
-          llama = await getLlama({ logLevel: LlamaLogLevel.error });
+          try {
+            llama = await getLlama({ logLevel: LlamaLogLevel.error });
+          } catch (gpuErr) {
+            // If a GPU backend was requested via NODE_LLAMA_CPP_GPU but failed,
+            // fall back to CPU so that local embeddings still work.
+            const envGpu = process.env.NODE_LLAMA_CPP_GPU;
+            if (envGpu && envGpu !== "false" && envGpu !== "cpu") {
+              llama = await getLlama({ logLevel: LlamaLogLevel.error, gpu: false });
+            } else {
+              throw gpuErr;
+            }
+          }
         }
         if (!embeddingModel) {
           const resolved = await resolveModelFile(modelPath, modelCacheDir || undefined);
