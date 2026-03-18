@@ -80,7 +80,7 @@ fi
 # 2. Fetch upstream + tags
 # ══════════════════════════════════════════════════════════════════════════════
 step "fetch upstream + origin"
-git fetch upstream --tags --prune --quiet
+git fetch upstream --tags --prune --force --quiet
 git fetch origin --prune --quiet
 
 # ══════════════════════════════════════════════════════════════════════════════
