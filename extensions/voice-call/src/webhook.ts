@@ -21,6 +21,7 @@ import {
 } from "./config.js";
 import type { CoreAgentDeps, CoreConfig } from "./core-bridge.js";
 import { getHeader } from "./http-headers.js";
+import { HybridCrHandler } from "./hybrid/cr-handler.js";
 import type { CallManager } from "./manager.js";
 import type { MediaStreamConfig } from "./media-stream.js";
 import { MediaStreamHandler } from "./media-stream.js";
@@ -201,6 +202,9 @@ export class VoiceCallWebhookServer {
   private pendingDisconnectHangups = new Map<string, ReturnType<typeof setTimeout>>();
   /** Realtime voice handler for duplex provider bridges. */
   private realtimeHandler: RealtimeCallHandler | null = null;
+
+  /** Hybrid mode CR (ConversationRelay) WebSocket handler. */
+  private crHandler: HybridCrHandler | null = null;
 
   constructor(
     config: VoiceCallConfig,
@@ -418,7 +422,18 @@ export class VoiceCallWebhookServer {
         if (this.shouldSuppressBargeInForInitialMessage(call)) {
           return;
         }
-        (this.provider as TwilioProvider).clearTtsQueue(providerCallId);
+        const twilio = this.provider as TwilioProvider;
+        // Hybrid mode: abort the play queue + switch back to CR.
+        if (twilio.isHybridMode && twilio.hasActiveHybridQueue(providerCallId)) {
+          twilio.abortHybridPlay(providerCallId).catch((err) => {
+            console.warn(
+              `[voice-call][hybrid] abortHybridPlay failed:`,
+              err instanceof Error ? err.message : err,
+            );
+          });
+          return;
+        }
+        twilio.clearTtsQueue(providerCallId);
       },
       onPartialTranscript: (callId, partial) => {
         const safePartial = sanitizeTranscriptForLog(partial);
@@ -514,13 +529,24 @@ export class VoiceCallWebhookServer {
       });
 
       // Handle WebSocket upgrades for realtime voice and media streams.
-      if (this.realtimeHandler || this.mediaStreamHandler) {
+      const hybridUpgradeNeeded =
+        this.config.streaming.hybridMode && this.provider.name === "twilio";
+      if (this.realtimeHandler || this.mediaStreamHandler || hybridUpgradeNeeded) {
         this.server.on("upgrade", (request, socket, head) => {
           if (this.realtimeHandler && this.isRealtimeWebSocketUpgrade(request)) {
             this.realtimeHandler.handleWebSocketUpgrade(request, socket, head);
             return;
           }
           const path = this.getUpgradePathname(request);
+          // Hybrid mode: dispatch CR WebSocket upgrades.
+          if (
+            this.config.streaming.hybridMode &&
+            this.provider.name === "twilio" &&
+            path === this.config.streaming.crPath
+          ) {
+            this.ensureCrHandler().handleUpgrade(request, socket, head);
+            return;
+          }
           if (path === streamPath && this.mediaStreamHandler) {
             this.mediaStreamHandler?.handleUpgrade(request, socket, head);
           } else {
@@ -607,6 +633,25 @@ export class VoiceCallWebhookServer {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Lazily construct the hybrid CR handler.  Only valid when the provider is
+   * Twilio and `streaming.hybridMode` is enabled.
+   */
+  private ensureCrHandler(): HybridCrHandler {
+    if (!this.crHandler) {
+      this.crHandler = new HybridCrHandler({
+        manager: this.manager,
+        isHybridPlaying: (callSid) =>
+          this.provider.name === "twilio" &&
+          (this.provider as TwilioProvider).hasActiveHybridQueue(callSid),
+        speakInitialMessage: (callId) => this.manager.speakInitialMessage(callId).then(() => {}),
+        // Phase 1: no LLM-abort callback yet; barge-in is driven by onSpeechStart
+        // on the fork stream (which calls TwilioProvider.abortHybridPlay).
+      });
+    }
+    return this.crHandler;
   }
 
   private normalizeWebhookPathForMatch(pathname: string): string {
