@@ -21,6 +21,7 @@ import {
 } from "./src/config.js";
 import type { CoreConfig } from "./src/core-bridge.js";
 import { createVoiceCallContinueOperationStore } from "./src/gateway-continue-operation.js";
+import { buildOnCallEndedHandler } from "./src/post-call-pipeline.js";
 
 const VOICE_CALL_WRITE_METHOD_SCOPE = { scope: "operator.write" as const };
 const VOICE_CALL_READ_METHOD_SCOPE = { scope: "operator.read" as const };
@@ -829,9 +830,15 @@ export default definePluginEntry({
           );
           return;
         }
-        void ensureRuntime().catch((err) => {
-          api.logger.error(`[voice-call] Failed to start runtime: ${formatErrorMessage(err)}`);
-        });
+        void ensureRuntime()
+          .then((rt) => {
+            // Wire post-call reporting pipeline. The hook fires exactly once
+            // per call from CallManager.finalizeCall (de-duped by callId).
+            rt.manager.onCallEnded = buildOnCallEndedHandler({ api, config });
+          })
+          .catch((err) => {
+            api.logger.error(`[voice-call] Failed to start runtime: ${formatErrorMessage(err)}`);
+          });
       },
       stop: async () => {
         if (runtimeState[VOICE_CALL_RUNTIME_STOP_PROMISE_KEY]) {

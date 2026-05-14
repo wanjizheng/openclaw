@@ -4,7 +4,7 @@ import path from "node:path";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { VoiceCallConfig } from "./config.js";
-import type { CallManagerContext, StreamSessionIssuer } from "./manager/context.js";
+import type { CallManagerContext } from "./manager/context.js";
 import { processEvent as processManagerEvent } from "./manager/events.js";
 import { getCallByProviderCallId as getCallByProviderCallIdFromMaps } from "./manager/lookup.js";
 import {
@@ -71,6 +71,7 @@ export class CallManager {
   private providerCallIdMap = new Map<string, CallId>();
   private processedEventIds = new Set<string>();
   private rejectedProviderCallIds = new Set<string>();
+  private firedEndIds = new Set<CallId>();
   private provider: VoiceCallProvider | null = null;
   private config: VoiceCallConfig;
   private storePath: string;
@@ -86,13 +87,8 @@ export class CallManager {
   >();
   private maxDurationTimers = new Map<CallId, NodeJS.Timeout>();
   private initialMessageInFlight = new Set<CallId>();
-
-  /**
-   * Carrier-side stream session issuer. Wired by the runtime when realtime is
-   * enabled so the manager can pre-issue stream URLs for providers (e.g.
-   * Telnyx) that attach Media Streaming at dial or answer time.
-   */
-  streamSessionIssuer: StreamSessionIssuer | undefined;
+  /** Optional hook fired exactly once per call after it reaches a terminal state. */
+  public onCallEnded?: (call: CallRecord) => void;
 
   constructor(config: VoiceCallConfig, storePath?: string) {
     this.config = config;
@@ -335,6 +331,7 @@ export class CallManager {
       providerCallIdMap: this.providerCallIdMap,
       processedEventIds: this.processedEventIds,
       rejectedProviderCallIds: this.rejectedProviderCallIds,
+      firedEndIds: this.firedEndIds,
       provider: this.provider,
       config: this.config,
       storePath: this.storePath,
@@ -346,7 +343,15 @@ export class CallManager {
       onCallAnswered: (call) => {
         this.maybeSpeakInitialMessageOnAnswered(call);
       },
-      streamSessionIssuer: this.streamSessionIssuer,
+      onCallEnded: this.onCallEnded
+        ? (call) => {
+            try {
+              this.onCallEnded?.(call);
+            } catch {
+              // Hook errors must never propagate to call cleanup.
+            }
+          }
+        : undefined,
     };
   }
 

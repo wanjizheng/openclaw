@@ -15,6 +15,9 @@ type CallManagerRuntimeState = {
   processedEventIds: Set<string>;
   /** Provider call IDs we already sent a reject hangup for; avoids duplicate hangup calls. */
   rejectedProviderCallIds: Set<string>;
+  /** CallIds whose end-of-call hook has already fired; prevents duplicate post-call reports
+   * when finalizeCall is invoked from multiple end paths (provider webhook + stream disconnect). */
+  firedEndIds: Set<CallId>;
 };
 
 type CallManagerRuntimeDeps = {
@@ -31,17 +34,12 @@ type CallManagerTransientState = {
   initialMessageInFlight: Set<CallId>;
 };
 
-export type StreamSessionIssuer = (request: {
-  providerName: "twilio" | "telnyx";
-  callId: CallId;
-  from?: string;
-  to?: string;
-  direction: "inbound" | "outbound";
-}) => { token: string; streamUrl: string } | undefined;
-
 type CallManagerHooks = {
+  /** Optional runtime hook invoked after an event transitions a call into answered state. */
   onCallAnswered?: (call: CallRecord) => void;
-  streamSessionIssuer?: StreamSessionIssuer;
+  /** Optional runtime hook invoked exactly once after a call reaches a terminal state.
+   * Receives the finalized CallRecord (transcript + endReason populated). */
+  onCallEnded?: (call: CallRecord) => void;
 };
 
 export type CallManagerContext = CallManagerRuntimeState &

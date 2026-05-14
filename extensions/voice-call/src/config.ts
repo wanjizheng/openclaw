@@ -379,6 +379,16 @@ const VoiceCallStreamingConfigSchema = z
     maxPendingConnectionsPerIp: z.number().int().positive().default(4),
     /** Hard cap for all open media stream sockets (pending + active). */
     maxConnections: z.number().int().positive().default(128),
+    /**
+     * Hybrid mode (fork-only).
+     * When true, calls use `<Start><Stream>` (STT-only fork) +
+     * `<Connect><ConversationRelay>` (event channel) and TTS is delivered as mp3
+     * files via Twilio Call Update `<Play>` injection. Enables true echo-free
+     * barge-in via OpenAI VAD on the inbound stream.
+     */
+    hybridMode: z.boolean().default(false),
+    /** WebSocket path for ConversationRelay event channel (hybrid mode). */
+    crPath: z.string().min(1).default("/voice/cr"),
   })
   .strict()
   .default({
@@ -389,6 +399,8 @@ const VoiceCallStreamingConfigSchema = z
     maxPendingConnections: 32,
     maxPendingConnectionsPerIp: 4,
     maxConnections: 128,
+    hybridMode: false,
+    crPath: "/voice/cr",
   });
 
 // -----------------------------------------------------------------------------

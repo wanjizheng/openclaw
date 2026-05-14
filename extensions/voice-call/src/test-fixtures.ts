@@ -45,6 +45,8 @@ export function createVoiceCallBaseConfig(params?: {
       maxPendingConnections: 32,
       maxPendingConnectionsPerIp: 4,
       maxConnections: 128,
+      hybridMode: false,
+      crPath: "/voice/cr",
     },
     realtime: {
       enabled: false,

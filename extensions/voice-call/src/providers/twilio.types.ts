@@ -14,4 +14,13 @@ export interface TwilioProviderOptions {
   skipVerification?: boolean;
   /** Webhook security options (forwarded headers/allowlist) */
   webhookSecurity?: WebhookSecurityConfig;
+  /**
+   * Enable hybrid mode (fork): `<Start><Stream>` (STT-only fork) +
+   * `<Connect><ConversationRelay>` (event channel) + Twilio Call Update
+   * `<Play>` for TTS.  Requires `crPath` and a ConversationRelay-capable
+   * account.
+   */
+  hybridMode?: boolean;
+  /** Path for the ConversationRelay WebSocket when hybrid mode is enabled. */
+  crPath?: string;
 }

@@ -257,6 +257,13 @@ export type PlayTtsInput = {
   text: string;
   voice?: string;
   locale?: string;
+  /**
+   * Optional pre-generated public audio URL (mp3).  When set, hybrid-mode
+   * providers will inject this URL via a Twilio Call Update `<Play>` instead
+   * of streaming audio over the media WebSocket.  Ignored by non-hybrid
+   * providers.
+   */
+  audioUrl?: string;
 };
 
 export type SendDtmfInput = {
