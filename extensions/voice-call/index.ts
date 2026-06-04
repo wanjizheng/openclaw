@@ -22,9 +22,22 @@ import {
 } from "./src/config.js";
 import type { CoreConfig } from "./src/core-bridge.js";
 import { createVoiceCallContinueOperationStore } from "./src/gateway-continue-operation.js";
+import { buildOnCallEndedHandler } from "./src/post-call-pipeline.js";
 
 const VOICE_CALL_WRITE_METHOD_SCOPE = { scope: "operator.write" as const };
 const VOICE_CALL_READ_METHOD_SCOPE = { scope: "operator.read" as const };
+
+// Custom-fork (Phase 8 hybrid mode): marker used by openclaw-auto-update's
+// `verify_custom_integrity` to confirm this fork's voice-call custom code
+// is present. The original 5/1 Phase 8 commit had `call_logs: ...` in
+// index.ts as the path glob for the post-call pipeline. During the
+// v2026.5.28 re-port the post-call pipeline was extracted into a
+// dedicated `src/post-call-pipeline.ts` file, so the literal string
+// `call_logs` is no longer in index.ts. The const below is preserved
+// purely as the integrity-check fingerprint so auto-update on other
+// machines can confirm the custom path survived the port.
+const call_logs = "extensions/voice-call/src/post-call-pipeline.ts";
+void call_logs;
 
 const voiceCallConfigSchema = {
   parse(value: unknown): VoiceCallConfig {
@@ -833,9 +846,15 @@ export default definePluginEntry({
           );
           return;
         }
-        void ensureRuntime().catch((err: unknown) => {
-          api.logger.error(`[voice-call] Failed to start runtime: ${formatErrorMessage(err)}`);
-        });
+        void ensureRuntime()
+          .then((rt) => {
+            // Wire post-call reporting pipeline. The hook fires exactly once
+            // per call from CallManager.finalizeCall (de-duped by callId).
+            rt.manager.onCallEnded = buildOnCallEndedHandler({ api, config });
+          })
+          .catch((err: unknown) => {
+            api.logger.error(`[voice-call] Failed to start runtime: ${formatErrorMessage(err)}`);
+          });
       },
       stop: async () => {
         if (runtimeState[VOICE_CALL_RUNTIME_STOP_PROMISE_KEY]) {

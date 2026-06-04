@@ -5,6 +5,7 @@ import {
   resolveVoiceCallSessionKey,
   type CallMode,
 } from "../config.js";
+import { generateHybridAudioUrl } from "../hybrid/audio-pipeline.js";
 import { resolvePreferredTtsVoice } from "../tts-provider-voice.js";
 import {
   type EndReason,
@@ -258,6 +259,7 @@ export async function speak(
   ctx: SpeakContext,
   callId: CallId,
   text: string,
+  options?: { endCall?: boolean },
 ): Promise<{ success: boolean; error?: string }> {
   const connected = requireConnectedCall(ctx, callId);
   if (!connected.ok) {
@@ -274,11 +276,38 @@ export async function speak(
     const voice = resolvePreferredTtsVoice(
       resolveVoiceCallEffectiveConfig(ctx.config, numberRouteKey).config,
     );
+
+    // Hybrid mode: pre-generate the mp3 file and pass its public URL.
+    // Twilio plays it via Call Update <Play> instead of streaming over WS.
+    let audioUrl: string | undefined;
+    if (ctx.config.streaming?.hybridMode) {
+      try {
+        audioUrl = await generateHybridAudioUrl({
+          text,
+          voiceConfig: ctx.config,
+          coreConfig: { messages: { tts: ctx.config.tts } } as never,
+          callId,
+        });
+      } catch (err) {
+        console.warn(
+          `[voice-call][hybrid] generateHybridAudioUrl failed:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+      if (!audioUrl) {
+        console.warn(
+          `[voice-call][hybrid] No audio URL produced for ${callId}; provider will fall back if possible`,
+        );
+      }
+    }
+
     await provider.playTts({
       callId,
       providerCallId,
       text,
       voice,
+      audioUrl,
+      endCall: options?.endCall,
     });
 
     addTranscriptEntry(call, "bot", text);
