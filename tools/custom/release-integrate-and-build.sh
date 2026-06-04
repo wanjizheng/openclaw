@@ -461,8 +461,8 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   rsync -a --delete dist/ "$DEPLOY_TARGET/dist/"
   cp -f openclaw.mjs "$DEPLOY_TARGET/openclaw.mjs"
   cp -f package.json "$DEPLOY_TARGET/package.json"
-  [[ -d "$DEPLOY_TARGET/extensions" ]] && rsync -a --delete extensions/ "$DEPLOY_TARGET/extensions/"
-  [[ -d "$DEPLOY_TARGET/skills" ]]     && rsync -a --delete skills/ "$DEPLOY_TARGET/skills/"
+  mkdir -p "$DEPLOY_TARGET/extensions" && rsync -a --delete extensions/ "$DEPLOY_TARGET/extensions/"
+  mkdir -p "$DEPLOY_TARGET/skills"     && rsync -a --delete skills/ "$DEPLOY_TARGET/skills/"
   log "artifacts synced"
 
   # ── Refresh gateway service unit/env ──
