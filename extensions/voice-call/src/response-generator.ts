@@ -1,17 +1,17 @@
 /**
- * Voice call response generator - uses the embedded OpenClaw agent for tool support.
+ * Voice call response generator - uses the embedded Pi agent for tool support.
  * Routes voice responses through the same agent infrastructure as messaging.
  */
 
 import crypto from "node:crypto";
 import { applyModelOverrideToSessionEntry } from "openclaw/plugin-sdk/model-session-runtime";
-import {
-  isRecord,
-  normalizeLowercaseStringOrEmpty,
-  normalizeStringEntries,
-} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import type { SessionEntry } from "../api.js";
+import { resolveVoiceAgentId } from "./agent-routing.js";
 import { resolveVoiceCallSessionKey, type VoiceCallConfig } from "./config.js";
+import { findContactByPhone, loadContactsFileAsync, type ParsedContact } from "./contact-file.js";
 import type { CoreAgentDeps, CoreConfig } from "./core-bridge.js";
+import { stripLlmReasoningTags } from "./llm-tag-cleanup.js";
 import { resolveVoiceResponseModel } from "./response-model.js";
 
 export type VoiceResponseParams = {
@@ -43,6 +43,10 @@ type VoiceResponsePayload = {
   isError?: boolean;
   isReasoning?: boolean;
 };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 function readExplicitToolsAllow(value: unknown): string[] | undefined {
   if (!isRecord(value)) {
@@ -159,7 +163,10 @@ function sanitizePlainSpokenText(text: string): string | null {
     return null;
   }
 
-  const paragraphs = normalizeStringEntries(withoutCodeFences.split(/\n\s*\n+/));
+  const paragraphs = withoutCodeFences
+    .split(/\n\s*\n+/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
 
   while (paragraphs.length > 1 && isLikelyMetaReasoningParagraph(paragraphs[0])) {
     paragraphs.shift();
@@ -181,7 +188,16 @@ function extractSpokenTextFromPayloads(payloads: VoiceResponsePayload[]): string
       continue;
     }
 
-    const structured = tryParseSpokenJson(rawText);
+    // Custom-fork: strip DeepSeek/anthropic-style <think>/<final> reasoning
+    // tags BEFORE attempting JSON or plain-text parsing so the spoken text
+    // never includes leaked chain-of-thought.
+    const cleaned = stripLlmReasoningTags(rawText, { isFinal: true });
+    const strippedText = cleaned.trim();
+    if (!strippedText) {
+      continue;
+    }
+
+    const structured = tryParseSpokenJson(strippedText);
     if (structured !== null) {
       if (structured.length > 0) {
         spokenSegments.push(structured);
@@ -189,7 +205,7 @@ function extractSpokenTextFromPayloads(payloads: VoiceResponsePayload[]): string
       continue;
     }
 
-    const plain = sanitizePlainSpokenText(rawText);
+    const plain = sanitizePlainSpokenText(strippedText);
     if (plain) {
       spokenSegments.push(plain);
     }
@@ -207,7 +223,7 @@ function resolveVoiceSandboxSessionKey(agentId: string, sessionKey: string): str
 }
 
 /**
- * Generate a voice response using the embedded OpenClaw agent with full tool support.
+ * Generate a voice response using the embedded Pi agent with full tool support.
  * Uses the same agent infrastructure as messaging for consistent behavior.
  */
 export async function generateVoiceResponse(
@@ -235,8 +251,25 @@ export async function generateVoiceResponse(
     phone: from,
     explicitSessionKey: sessionKey,
   });
-  const agentId = voiceConfig.agentId ?? "main";
+  // Custom-fork: support sessionKey-prefixed agent ids (`agent:<id>:...`)
+  // and fall back to voiceConfig.agentId or "main".
+  const agentId = resolveVoiceAgentId({
+    agentId: voiceConfig.agentId,
+    sessionKey: resolvedSessionKey,
+    fallback: "main",
+  });
   const toolsAllow = resolveVoiceAgentToolsAllow(cfg, agentId);
+
+  // Custom-fork: load CONTACT_LIST.md (if present) so we can enrich the
+  // system prompt with caller name + per-contact info. Failures are
+  // swallowed by loadContactsFileAsync.
+  let contact: ParsedContact | undefined;
+  try {
+    const contacts = await loadContactsFileAsync();
+    contact = findContactByPhone(from, contacts);
+  } catch {
+    contact = undefined;
+  }
 
   // Resolve paths
   const storePath = agentRuntime.session.resolveStorePath(cfg.session?.store, { agentId });
@@ -247,47 +280,34 @@ export async function generateVoiceResponse(
   await agentRuntime.ensureAgentWorkspace({ dir: workspaceDir });
 
   // Load or create session entry
+  const sessionStore = agentRuntime.session.loadSessionStore(storePath);
   const now = Date.now();
-  const existingSessionEntry = agentRuntime.session.getSessionEntry({
-    storePath,
-    sessionKey: resolvedSessionKey,
-  });
+  const existingSessionEntry = sessionStore[resolvedSessionKey] as SessionEntry | undefined;
 
   // Resolve model from config
   const { provider, model } = resolveVoiceResponseModel({ voiceConfig, agentRuntime });
 
   let sessionEntry = existingSessionEntry;
   if (!sessionEntry?.sessionId || voiceConfig.responseModel) {
-    sessionEntry =
-      (await agentRuntime.session.patchSessionEntry({
-        storePath,
-        sessionKey: resolvedSessionKey,
-        replaceEntry: true,
-        fallbackEntry: sessionEntry ?? {
+    sessionEntry = await agentRuntime.session.updateSessionStore(storePath, (store) => {
+      let entry = store[resolvedSessionKey] as SessionEntry | undefined;
+      if (!entry?.sessionId) {
+        entry = {
+          ...entry,
           sessionId: crypto.randomUUID(),
           updatedAt: now,
-        },
-        update: (entry) => {
-          const next = entry.sessionId
-            ? { ...entry }
-            : {
-                ...entry,
-                sessionId: crypto.randomUUID(),
-                updatedAt: now,
-              };
-          if (voiceConfig.responseModel) {
-            applyModelOverrideToSessionEntry({
-              entry: next,
-              selection: { provider, model },
-              selectionSource: "auto",
-            });
-          }
-          return next;
-        },
-      })) ?? undefined;
-  }
-  if (!sessionEntry?.sessionId) {
-    return { text: null, error: "Voice response session could not be initialized" };
+        };
+        store[resolvedSessionKey] = entry;
+      }
+      if (voiceConfig.responseModel) {
+        applyModelOverrideToSessionEntry({
+          entry,
+          selection: { provider, model },
+          selectionSource: "auto",
+        });
+      }
+      return entry;
+    });
   }
   const sessionId = sessionEntry.sessionId;
 
@@ -303,16 +323,24 @@ export async function generateVoiceResponse(
   const agentName = identity?.name?.trim() || "assistant";
 
   // Build system prompt with conversation history
+  const callerLabel = contact?.name ? `${contact.name} (${from})` : from;
   const basePrompt =
     voiceConfig.responseSystemPrompt ??
-    `You are ${agentName}, a helpful voice assistant on a phone call. Keep responses brief and conversational (1-2 sentences max). Be natural and friendly. The caller's phone number is ${from}. You have access to tools - use them when helpful.`;
+    `You are ${agentName}, a helpful voice assistant on a phone call. Keep responses brief and conversational (1-2 sentences max). Be natural and friendly. The caller is ${callerLabel}. You have access to tools - use them when helpful.`;
 
   let extraSystemPrompt = basePrompt;
+
+  // Custom-fork: if the caller is a known contact, inject their per-contact
+  // free-form info block so the agent has the right relational context.
+  if (contact?.info) {
+    extraSystemPrompt = `${extraSystemPrompt}\n\nCaller info:\n${contact.info}`;
+  }
+
   if (transcript.length > 0) {
     const history = transcript
       .map((entry) => `${entry.speaker === "bot" ? "You" : "Caller"}: ${entry.text}`)
       .join("\n");
-    extraSystemPrompt = `${basePrompt}\n\nConversation so far:\n${history}`;
+    extraSystemPrompt = `${extraSystemPrompt}\n\nConversation so far:\n${history}`;
   }
   extraSystemPrompt = `${extraSystemPrompt}\n\n${VOICE_SPOKEN_OUTPUT_CONTRACT}`;
 
@@ -321,7 +349,7 @@ export async function generateVoiceResponse(
   const runId = `voice:${callId}:${Date.now()}`;
 
   try {
-    const result = await agentRuntime.runEmbeddedAgent({
+    const result = await agentRuntime.runEmbeddedPiAgent({
       sessionId,
       sessionKey: resolvedSessionKey,
       sandboxSessionKey: resolveVoiceSandboxSessionKey(agentId, resolvedSessionKey),

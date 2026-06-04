@@ -11,7 +11,12 @@ type CallLifecycleContext = Pick<
   CallManagerContext,
   "activeCalls" | "providerCallIdMap" | "storePath"
 > &
-  Partial<Pick<CallManagerContext, "transcriptWaiters" | "maxDurationTimers">>;
+  Partial<
+    Pick<
+      CallManagerContext,
+      "transcriptWaiters" | "maxDurationTimers" | "firedEndIds" | "onCallEnded"
+    >
+  >;
 
 /** Remove a provider-call mapping only when it still points at this call. */
 function removeProviderCallMapping(
@@ -55,4 +60,18 @@ export function finalizeCall(params: {
 
   ctx.activeCalls.delete(call.callId);
   removeProviderCallMapping(ctx.providerCallIdMap, call);
+
+  // Fire end-of-call hook exactly once per callId, even if finalizeCall is
+  // invoked from multiple end paths (e.g. provider webhook + stream disconnect).
+  if (ctx.onCallEnded) {
+    const fired = ctx.firedEndIds;
+    if (!fired || !fired.has(call.callId)) {
+      fired?.add(call.callId);
+      try {
+        ctx.onCallEnded(call);
+      } catch {
+        // Hook errors must never break call cleanup.
+      }
+    }
+  }
 }
