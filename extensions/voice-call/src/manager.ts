@@ -72,6 +72,7 @@ export class CallManager {
   private providerCallIdMap = new Map<string, CallId>();
   private processedEventIds = new Set<string>();
   private rejectedProviderCallIds = new Set<string>();
+  private firedEndIds = new Set<CallId>();
   private provider: VoiceCallProvider | null = null;
   private config: VoiceCallConfig;
   private storePath: string;
@@ -87,7 +88,8 @@ export class CallManager {
   >();
   private maxDurationTimers = new Map<CallId, NodeJS.Timeout>();
   private initialMessageInFlight = new Set<CallId>();
-
+  /** Optional hook fired exactly once per call after it reaches a terminal state. */
+  public onCallEnded?: (call: CallRecord) => void;
   /**
    * Carrier-side stream session issuer. Wired by the runtime when realtime is
    * enabled so the manager can pre-issue stream URLs for providers (e.g.
@@ -295,8 +297,12 @@ export class CallManager {
   /**
    * Speak to user in an active call.
    */
-  async speak(callId: CallId, text: string): Promise<{ success: boolean; error?: string }> {
-    return speakWithContext(this.getContext(), callId, text);
+  async speak(
+    callId: CallId,
+    text: string,
+    options?: { endCall?: boolean },
+  ): Promise<{ success: boolean; error?: string }> {
+    return speakWithContext(this.getContext(), callId, text, options);
   }
 
   /**
@@ -336,6 +342,7 @@ export class CallManager {
       providerCallIdMap: this.providerCallIdMap,
       processedEventIds: this.processedEventIds,
       rejectedProviderCallIds: this.rejectedProviderCallIds,
+      firedEndIds: this.firedEndIds,
       provider: this.provider,
       config: this.config,
       storePath: this.storePath,
@@ -347,6 +354,15 @@ export class CallManager {
       onCallAnswered: (call) => {
         this.maybeSpeakInitialMessageOnAnswered(call);
       },
+      onCallEnded: this.onCallEnded
+        ? (call) => {
+            try {
+              this.onCallEnded?.(call);
+            } catch {
+              // Hook errors must never propagate to call cleanup.
+            }
+          }
+        : undefined,
       streamSessionIssuer: this.streamSessionIssuer,
     };
   }
