@@ -3,6 +3,8 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { getHeader } from "../http-headers.js";
+import { HybridPlayQueue, type CallUpdateApi } from "../hybrid/play-queue.js";
+import { buildHybridInitialTwiml, type ConversationRelayOptions } from "../hybrid/twiml.js";
 import type { MediaStreamHandler } from "../media-stream.js";
 import { chunkAudio } from "../telephony-audio.js";
 import type { TelephonyTtsProvider } from "../telephony-tts.js";
@@ -102,6 +104,23 @@ export class TwilioProvider implements VoiceCallProvider {
   private readonly notifyCalls = new Set<string>();
   private readonly activeStreamCalls = new Set<string>();
 
+  /** Hybrid mode play queue (lazily constructed when hybrid is enabled). */
+  private hybridQueue: HybridPlayQueue | null = null;
+
+  /**
+   * Hybrid mode: optional pre-generated greeting audio URL keyed by callId.
+   * Consumed once during the initial TwiML response (`<Play>` element).
+   */
+  private readonly hybridInitialAudio = new Map<string, string>();
+
+  /**
+   * Hybrid mode: register a pre-generated greeting audio URL for a callId.
+   * The next initial TwiML response for this callId will include `<Play>`.
+   */
+  setHybridInitialAudioUrl(callId: string, url: string): void {
+    this.hybridInitialAudio.set(callId, url);
+  }
+
   /**
    * Delete stored TwiML for a given `callId`.
    *
@@ -157,6 +176,80 @@ export class TwilioProvider implements VoiceCallProvider {
 
   getPublicUrl(): string | null {
     return this.currentPublicUrl;
+  }
+
+  // ── Hybrid mode ─────────────────────────────────────────────────────────
+
+  get isHybridMode(): boolean {
+    return this.options.hybridMode === true;
+  }
+
+  /** Lazily-constructed hybrid play queue (null when hybrid disabled). */
+  getHybridQueue(): HybridPlayQueue | null {
+    if (!this.isHybridMode) return null;
+    if (!this.hybridQueue) {
+      const api: CallUpdateApi = {
+        updateCallTwiml: (sid, twiml) => this.updateCallTwiml(sid, twiml),
+        getPlayNextUrl: (sid, cid) => this.getPlayNextUrl(sid, cid),
+        getConversationRelayOptions: () => this.getConversationRelayOptions(),
+      };
+      this.hybridQueue = new HybridPlayQueue(api);
+    }
+    return this.hybridQueue;
+  }
+
+  /** Whether a hybrid play queue is active for this call SID. */
+  hasActiveHybridQueue(callSid: string): boolean {
+    return this.hybridQueue?.has(callSid) ?? false;
+  }
+
+  /** Abort hybrid playback (used by webhook on barge-in). */
+  abortHybridPlay(callSid: string): Promise<void> {
+    return this.hybridQueue?.abort(callSid) ?? Promise.resolve();
+  }
+
+  /** Mark hybrid sentences done for a call (no more queued; resume CR after drain). */
+  markHybridSentencesDone(callSid: string, endCall = false): void {
+    this.hybridQueue?.markDone(callSid, endCall);
+  }
+
+  /** Handle the playAction redirect callback. */
+  handlePlayNextAction(callSid: string, callId?: string): string {
+    const q = this.getHybridQueue();
+    if (!q) return TwilioProvider.PAUSE_TWIML;
+    return q.handlePlayNextAction(callSid, callId);
+  }
+
+  /** Update a live call's TwiML via Twilio Calls API. */
+  async updateCallTwiml(callSid: string, twiml: string): Promise<void> {
+    await this.apiRequest(`/Calls/${callSid}.json`, { Twiml: twiml });
+  }
+
+  /** Build the public redirect URL for hybrid play-next chaining. */
+  private getPlayNextUrl(_callSid: string, callId?: string): string | null {
+    if (!this.currentPublicUrl) return null;
+    const url = new URL(this.currentPublicUrl);
+    if (callId) url.searchParams.set("callId", callId);
+    url.searchParams.set("playAction", "1");
+    return url.toString();
+  }
+
+  /** Get the WebSocket URL for ConversationRelay (hybrid mode). */
+  private getConversationRelayWsUrl(): string | null {
+    if (!this.currentPublicUrl) return null;
+    const url = new URL(this.currentPublicUrl);
+    const wsOrigin = url.origin.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://");
+    const crPath = (this.options.crPath ?? "/voice/cr").startsWith("/")
+      ? (this.options.crPath ?? "/voice/cr")
+      : `/${this.options.crPath ?? "/voice/cr"}`;
+    return `${wsOrigin}${crPath}`;
+  }
+
+  /** Resolve current ConversationRelay options for hybrid TwiML/resume. */
+  getConversationRelayOptions(): ConversationRelayOptions | null {
+    const wsUrl = this.getConversationRelayWsUrl();
+    if (!wsUrl) return null;
+    return { wsUrl };
   }
 
   setTTSProvider(provider: TelephonyTtsProvider): void {
@@ -418,6 +511,33 @@ export class TwilioProvider implements VoiceCallProvider {
     }
 
     const view = readTwimlRequestView(ctx);
+
+    // Hybrid mode: handle the playAction redirect callback first.
+    if (this.isHybridMode) {
+      const playAction = normalizeOptionalString(ctx.query?.playAction);
+      const callIdQ = normalizeOptionalString(ctx.query?.callId);
+      if (playAction && view.callSid) {
+        return this.handlePlayNextAction(view.callSid, callIdQ);
+      }
+      // Initial webhook hit for an answered call → emit hybrid TwiML.
+      if (view.callSid) {
+        const streamUrl = this.getStreamUrlForCall(view.callSid);
+        const cr = this.getConversationRelayOptions();
+        if (streamUrl && cr) {
+          this.activeStreamCalls.add(view.callSid);
+          const initialAudioUrl = view.callIdFromQuery
+            ? this.hybridInitialAudio.get(view.callIdFromQuery)
+            : undefined;
+          if (view.callIdFromQuery) {
+            this.hybridInitialAudio.delete(view.callIdFromQuery);
+          }
+          return buildHybridInitialTwiml({ streamUrl, cr, playUrl: initialAudioUrl });
+        }
+      }
+      // Fallback if hybrid prerequisites missing.
+      return TwilioProvider.PAUSE_TWIML;
+    }
+
     const storedTwiml = view.callIdFromQuery
       ? this.twimlStorage.get(view.callIdFromQuery)
       : undefined;
@@ -614,6 +734,25 @@ export class TwilioProvider implements VoiceCallProvider {
    * 2. TwiML <Say>: fallback only when there is no active stream for the call.
    */
   async playTts(input: PlayTtsInput): Promise<void> {
+    // Hybrid path: push the URL through the play queue.
+    if (this.isHybridMode && input.audioUrl) {
+      const queue = this.getHybridQueue();
+      if (queue) {
+        const wasEmpty = !queue.has(input.providerCallId);
+        queue.enqueue(input.providerCallId, input.audioUrl, input.callId);
+        if (wasEmpty) {
+          await queue.triggerFirst(input.providerCallId);
+        }
+        // Mark this single-chunk turn as done so the redirect handler
+        // resumes CR after playback. If `endCall` is set, the redirect
+        // returns HYBRID_HANGUP_TWIML (a <Hangup/> TwiML) once the audio
+        // finishes — this is the queue-driven end-of-call path with no
+        // setTimeout, so we never hang up mid-goodbye.
+        queue.markDone(input.providerCallId, input.endCall === true);
+        return;
+      }
+    }
+
     const streamSid = this.callStreamMap.get(input.providerCallId);
     if (streamSid) {
       if (!this.ttsProvider || !this.mediaStreamHandler) {
