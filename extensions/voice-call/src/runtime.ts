@@ -223,6 +223,8 @@ async function resolveProvider(config: VoiceCallConfig): Promise<VoiceCallProvid
           skipVerification: config.skipSignatureVerification,
           streamPath: config.streaming?.enabled ? config.streaming.streamPath : undefined,
           webhookSecurity: config.webhookSecurity,
+          hybridMode: config.streaming?.hybridMode === true,
+          crPath: config.streaming?.crPath,
         },
       );
     }

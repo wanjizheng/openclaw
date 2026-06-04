@@ -16,6 +16,9 @@ type CallManagerRuntimeState = {
   processedEventIds: Set<string>;
   /** Provider call IDs we already sent a reject hangup for; avoids duplicate hangup calls. */
   rejectedProviderCallIds: Set<string>;
+  /** CallIds whose end-of-call hook has already fired; prevents duplicate post-call reports
+   * when finalizeCall is invoked from multiple end paths (provider webhook + stream disconnect). */
+  firedEndIds: Set<CallId>;
 };
 
 type CallManagerRuntimeDeps = {
@@ -32,6 +35,8 @@ type CallManagerTransientState = {
   initialMessageInFlight: Set<CallId>;
 };
 
+/** Issue a carrier-side stream session for a provider that attaches Media Streaming
+ * at dial/answer time (e.g. Telnyx). Wired by the runtime when realtime is enabled. */
 export type StreamSessionIssuer = (request: {
   providerName: "twilio" | "telnyx";
   callId: CallId;
@@ -41,7 +46,12 @@ export type StreamSessionIssuer = (request: {
 }) => { token: string; streamUrl: string } | undefined;
 
 type CallManagerHooks = {
+  /** Optional runtime hook invoked after an event transitions a call into answered state. */
   onCallAnswered?: (call: CallRecord) => void;
+  /** Optional runtime hook invoked exactly once after a call reaches a terminal state.
+   * Receives the finalized CallRecord (transcript + endReason populated). */
+  onCallEnded?: (call: CallRecord) => void;
+  /** Carrier-side stream session issuer. Wired by the runtime when realtime is enabled. */
   streamSessionIssuer?: StreamSessionIssuer;
 };
 
