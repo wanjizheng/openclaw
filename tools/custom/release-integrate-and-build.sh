@@ -380,14 +380,40 @@ log "cherry-pick complete ($(elapsed))"
 # ══════════════════════════════════════════════════════════════════════════════
 if [[ "$SKIP_BUILD" != "true" ]]; then
   if [[ "$SKIP_INSTALL" != "true" ]]; then
+    # Run pnpm install with --frozen-lockfile, but allow a one-shot fallback
+    # to a non-frozen install when the failure is ERR_PNPM_OUTDATED_LOCKFILE.
+    # This happens when a freshly cherry-picked upstream commit (typically an
+    # extension manifest bump) downgrades or moves a specifier that the
+    # existing pnpm-lock.yaml still records at the old version. The
+    # integration build is the right place to regenerate the lockfile, since
+    # we explicitly accept upstream manifest drift here.
+    pnpm_install_with_lockfile_fallback() {
+      local label="$1"; shift
+      local log_file; log_file="$(mktemp)"
+      if "$@" > "$log_file" 2>&1; then
+        rm -f "$log_file"
+        return 0
+      fi
+      if grep -q "ERR_PNPM_OUTDATED_LOCKFILE" "$log_file"; then
+        log "[warn] $label: pnpm-lock.yaml drift detected (upstream manifest changed); regenerating with plain pnpm install"
+        tail -20 "$log_file" >&2
+        rm -f "$log_file"
+        pnpm install 2>&1 | tail -10
+        return $?
+      fi
+      tail -50 "$log_file" >&2
+      rm -f "$log_file"
+      die "$label failed (non-drift error)"
+    }
+
     if has_gpu_environment; then
       step "pnpm install (GPU detected)"
       log "GPU environment detected; enabling full node-llama-cpp postinstall"
-      pnpm install --frozen-lockfile 2>&1 | tail -10
+      pnpm_install_with_lockfile_fallback "pnpm install (GPU)" pnpm install --frozen-lockfile
     else
       step "pnpm install (no GPU)"
       log "GPU not detected; set NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 to skip llama.cpp postinstall download/build"
-      NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 pnpm install --frozen-lockfile 2>&1 | tail -10
+      pnpm_install_with_lockfile_fallback "pnpm install (no GPU)" env NODE_LLAMA_CPP_SKIP_DOWNLOAD=1 pnpm install --frozen-lockfile
     fi
   fi
 
