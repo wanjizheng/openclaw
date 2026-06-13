@@ -217,11 +217,20 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. Collect custom-only commits
 #    Use first-parent mainline only; exclude commits already reachable from
-#    upstream/main; then slim noisy repeated subjects.
+#    upstream/main or any upstream/release/* branch (those are upstream
+#    release-engineering commits, not fork changes). Then slim noisy repeated
+#    subjects.
 # ══════════════════════════════════════════════════════════════════════════════
 step "collecting custom commits"
+UPSTREAM_EXCLUDES=("^upstream/main")
+while IFS= read -r rb; do
+  rb="${rb#"${rb%%[![:space:]]*}"}"
+  [[ -n "$rb" ]] || continue
+  UPSTREAM_EXCLUDES+=("^${rb}")
+done < <(git branch -r --list 'upstream/release/*' 2>/dev/null | sed 's/^[[:space:]]*//')
+log "excluding $((${#UPSTREAM_EXCLUDES[@]} - 1)) upstream release branch(es) from cherry-pick list"
 mapfile -t CUSTOM_COMMITS < <(
-  git --no-pager log --first-parent --reverse --no-merges --pretty=%H "${LATEST_TAG}..custom-main" ^upstream/main
+  git --no-pager log --first-parent --reverse --no-merges --pretty=%H "${LATEST_TAG}..custom-main" "${UPSTREAM_EXCLUDES[@]}"
 )
 if (( ${#CUSTOM_COMMITS[@]} == 0 )) || [[ -z "${CUSTOM_COMMITS[0]:-}" ]]; then
   die "no custom commits found between ${LATEST_TAG} and custom-main"
