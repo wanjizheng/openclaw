@@ -395,11 +395,25 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
         return 0
       fi
       if grep -q "ERR_PNPM_OUTDATED_LOCKFILE" "$log_file"; then
-        log "[warn] $label: pnpm-lock.yaml drift detected (upstream manifest changed); regenerating with plain pnpm install"
+        log "[warn] $label: pnpm-lock.yaml drift detected (upstream manifest changed); regenerating lockfile only (--lockfile-only) and re-installing with --frozen-lockfile"
         tail -20 "$log_file" >&2
         rm -f "$log_file"
-        pnpm install 2>&1 | tail -10
-        return $?
+        # Step 1: regenerate the lockfile to match the new manifest, but
+        # DO NOT touch node_modules or run postinstall scripts. node-llama-cpp
+        # postinstall tries a CUDA build from source and fails on hosts
+        # without a working CUDA toolchain; we never want to trigger that
+        # from a lockfile-drift recovery.
+        if ! pnpm install --lockfile-only > "$log_file" 2>&1; then
+          tail -50 "$log_file" >&2
+          rm -f "$log_file"
+          die "$label: --lockfile-only failed to resolve manifest drift"
+        fi
+        log "[info] $label: lockfile regenerated; re-running install with --frozen-lockfile"
+        # Step 2: now the lockfile matches, the original --frozen-lockfile
+        # command (with all its original env vars) will succeed.
+        rm -f "$log_file"
+        "$@" 2>&1 | tail -10
+        return ${PIPESTATUS[0]}
       fi
       tail -50 "$log_file" >&2
       rm -f "$log_file"
