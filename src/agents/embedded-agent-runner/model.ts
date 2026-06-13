@@ -1,3 +1,6 @@
+/**
+ * Resolves embedded-agent provider/model selections from config, registry, and catalogs.
+ */
 import { finiteSecondsToTimerSafeMilliseconds } from "@openclaw/normalization-core/number-coercion";
 import type { ModelCompatConfig, ModelMediaInputConfig } from "../../config/types.models.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -187,10 +190,12 @@ function applyResolvedTransportFallback(params: {
     provider: params.provider,
     config: params.cfg,
     workspaceDir: params.workspaceDir,
+    modelId: params.model.id,
     context: {
       config: params.cfg,
       workspaceDir: params.workspaceDir,
       provider: params.provider,
+      modelId: params.model.id,
       api: params.model.api,
       baseUrl: params.model.baseUrl,
     },
@@ -309,6 +314,7 @@ function normalizeResolvedModel(params: {
 
 function resolveProviderTransport(params: {
   provider: string;
+  modelId?: string;
   api?: Api | null;
   baseUrl?: string;
   cfg?: OpenClawConfig;
@@ -321,12 +327,14 @@ function resolveProviderTransport(params: {
   const runtimeHooks = params.runtimeHooks ?? DEFAULT_PROVIDER_RUNTIME_HOOKS;
   const normalized = runtimeHooks.normalizeProviderTransportWithPlugin({
     provider: params.provider,
+    ...(params.modelId ? { modelId: params.modelId } : {}),
     config: params.cfg,
     workspaceDir: params.workspaceDir,
     context: {
       config: params.cfg,
       workspaceDir: params.workspaceDir,
       provider: params.provider,
+      ...(params.modelId ? { modelId: params.modelId } : {}),
       api: params.api,
       baseUrl: params.baseUrl,
     },
@@ -661,6 +669,7 @@ function applyConfiguredProviderOverrides(params: {
       ...(resolvedParams ? { params: resolvedParams } : {}),
       ...(requestTimeoutMs !== undefined ? { requestTimeoutMs } : {}),
       headers: passthroughRequestConfig.headers,
+      ...(providerConfig.authHeader !== undefined ? { authHeader: providerConfig.authHeader } : {}),
     };
   }
   const resolvedParams = mergeModelParams(
@@ -696,6 +705,7 @@ function applyConfiguredProviderOverrides(params: {
 
   const resolvedTransport = resolveProviderTransport({
     provider: params.provider,
+    modelId: discoveredModel.id,
     api: resolvedTransportApi,
     baseUrl: resolvedTransportBaseUrl,
     cfg: params.cfg,
@@ -751,6 +761,9 @@ function applyConfiguredProviderOverrides(params: {
         ...(resolvedParams ? { params: resolvedParams } : {}),
         ...(requestTimeoutMs !== undefined ? { requestTimeoutMs } : {}),
         headers: requestConfig.headers,
+        ...(providerConfig.authHeader !== undefined
+          ? { authHeader: providerConfig.authHeader }
+          : {}),
         compat: resolvedCompat,
         mediaInput: mergeModelMediaInput(
           discoveredModel.mediaInput,
@@ -1060,6 +1073,7 @@ function resolveConfiguredFallbackModel(params: {
   });
   const fallbackTransport = resolveProviderTransport({
     provider,
+    modelId,
     api:
       normalizeResolvedTransportApi(configuredModel?.api) ??
       resolveConfiguredProviderDefaultApi({
@@ -1133,6 +1147,9 @@ function resolveConfiguredFallbackModel(params: {
           ...(resolvedParams ? { params: resolvedParams } : {}),
           ...(requestTimeoutMs !== undefined ? { requestTimeoutMs } : {}),
           headers: requestConfig.headers,
+          ...(providerConfig?.authHeader !== undefined
+            ? { authHeader: providerConfig.authHeader }
+            : {}),
           compat: fallbackCompat,
           mediaInput: fallbackMediaInput,
         } as Model,
@@ -1674,5 +1691,5 @@ function buildMissingProviderModelRegistrationHint(params: {
   if (hasProviderModel) {
     return undefined;
   }
-  return `Found agents.defaults.models["${agentModelKey}"], but no matching models.providers["${params.provider}"].models[] entry. Add { "id": "${params.modelId}" } to models.providers["${params.provider}"].models[] to register this provider model.`;
+  return `Found agents.defaults.models["${agentModelKey}"], but no matching models.providers["${params.provider}"].models[] entry. Add { "id": "${params.modelId}", "name": "${params.modelId}" } to models.providers["${params.provider}"].models[] to register this provider model. For custom or proxy providers, also set api and baseUrl so requests route to the intended endpoint. See https://docs.openclaw.ai/concepts/model-providers.`;
 }

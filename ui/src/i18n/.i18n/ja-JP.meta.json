@@ -1,10 +1,10 @@
 {
   "fallbackKeys": [
-    "skillWorkshop.viewSwitcher.board",
-    "skillWorkshop.viewSwitcher.boardTitle",
-    "skillWorkshop.viewSwitcher.label",
-    "skillWorkshop.viewSwitcher.today",
-    "skillWorkshop.viewSwitcher.todayTitle",
+    "cron.jobDetail.command",
+    "cron.jobDetail.cwd",
+    "skillWorkshop.header.useCurrentChat",
+    "skillWorkshop.header.useCurrentChatAria",
+    "skillWorkshop.header.useCurrentChatTooltip",
     "workboard.dependencies",
     "workboard.dependenciesBlocked",
     "workboard.dependenciesBlockedTitle",
@@ -34,11 +34,11 @@
     "workboard.unknownStatus",
     "workboard.viewDetails"
   ],
-  "generatedAt": "2026-06-03T06:31:04.133Z",
+  "generatedAt": "2026-06-10T18:02:10.997Z",
   "locale": "ja-JP",
   "model": "claude-opus-4-8",
   "provider": "anthropic",
-  "sourceHash": "ce63b96039a96fd989fc4571837dcee90c48104d95e863e8ab8c482ad7d688a3",
+  "sourceHash": "d31dac3a16f784afca7d2c01a614ceeb2d90bb455a67114a0830a3c045210715",
   "totalKeys": 1335,
   "translatedKeys": 1302,
   "workflow": 1
