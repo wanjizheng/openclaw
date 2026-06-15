@@ -23,7 +23,11 @@ import { addTranscriptEntry, transitionState } from "./state.js";
 import { persistCallRecord } from "./store.js";
 import { resolveVoiceCallSecondsTimerDelayMs } from "./timer-delays.js";
 import { clearTranscriptWaiter, waitForFinalTranscript } from "./timers.js";
-import { generateDtmfRedirectTwiml, generateNotifyTwiml } from "./twiml.js";
+import {
+  generateDtmfRedirectTwiml,
+  generateHybridNotifyTwiml,
+  generateNotifyTwiml,
+} from "./twiml.js";
 
 type InitiateContext = Pick<
   CallManagerContext,
@@ -201,8 +205,23 @@ export async function initiateCall(
     let preConnectTwiml: string | undefined;
     if (mode === "notify" && initialMessage) {
       const pollyVoice = mapVoiceToPolly(resolvePreferredTtsVoice(ctx.config));
-      inlineTwiml = generateNotifyTwiml(initialMessage, pollyVoice);
-      console.log(`[voice-call] Using inline TwiML for notify mode (voice: ${pollyVoice})`);
+      // Fork custom: hybrid mode keeps the call alive (Pause 30s) instead of
+      // auto-hanging-up, so the hybrid Call Update <Play> path has time to
+      // inject the ElevenLabs-generated mp3 mid-call. Without this, Twilio
+      // completes the call as soon as <Say> finishes and
+      // `client.calls(sid).update({twiml:<Play>})` fails with
+      // "400 Call is not in-progress. Cannot redirect." — the
+      // `[voice-call][hybrid] Call Update for first play failed` error in
+      // the gateway log.
+      if (ctx.config.streaming?.hybridMode) {
+        inlineTwiml = generateHybridNotifyTwiml(initialMessage, pollyVoice);
+        console.log(
+          `[voice-call] Using hybrid inline TwiML for notify mode (voice: ${pollyVoice}, pause=30s for Call Update)`,
+        );
+      } else {
+        inlineTwiml = generateNotifyTwiml(initialMessage, pollyVoice);
+        console.log(`[voice-call] Using inline TwiML for notify mode (voice: ${pollyVoice})`);
+      }
     } else if (dtmfSequence) {
       preConnectTwiml = generateDtmfRedirectTwiml(dtmfSequence, ctx.webhookUrl);
       console.log(
