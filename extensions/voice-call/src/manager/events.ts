@@ -11,7 +11,6 @@ import { endCall } from "./outbound.js";
 import { addTranscriptEntry, transitionState } from "./state.js";
 import { persistCallRecord } from "./store.js";
 import {
-  ensureMaxDurationTimerForLiveCall,
   resolveTranscriptWaiter,
   startMaxDurationTimer,
 } from "./timers.js";
@@ -281,14 +280,6 @@ export function processEvent(ctx: EventContext, event: NormalizedEvent): void {
       break;
 
     case "call.speaking":
-      ensureMaxDurationTimerForLiveCall({
-        ctx,
-        call,
-        liveAt: event.timestamp,
-        onTimeout: async (callId) => {
-          await endCall(ctx, callId, { reason: "timeout" });
-        },
-      });
       transitionState(call, "speaking");
       break;
 
@@ -309,14 +300,6 @@ export function processEvent(ctx: EventContext, event: NormalizedEvent): void {
         }
         addTranscriptEntry(call, "user", event.transcript);
       }
-      ensureMaxDurationTimerForLiveCall({
-        ctx,
-        call,
-        liveAt: event.timestamp,
-        onTimeout: async (callId) => {
-          await endCall(ctx, callId, { reason: "timeout" });
-        },
-      });
       transitionState(call, "listening");
       break;
 
