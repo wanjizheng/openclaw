@@ -2,7 +2,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
-import { readRuntimeToolCoverageMetadata } from "./runtime-tool-metadata.js";
+import {
+  type QaRuntimeToolCoverageMetadata,
+  readRuntimeToolCoverageMetadata,
+} from "./runtime-tool-metadata.js";
 import { liveTurnTimeoutMs } from "./suite-runtime-agent-common.js";
 import { readRawQaSessionStore } from "./suite-runtime-agent-session.js";
 import type { QaSuiteRuntimeEnv } from "./suite-runtime-types.js";
@@ -107,7 +110,7 @@ function isHardFailureToolOutputText(text: string) {
   return (
     /\b(?:ENOENT|EACCES|EPERM)\b/u.test(text) ||
     /(?:^|\n)\s*(?:Error|Exception|Failed):/u.test(text) ||
-    /\b(?:no such file|permission denied|forbidden)\b/iu.test(text)
+    /\b(?:disabled|forbidden|no provider|no such file|permission denied|unavailable)\b/iu.test(text)
   );
 }
 
@@ -239,6 +242,12 @@ function readBooleanTrue(value: unknown) {
   return value === true;
 }
 
+const FAILURE_LIKE_TOOL_RESULT_RE =
+  /\b(?:denied|enoent|error|exception|fail(?:ed|ure)?|forbidden|invalid|missing|not found|permission)\b/iu;
+
+const REQUIRED_FIELD_TOOL_RESULT_RE =
+  /(?:^|[\n:,({[]\s*)["']?[A-Z_][A-Z0-9_.[\]-]*["']?\s+(?:is\s+)?required\b/iu;
+
 function isFailureLikeToolResult(params: {
   type?: string;
   text: string;
@@ -247,9 +256,9 @@ function isFailureLikeToolResult(params: {
 }) {
   return (
     isStructuredFailureToolResult(params) ||
-    /\b(?:denied|enoent|error|exception|fail(?:ed|ure)?|forbidden|invalid|missing|not found|permission)\b/iu.test(
-      params.text,
-    )
+    isHardFailureToolOutputText(params.text) ||
+    FAILURE_LIKE_TOOL_RESULT_RE.test(params.text) ||
+    REQUIRED_FIELD_TOOL_RESULT_RE.test(params.text)
   );
 }
 
@@ -548,6 +557,37 @@ function formatCodexNativeWorkspaceDetails(params: {
     .join("\n");
 }
 
+function formatReportOnlyMockDetails(params: {
+  toolName: string;
+  happyRequest: QaRuntimeToolFixtureRequest;
+  failureRequest: QaRuntimeToolFixtureRequest;
+}) {
+  return [
+    `${params.toolName} mock provider report-only: direct tool output is not required by this fixture`,
+    `${params.toolName} mock provider happy planned args (diagnostic only): ${formatPlannedToolArgs(params.happyRequest.plannedToolArgs)}`,
+    `${params.toolName} mock provider failure planned args (diagnostic only): ${formatPlannedToolArgs(params.failureRequest.plannedToolArgs)}`,
+  ].join("\n");
+}
+
+function isAsyncReportOnlyMockCoverage(metadata: QaRuntimeToolCoverageMetadata) {
+  return !metadata.required && /\basync\b/iu.test(metadata.action ?? "");
+}
+
+function plannedRequestHasDeniedInputFailure(request: QaRuntimeToolFixtureRequest) {
+  return (
+    isRecord(request.plannedToolArgs) &&
+    request.plannedToolArgs["__qaFailureMode"] === "denied-input"
+  );
+}
+
+function plannedRequestHasPrompt(request: QaRuntimeToolFixtureRequest) {
+  return (
+    isRecord(request.plannedToolArgs) &&
+    typeof request.plannedToolArgs.prompt === "string" &&
+    request.plannedToolArgs.prompt.trim().length > 0
+  );
+}
+
 function formatKnownHarnessGapDetails(toolName: string, config: QaRuntimeToolFixtureConfig) {
   const knownHarnessGap = isKnownHarnessGap(config.knownHarnessGap) ? config.knownHarnessGap : {};
   const issue = readString(knownHarnessGap.issue);
@@ -703,6 +743,39 @@ export async function runRuntimeToolFixture(
     excludedPromptSnippet: failurePromptSnippet,
     toolName,
   });
+  const failurePlannedRequest = findPlannedRequest({
+    requests,
+    requestCountBefore,
+    promptSnippet: failurePromptSnippet,
+    toolName,
+  });
+  const failureRequest = findExecutedRequest({
+    requests,
+    requestCountBefore,
+    promptSnippet: failurePromptSnippet,
+    toolName,
+  });
+  if (
+    isAsyncReportOnlyMockCoverage(metadata) &&
+    happyPlannedRequest &&
+    failurePlannedRequest &&
+    !happyRequest
+  ) {
+    if (!plannedRequestHasPrompt(happyPlannedRequest)) {
+      throw new Error(`expected mock happy-path prompt args for ${toolName}`);
+    }
+    if (!plannedRequestHasDeniedInputFailure(failurePlannedRequest)) {
+      throw new Error(`expected mock failure-path denied-input args for ${toolName}`);
+    }
+    if (failureRequest && !requestHasFailureLikeToolOutput(failureRequest.outputRequest)) {
+      throw new Error(`expected mock failure-path tool failure output for ${toolName}`);
+    }
+    return formatReportOnlyMockDetails({
+      toolName,
+      happyRequest: happyPlannedRequest,
+      failureRequest: failurePlannedRequest,
+    });
+  }
   if (!happyRequest) {
     if (dynamicExposureIntentionallyExcluded) {
       return formatCodexNativeWorkspaceDetails({
@@ -727,18 +800,6 @@ export async function runRuntimeToolFixture(
     }
     throw new Error(`expected mock happy-path successful tool output for ${toolName}`);
   }
-  const failurePlannedRequest = findPlannedRequest({
-    requests,
-    requestCountBefore,
-    promptSnippet: failurePromptSnippet,
-    toolName,
-  });
-  const failureRequest = findExecutedRequest({
-    requests,
-    requestCountBefore,
-    promptSnippet: failurePromptSnippet,
-    toolName,
-  });
   if (!failureRequest) {
     if (dynamicExposureIntentionallyExcluded) {
       return formatCodexNativeWorkspaceDetails({

@@ -10,7 +10,10 @@ import { findCall } from "./lookup.js";
 import { endCall } from "./outbound.js";
 import { addTranscriptEntry, transitionState } from "./state.js";
 import { persistCallRecord } from "./store.js";
-import { resolveTranscriptWaiter, startMaxDurationTimer } from "./timers.js";
+import {
+  resolveTranscriptWaiter,
+  startMaxDurationTimer,
+} from "./timers.js";
 
 type EventContext = Pick<
   CallManagerContext,
