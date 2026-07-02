@@ -33,10 +33,28 @@ PUSH="true"
 SKIP_INSTALL="false"
 SKIP_BUILD="false"
 SKIP_DEPLOY="false"
-CONFLICT_STRATEGY="prefer-custom"
+# Conflict strategy: by default FAIL-LOUD on the first conflict instead of
+# silently picking one side. The previous prefer-custom default silently
+# broke cross-file symbol references when a cherry-pick conflict happened
+# in a "near-uncontested" file (auto-resolve dropped an upstream function
+# while a parallel non-conflicting file kept its new caller of that
+# function). See `verify_cross_file_symbols` for the catching layer.
+#
+# Escape hatch: set OPENCLAW_ALLOW_PREFER_CUSTOM=true (or pass
+# --conflict-strategy prefer-custom) to fall back to the legacy
+# auto-resolve. Only do this when you have reviewed the resulting
+# release branch and confirmed every import resolves; the lint is
+# authoritative.
+if [[ "${OPENCLAW_ALLOW_PREFER_CUSTOM:-false}" == "true" ]]; then
+  CONFLICT_STRATEGY="prefer-custom"
+else
+  CONFLICT_STRATEGY="stop"
+fi
 SYNC_CUSTOM_MAIN="false"
 MAX_CUSTOM_COMMITS="300"
 AUTO_SLIM_COMMITS="true"
+REUSE_EXISTING="false"
+STRICT_TYPECHECK="true"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 log()  { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
@@ -55,7 +73,9 @@ while (( $# )); do
     --sync-custom-main)  SYNC_CUSTOM_MAIN="true"; shift ;;
     --max-custom-commits) MAX_CUSTOM_COMMITS="${2:-300}"; shift 2 ;;
     --no-auto-slim-commits) AUTO_SLIM_COMMITS="false"; shift ;;
-    --conflict-strategy) CONFLICT_STRATEGY="${2:-prefer-custom}"; shift 2 ;;
+    --conflict-strategy) CONFLICT_STRATEGY="${2:-stop}"; shift 2 ;;
+    --reuse-existing)     REUSE_EXISTING="true"; shift ;;
+    --no-strict-typecheck) STRICT_TYPECHECK="false"; shift ;;
     --deploy-target)     DEPLOY_TARGET="${2:?}"; shift 2 ;;
     *) die "unknown arg: $1" ;;
   esac
@@ -63,6 +83,11 @@ done
 
 [[ "$CONFLICT_STRATEGY" =~ ^(prefer-custom|stop)$ ]] \
   || die "--conflict-strategy must be prefer-custom|stop"
+
+if [[ "$CONFLICT_STRATEGY" == "prefer-custom" ]]; then
+  log "WARN: --conflict-strategy=prefer-custom is unsafe across re-port chains (cross-file symbol drop)."
+  log "      Maintain it manually and run verify_cross_file_symbols after the build, or set OPENCLAW_ALLOW_PREFER_CUSTOM=true explicitly to suppress this message."
+fi
 
 [[ "$MAX_CUSTOM_COMMITS" =~ ^[0-9]+$ ]] \
   || die "--max-custom-commits must be a non-negative integer"
@@ -152,6 +177,365 @@ is_low_memory_host() {
 
   # Treat hosts below 12 GiB RAM as low-memory for this build pipeline.
   (( mem_total_kb > 0 && mem_total_kb < 12582912 ))
+}
+
+# ── Cross-file symbol lint ────────────────────────────────────────────────────
+# Static cross-file import→export integrity check for the voice-call extension
+# (where fork customisation concentrates). Runs after cherry-picks and before
+# pnpm install. tsdown's bundler does validate imports — but only after a
+# 100-second compile, and only at build time. This pre-build lint catches the
+# exact failure mode where:
+#   * cherry-pick A conflicts on `manager/timers.ts` (auto-resolved to
+#     "ours" → drops an upstream function)
+#   * cherry-pick B has no conflict on `manager/events.ts` (gets the new
+#     caller of that function)
+#   * Result: events.ts imports a non-existent symbol → tsdown exits with
+#     [MISSING_EXPORT] 100 seconds later.
+#
+# Scans all .ts files under extensions/voice-call/src/manager/, extracts named
+# imports from relative paths, then resolves each name against the target
+# file's `export` statements. Missing symbols fail with rc=10 and a clear
+# file:line list. Cheap (pure bash + grep), exit-fast.
+#
+# This check is INTENTIONALLY conservative — false positives are acceptable
+# at 0%; false negatives are not (we'd rather block a build than deploy a
+# broken dist). The lint catches dangling imports; downstream semantics are
+# still on the operator (the lint will not catch "wrong constant value").
+
+verify_cross_file_symbols() {
+  local root="extensions/voice-call/src"
+  [[ -d "$root" ]] || { log "[ok] cross-file symbol lint skipped: $root not present"; return 0; }
+
+  local exit_code=0
+  local -a missing_refs=()
+
+  # Collect all .ts files under the manager/ subtree (most-forked surface)
+  # and the wider src/ tree (anything `from "./..."` could point to).
+  local -a ts_files
+  mapfile -t ts_files < <(find "$root" -type f -name '*.ts' -not -path '*/node_modules/*' 2>/dev/null)
+
+  for src_file in "${ts_files[@]}"; do
+    # Pull every `import { ... } from "./relative/path"` statement, joining
+    # multi-line imports (which span `import {\n  ...\n} from "..."`) into a
+    # single virtual line. The bug we're hunting (7/1 cross-file drift) was
+    # inside a multi-line import in events.ts that a single-line grep would
+    # miss.
+    #
+    # Approach: read the whole file into a bash array of lines, find each
+    # line that opens an `import {` without a `from` on the same line, then
+    # walk forward collecting continuation lines until we hit `} from`.
+    # Avoids the fd-3 dance and process-substitution stdin entanglement
+    # that bit the earlier `while read <&3` attempt.
+    local -a file_lines=()
+    mapfile -t file_lines < "$src_file"
+    local -a import_lines=()
+    local i
+    for ((i=0; i<${#file_lines[@]}; i++)); do
+      local line="${file_lines[$i]}"
+      # Only consider import statements.
+      [[ "$line" =~ ^[[:space:]]*import[[:space:]] ]] || continue
+      if [[ "$line" =~ ^[[:space:]]*import[[:space:]]+(type[[:space:]]+)?\{[[:space:]]*$ ]]; then
+        # Multi-line opener — walk forward until we find `} from "..."`.
+        local accum="$line"
+        local j
+        for ((j=i+1; j<${#file_lines[@]}; j++)); do
+          local next_line="${file_lines[$j]}"
+          accum="${accum}
+${next_line}"
+          if [[ "$next_line" =~ \}[[:space:]]+from[[:space:]]+[\"\'] ]]; then
+            break
+          fi
+          # Safety cap: don't read forever if we never find the close.
+          if [[ ${#accum} -gt 4096 ]]; then
+            break
+          fi
+        done
+        import_lines+=("$accum")
+      else
+        import_lines+=("$line")
+      fi
+    done
+
+    for import_line in "${import_lines[@]}"; do
+      [[ -z "$import_line" ]] && continue
+
+      # ── Form 1: `import { X, Y as Z, type T } from "./spec"`
+      #              captures group 1 = brace list, group 2 = specifier
+      local brace_list="" specifier=""
+      if [[ "$import_line" =~ from[[:space:]]+\"([^\"]+)\" ]] || \
+         [[ "$import_line" =~ from[[:space:]]+\'([^\']+)\' ]]; then
+        specifier="${BASH_REMATCH[1]}"
+      fi
+      # Multi-line imports: collapse to one line for the brace-list sed.
+      # `import {` on line 1 + `}` on the last line + intervening names —
+      # we want `import { A, B, C } from "./spec"` to match the sed regex.
+      local flat_import_line
+      flat_import_line="$(printf '%s' "$import_line" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+      # Extract brace list separately
+      local bl=""
+      bl="$(printf '%s\n' "$flat_import_line" | sed -nE 's/^import[[:space:]]+(type[[:space:]]+)?\{([^}]*)\}[[:space:]]+from.*/\2/p')"
+      if [[ -n "$bl" && -n "$specifier" ]]; then
+        brace_list="$bl"
+      else
+        # ── Form 2: `import Foo from "./spec"` (default import)
+        local default_name=""
+        default_name="$(printf '%s\n' "$flat_import_line" | sed -nE 's/^import[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]+from.*/\1/p')"
+        if [[ -n "$default_name" && "$default_name" != "type" && -n "$specifier" ]]; then
+          brace_list="default"
+        else
+          # Form 3 (`import * as X from "./spec"`) and Form 4
+          # (side-effect `import "./spec"`) — no symbols to verify.
+          continue
+        fi
+      fi
+
+      # Only relative specifiers carry the cross-file risk that broke us.
+      case "$specifier" in
+        .*|/*) ;;
+        *) continue ;;
+      esac
+
+      # Resolve relative to the importing file's directory.
+      local src_dir
+      src_dir="$(dirname "$src_file")"
+      local resolved=""
+      # shellcheck disable=SC2162  # we want word-splitting on /, intentional
+      local piece
+      local -a segs=()
+      # Split src_dir on /
+      local IFS='/'
+      # shellcheck disable=SC2206
+      segs=( $src_dir )
+      unset IFS
+      # Normalize the specifier's leading "./"
+      local spec_norm="$specifier"
+      spec_norm="${spec_norm#./}"
+      # Split specifier on /
+      local -a pieces=()
+      local IFS='/'
+      # shellcheck disable=SC2206
+      pieces=( $spec_norm )
+      unset IFS
+      for piece in "${pieces[@]}"; do
+        case "$piece" in
+          ""|".") ;;
+          "..") [[ ${#segs[@]} -gt 0 ]] && unset 'segs[${#segs[@]}-1]' ;;
+          *) segs+=("$piece") ;;
+        esac
+      done
+      # Join segments
+      resolved=""
+      local s
+      for s in "${segs[@]}"; do
+        resolved="${resolved}/${s}"
+      done
+      # Drop the leading slash we just prepended
+      resolved="${resolved#/}"
+
+      # Add .ts if no extension (.js paths are TS source under pnpm).
+      case "$resolved" in
+        *.ts|*.tsx|*.mts|*.cts|*.js|*.mjs|*.cjs) ;;
+        *) resolved="${resolved}.ts" ;;
+      esac
+
+      # TypeScript resolves `./foo.js` to `./foo.ts` (ESM-style .js import
+      # against .ts source under pnpm). If the literal `.js` file is missing
+      # but the `.ts` sibling exists, rewrite $resolved to the .ts path so
+      # the export-grep finds the actual symbol declarations.
+      if [[ ! -f "$resolved" && "$resolved" == *.js ]]; then
+        local ts_candidate="${resolved%.js}.ts"
+        if [[ -f "$ts_candidate" ]]; then
+          resolved="$ts_candidate"
+        fi
+      fi
+
+      [[ -f "$resolved" ]] || {
+        # Bail silently — TypeScript will surface module-not-found at build
+        # time, and we already have a separate [MISSING_EXPORT] check there.
+        # Don't pile a false positive onto this lint.
+        continue
+      }
+
+      # For each name in the brace list (split on commas, trim, drop
+      # `type X` prefix). Aliases (`X as Y`) are checked by their underlying
+      # name X — the export side just needs to declare X.
+      local raw_name
+      local -a raw_names=()
+      local IFS=','
+      # shellcheck disable=SC2206
+      raw_names=( $brace_list )
+      unset IFS
+      for raw_name in "${raw_names[@]}"; do
+        # Trim whitespace
+        raw_name="${raw_name#"${raw_name%%[![:space:]]*}"}"
+        raw_name="${raw_name%"${raw_name##*[![:space:]]}"}"
+        [[ -z "$raw_name" ]] && continue
+        # Strip `type ` prefix (type-only imports — nothing to runtime-check)
+        raw_name="${raw_name#type }"
+        raw_name="${raw_name#"${raw_name%%[![:space:]]*}"}"
+        raw_name="${raw_name%"${raw_name##*[![:space:]]}"}"
+        [[ -z "$raw_name" ]] && continue
+        # Take left side of `as alias` — the actual imported name
+        local name="${raw_name%% *}"
+        [[ "$name" == "type" ]] && continue
+
+        # Search the target file for either:
+        #   - `export (function|const|let|var|class|interface|type|<NAME>) <name>`
+        #   - `export { ... <name> ... }`
+        #   - `export type { ... <name> ... }`
+        #   - `export default` (when name == "default")
+        if [[ "$name" == "default" ]]; then
+          if grep -qE '^[[:space:]]*export[[:space:]]+default[[:space:]]' "$resolved" \
+             || grep -qE '^[[:space:]]*export[[:space:]]+\{[[:space:]]*default[[:space:]]*\}' "$resolved"; then
+            continue
+          fi
+          missing_refs+=("${src_file}: default from \"${specifier}\" -> ${resolved} (no default export)")
+          exit_code=10
+          continue
+        fi
+
+        # Escaped name for the regex (defensive — symbols are usually
+        # [A-Za-z_$][\w$]* but we don't want to assume)
+        local esc_name
+        esc_name="$(printf '%s' "$name" | sed -E 's/[][^$.*+?(){}|\\]/\\&/g')"
+
+        # export <decl-keyword>? <name> <boundary>
+        if grep -qE "^[[:space:]]*export[[:space:]]+(async[[:space:]]+|abstract[[:space:]]+|declare[[:space:]]+|const[[:space:]]+|let[[:space:]]+|var[[:space:]]+|function[[:space:]]+|class[[:space:]]+|interface[[:space:]]+|type[[:space:]]+|enum[[:space:]]+|namespace[[:space:]]+)*${esc_name}[[:space:]]*[\\(\\<\\{;,=[:space:]]" "$resolved"; then
+          continue
+        fi
+        # export { ... <name> ... } — single-line and multi-line (barrel
+        # re-export `export { X, Y } from "./other";`). Pre-flatten the
+        # target file to one logical line so an `[^}]*` pattern can span
+        # what was originally multiple lines, then run ordinary grep. We
+        # do NOT anchor with `^` because after flattening the line may start
+        # with a leading comment — `export {` will appear mid-line and we
+        # want to match it regardless of position.
+        local flat_resolved
+        flat_resolved="$(tr '\n' ' ' < "$resolved")"
+        if grep -qE "export[[:space:]]+\\{[^}]*\\b${esc_name}\\b[^}]*\\}" <<<"$flat_resolved"; then
+          continue
+        fi
+        # export type { ... <name> ... }
+        if grep -qE "export[[:space:]]+type[[:space:]]+\\{[^}]*\\b${esc_name}\\b[^}]*\\}" <<<"$flat_resolved"; then
+          continue
+        fi
+
+        missing_refs+=("${src_file}: import { ${raw_name} } from \"${specifier}\" -> ${resolved}")
+        exit_code=10
+      done
+    done
+  done
+
+  if (( exit_code != 0 )); then
+    log "[error] cross-file symbol lint failed with ${#missing_refs[@]} missing reference(s):"
+    local ref
+    for ref in "${missing_refs[@]}"; do
+      log "  - ${ref}"
+    done
+    log "[hint]  these are imports that don't resolve to any export in the target file. Common cause:"
+    log "        a forked re-port commit conflicted on the target file and auto-resolve picked"
+    log "        \"ours\" (custom-main version), dropping an upstream symbol while a sibling file"
+    log "        kept its non-conflicting call site. Rebuild by cherry-picking the upstream commit"
+    log "        that added the missing symbol, or remove the dangling call site manually."
+    log "[hint]  set OPENCLAW_ALLOW_PREFER_CUSTOM=true to fall back to legacy auto-resolve (NOT"
+    log "        recommended — at minimum, re-run the build to confirm import drift is benign)."
+    return 10
+  fi
+  log "[ok] cross-file symbol lint passed (${#ts_files[@]} files scanned)"
+  return 0
+}
+
+# ── Strict typecheck gate ─────────────────────────────────────────────────────
+# Runs after `pnpm install` and before `pnpm build` to surface strict-mode
+# type regressions on the voice-call package. pnpm build is transpile-only,
+# which silently drops type errors that would otherwise have caught the
+# cherry-pick drift that produced the 2026-07-01 build failure. We diff
+# against a baseline captured from custom-main (which carries known fork
+# typecheck debt); NEW errors fail the integration build.
+#
+# Toggle: --no-strict-typecheck to disable, or env OPENCLAW_SKIP_STRICT_TYPECHECK=1.
+
+verify_strict_typecheck() {
+  if [[ "$STRICT_TYPECHECK" != "true" ]]; then
+    log "[skip] strict typecheck disabled (--no-strict-typecheck)"
+    return 0
+  fi
+  local baseline_branch="${OPENCLAW_TYPECHECK_BASELINE_BRANCH:-custom-main}"
+  local filter_args=(--filter "@openclaw/voice-call" --filter "@openclaw/voice-call-plugin")
+  local ts_err_file; ts_err_file="$(mktemp)"
+  local baseline_err_file="$WORKSPACE_STATE_DIR/_strict-typecheck-baseline.txt"
+  # $WORKSPACE_STATE_DIR may not exist; fall back to .update next to this script.
+  if [[ -z "${WORKSPACE_STATE_DIR:-}" ]]; then
+    WORKSPACE_STATE_DIR="$ROOT_DIR/tools/custom/.update"
+    mkdir -p "$WORKSPACE_STATE_DIR"
+    baseline_err_file="$WORKSPACE_STATE_DIR/_strict-typecheck-baseline.txt"
+  fi
+
+  log "running strict typecheck (voice-call package)"
+  if ! (set +e
+        pnpm tsgo "${filter_args[@]}" >"$ts_err_file" 2>&1
+        rc=$?
+        exit "$rc") </dev/null; then
+    :
+  fi
+
+  if [[ ! -s "$ts_err_file" ]]; then
+    rm -f "$ts_err_file"
+    log "[ok] strict typecheck passed (no errors emitted)"
+    return 0
+  fi
+
+  # New error filter: tsgo errors look like
+  #   extensions/voice-call/src/.../X.ts:NN:SS - error TSnnnn: <message>
+  # We compare against the baseline's error set by hashable signature.
+  local -A current_sigs=()
+  local sig
+  while IFS= read -r line; do
+    [[ "$line" =~ \.ts:[0-9]+:[0-9]+[[:space:]]+-?[[:space:]]*error[[:space:]]+TS[0-9]+ ]] || continue
+    sig="$(printf '%s' "$line" | sed -E 's/^[^:]+extensions\/voice-call/extensions\/voice-call/' | sed -E 's/[0-9]+:[0-9]+/<pos>/g')"
+    current_sigs["$sig"]=1
+  done <"$ts_err_file"
+
+  if [[ ! -f "$baseline_err_file" ]]; then
+    log "[info] strict typecheck baseline missing; capturing current as baseline"
+    cp "$ts_err_file" "$baseline_err_file"
+    log "[warn] captured ${#current_sigs[@]} typecheck error signature(s) into baseline. Next run will diff against it."
+    log "[hint]  review $baseline_err_file to confirm expected fork typecheck debt; or delete it and re-run for a fresh baseline."
+    rm -f "$ts_err_file"
+    return 0
+  fi
+
+  local -A baseline_sigs=()
+  while IFS= read -r line; do
+    [[ "$line" =~ \.ts:[0-9]+:[0-9]+[[:space:]]+-?[[:space:]]*error[[:space:]]+TS[0-9]+ ]] || continue
+    sig="$(printf '%s' "$line" | sed -E 's/^[^:]+extensions\/voice-call/extensions\/voice-call/' | sed -E 's/[0-9]+:[0-9]+/<pos>/g')"
+    baseline_sigs["$sig"]=1
+  done <"$baseline_err_file"
+
+  local -a new_errors=()
+  local -a fixed_errors=()
+  for sig in "${!current_sigs[@]}"; do
+    [[ -z "${baseline_sigs[$sig]+x}" ]] && new_errors+=("$sig")
+  done
+  for sig in "${!baseline_sigs[@]}"; do
+    [[ -z "${current_sigs[$sig]+x}" ]] && fixed_errors+=("$sig")
+  done
+
+  if (( ${#new_errors[@]} > 0 )); then
+    log "[error] strict typecheck introduced ${#new_errors[@]} new error signature(s) vs baseline:"
+    for sig in "${new_errors[@]}"; do
+      log "  + $sig"
+    done
+    log "[hint]  these are NEW type errors from the cherry-pick — they don't exist on $baseline_branch."
+    log "        The most common cause is a stale cross-file import (see verify_cross_file_symbols)."
+    log "        Manually fix or extend baseline: $baseline_err_file"
+    rm -f "$ts_err_file"
+    return 11
+  fi
+
+  log "[ok] strict typecheck pass: ${#current_sigs[@]} current errors, ${#baseline_sigs[@]} baseline errors, ${#fixed_errors[@]} fixed since baseline"
+  rm -f "$ts_err_file"
+  return 0
 }
 
 SECONDS=0
@@ -262,6 +646,26 @@ is_legacy_autoupdate_subject() {
     || [[ "$subject" == "Revert \"version change\"" ]]
 }
 
+# Upstream re-port commits (`feat(upgrade): re-port <old-tag> custom changes
+# onto <new-tag>`) capture a stale snapshot of the fork vs an OLD upstream
+# base. Re-applying them onto a much newer base via cherry-pick re-creates
+# the very cross-file drift that broke the 2026-07-01 release-custom build
+# (the `feat(upgrade): re-port v2026.5.28 custom changes onto v2026.6.1`
+# commit, cherry-picked onto v2026.6.11, caused timers.ts to lose its
+# upstream `ensureMaxDurationTimerForLiveCall` export while events.ts
+# kept its new caller of that function). Drop these from the cherry-pick
+# list. If the cherry-pick is genuinely needed for a specific file path,
+# it'll be picked up via the per-file diff in the integration script's
+# branch creation step (release branch from <LATEST_TAG>); the re-port
+# itself is NOT needed because the fork's custom-main already reflects
+# the merged state.
+is_upstream_re_port_subject() {
+  local subject="$1"
+  [[ "$subject" =~ ^feat\(upgrade\):[[:space:]]+re-port[[:space:]].+custom[[:space:]]changes[[:space:]]+onto[[:space:]] ]] \
+    && return 0
+  return 1
+}
+
 is_protected_custom_script_path() {
   local file_path="$1"
   [[ "$file_path" == "tools/custom/release-integrate-and-build.sh" ]] \
@@ -299,12 +703,16 @@ for sha in "${CUSTOM_COMMITS[@]}"; do
     log "  skip (legacy auto-update commit): $(git --no-pager log --oneline -1 "$sha")"
     continue
   fi
+  if is_upstream_re_port_subject "$subject"; then
+    log "  skip (re-port commit; unsafe across major-version drift): $(git --no-pager log --oneline -1 "$sha")"
+    continue
+  fi
   FILTERED_CUSTOM_COMMITS+=("$sha")
 done
 CUSTOM_COMMITS=("${FILTERED_CUSTOM_COMMITS[@]}")
 
 if (( ${#CUSTOM_COMMITS[@]} == 0 )); then
-  die "all candidate custom commits were filtered out as legacy auto-update commits"
+  die "all candidate custom commits were filtered out as legacy auto-update / re-port commits"
 fi
 
 log "found ${#CUSTOM_COMMITS[@]} custom commit(s) to cherry-pick:"
@@ -316,8 +724,50 @@ done
 # 6. Create release branch from tag + cherry-pick custom commits
 # ══════════════════════════════════════════════════════════════════════════════
 TARGET_BRANCH="release-custom/${LATEST_TAG}"
-step "create $TARGET_BRANCH from $LATEST_TAG"
-git checkout -B "$TARGET_BRANCH" "$LATEST_TAG" --quiet
+
+# ── --reuse-existing fast-path ────────────────────────────────────────────────
+# Used by the auto-update orchestrator when it has detected that custom-main
+# already contains the integration for $LATEST_TAG (release-custom/<tag> has
+# been merged into custom-main's first-parent). In that case the cherry-pick
+# step would be a no-op duplicated work — skip straight to rebuilding the
+# existing release branch (still re-running pnpm install + pnpm build to
+# refresh dist/ before deploy).
+#
+# Pre-conditions for skipping:
+#   1. $REUSE_EXISTING = "true" (set by `--reuse-existing`)
+#   2. refs/heads/$TARGET_BRANCH exists locally
+#   3. The branch's first non-merge parent is exactly $LATEST_TAG (i.e. it's
+#      an integration for this tag, not for some older tag the user forgot
+#      to clean up)
+#   4. The branch has at least one commit past $LATEST_TAG (i.e. it isn't an
+#      empty branch pointing right at the tag)
+if [[ "$REUSE_EXISTING" == "true" ]]; then
+  if ! git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
+    log "[warn] --reuse-existing requested but refs/heads/$TARGET_BRANCH missing; falling back to full pipeline"
+    REUSE_EXISTING="false"
+  elif ! git merge-base --is-ancestor "$LATEST_TAG" "$TARGET_BRANCH"; then
+    log "[warn] --reuse-existing but $TARGET_BRANCH doesn't descend from $LATEST_TAG; falling back to full pipeline"
+    REUSE_EXISTING="false"
+  else
+    # Count commits the branch has past the tag — must be > 0 to be a real
+    # integration (otherwise it's just an empty pointer at the tag).
+    commits_past_tag=$(git rev-list --count "$LATEST_TAG".."$TARGET_BRANCH" 2>/dev/null || echo 0)
+    if (( commits_past_tag <= 0 )); then
+      log "[warn] --reuse-existing but $TARGET_BRANCH has no commits past $LATEST_TAG; falling back to full pipeline"
+      REUSE_EXISTING="false"
+    fi
+  fi
+fi
+
+if [[ "$REUSE_EXISTING" == "true" ]]; then
+  step "reuse $TARGET_BRANCH (skip cherry-pick; re-run build)"
+  log "[info] --reuse-existing: custom-main's integrator already produced $TARGET_BRANCH."
+  log "[info] cherry-pick step skipped; will refresh pnpm install + pnpm build then deploy."
+  git checkout "$TARGET_BRANCH" --quiet
+else
+  step "create $TARGET_BRANCH from $LATEST_TAG"
+  git checkout -B "$TARGET_BRANCH" "$LATEST_TAG" --quiet
+fi
 
 cherry_pick_one() {
   local sha="$1"
@@ -383,6 +833,19 @@ done
 sync_protected_scripts_from_custom_main
 
 log "cherry-pick complete ($(elapsed))"
+
+# ── Cross-file symbol lint (post-cherry-pick, pre-install) ────────────────────
+# Detects the failure mode where a cherry-pick conflict auto-resolved to
+# drop an upstream symbol while a non-conflicting sibling file kept its
+# new caller of that symbol. Runs in <1s on the voice-call subtree; fails
+# with rc=10 before the 100-second `pnpm build` even starts.
+verify_cross_file_symbols || {
+  rc=$?
+  if [[ "$rc" -eq 10 ]]; then
+    die "cross-file symbol lint failed (rc=10); see [error] lines above for file:line list"
+  fi
+  exit "$rc"
+}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 7. Build
@@ -457,6 +920,20 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
 
   step "pnpm build"
   "${BUILD_CMD[@]}" 2>&1 | tail -10
+
+  # ── Strict typecheck gate (post-build, pre-deploy) ────────────────────────
+  # pnpm build is transpile-only and silently drops type errors. This catches
+  # them BEFORE deploy, with a baseline diff against custom-main so the
+  # known fork typecheck debt doesn't fail the build.
+  verify_strict_typecheck || {
+    rc=$?
+    log "[error] strict typecheck gate failed (rc=$rc); the cherry-pick introduced"
+    log "        new type errors that don't exist on custom-main. Manually fix the"
+    log "        listed signatures, or extend the baseline (delete the baseline"
+    log "        file at $WORKSPACE_STATE_DIR/_strict-typecheck-baseline.txt and re-run)."
+    exit "$rc"
+  }
+
   step "pnpm ui:build"
   "${UI_BUILD_CMD[@]}" 2>&1 | tail -5
   log "build complete ($(elapsed))"
