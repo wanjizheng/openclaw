@@ -33,6 +33,7 @@ import { HybridCrHandler } from "./hybrid/cr-handler.js";
 import type { CallManager } from "./manager.js";
 import type { MediaStreamConfig } from "./media-stream.js";
 import { MediaStreamHandler } from "./media-stream.js";
+import { normalizePath } from "./path-utils.js";
 import type { VoiceCallProvider } from "./providers/base.js";
 import { isProviderStatusTerminal } from "./providers/shared/call-status.js";
 import type { TwilioProvider } from "./providers/twilio.js";
@@ -575,8 +576,25 @@ export class VoiceCallWebhookServer {
             this.ensureCrHandler().handleUpgrade(request, socket, head);
             return;
           }
-          if (path === streamPath && this.mediaStreamHandler) {
-            this.mediaStreamHandler?.handleUpgrade(request, socket, head);
+          if (this.mediaStreamHandler) {
+            // Match the realtime handler's strict path-boundary rule so the
+            // trailing `/{token}` that Twilio appends to its TwiML <Stream>
+            // url still routes here. Without this, an exact equality check
+            // against the configured streamPath would reject every media
+            // stream connection (path is `/voice/stream/<token>`, not the
+            // bare `/voice/stream`). Sibling prefixes that happen to share
+            // a leading segment (e.g. `/voice/stream-other`) are still
+            // rejected because the slash-delimited boundary is required.
+            const normalizedStreamPath = normalizePath(streamPath);
+            const pathMatches =
+              normalizedStreamPath === "/" ||
+              path === normalizedStreamPath ||
+              path.startsWith(`${normalizedStreamPath}/`);
+            if (pathMatches) {
+              this.mediaStreamHandler.handleUpgrade(request, socket, head);
+            } else {
+              socket.destroy();
+            }
           } else {
             socket.destroy();
           }
