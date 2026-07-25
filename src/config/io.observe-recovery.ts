@@ -113,8 +113,26 @@ type ConfigReadRecoveryParams = {
   configPath: string;
   raw: string;
   parsed: unknown;
-  validateBackup?: (backup: { raw: string; parsed: unknown }) => Promise<boolean>;
-  validateBackupSync?: (backup: { raw: string; parsed: unknown }) => boolean;
+  /**
+   * Runtime validity gate. Receives the candidate's source (`last-good` or
+   * backup) so the validator can reject a stale `.last-good` snapshot from an
+   * older release while still accepting a current-release `.bak`. The
+   * validator is invoked for BOTH candidates; rejection of `.last-good`
+   * causes the picker to fall back to `.bak`, rejection of `.bak` aborts
+   * recovery. Keep the validator side-effect free.
+   */
+  validateBackup?: (backup: {
+    source: "last-good" | "backup";
+    path: string;
+    raw: string;
+    parsed: unknown;
+  }) => Promise<boolean>;
+  validateBackupSync?: (backup: {
+    source: "last-good" | "backup";
+    path: string;
+    raw: string;
+    parsed: unknown;
+  }) => boolean;
   allowBackupRecovery?: () => Promise<boolean>;
 };
 
@@ -374,8 +392,11 @@ type RecoveryCandidateCommon = {
  *   4. `gateway.mode` present (when required by the caller)
  *
  * The caller still owns the optional `validateBackup` runtime gate, because
- * its async/sync dispatch differs and its semantics are `.bak`-only (the
- * `.last-good` candidate is already verified-good on disk).
+ * its async/sync dispatch differs. The gate is applied to BOTH `.last-good`
+ * and `.bak` candidates — `.last-good` is verified-good at promotion time,
+ * but the runtime's notion of "good" can change between releases, so a
+ * stale snapshot from an older version must still pass current validation
+ * before it can overwrite the main config.
  */
 function verifyRecoveryCandidate(
   params: RecoveryCandidateCommon,
@@ -434,7 +455,12 @@ type PickVerifiedCandidateAsyncParams = {
   backupPath: string;
   backupRaw: string | null;
   requireGatewayMode: boolean;
-  validateBackup?: (backup: { raw: string; parsed: unknown }) => Promise<boolean>;
+  validateBackup?: (backup: {
+    source: "last-good" | "backup";
+    path: string;
+    raw: string;
+    parsed: unknown;
+  }) => Promise<boolean>;
 };
 
 type PickVerifiedCandidateSyncParams = {
@@ -446,7 +472,12 @@ type PickVerifiedCandidateSyncParams = {
   backupPath: string;
   backupRaw: string | null;
   requireGatewayMode: boolean;
-  validateBackupSync?: (backup: { raw: string; parsed: unknown }) => boolean;
+  validateBackupSync?: (backup: {
+    source: "last-good" | "backup";
+    path: string;
+    raw: string;
+    parsed: unknown;
+  }) => boolean;
 };
 
 /**
@@ -464,6 +495,12 @@ type PickVerifiedCandidateSyncParams = {
  * `.bak` is used as a fallback for users on older installs that never wrote a
  * `.last-good`. It is also reached when `.last-good` exists but is corrupt,
  * hash-mismatched, polluted, or missing the required `gateway.mode` shape.
+ *
+ * The runtime `validateBackup` gate is applied to BOTH candidates — a
+ * `.last-good` file was verified-good at promotion time, but the runtime's
+ * notion of "good" can change between releases, so a stale snapshot from an
+ * older version must still pass current validation before it can overwrite
+ * the main config.
  */
 async function pickVerifiedRecoveryCandidateAsync(
   params: PickVerifiedCandidateAsyncParams,
@@ -479,7 +516,23 @@ async function pickVerifiedRecoveryCandidateAsync(
       now: params.now,
     });
     if (lastGood) {
-      return lastGood;
+      if (params.validateBackup) {
+        const approved = await params.validateBackup({
+          source: "last-good",
+          path: params.lastGoodPath,
+          raw: lastGood.raw,
+          parsed: lastGood.parsed,
+        });
+        if (!approved) {
+          params.deps.logger.warn(
+            `Config recovery skipped last-good at ${params.lastGoodPath}: runtime validation rejected it`,
+          );
+        } else {
+          return lastGood;
+        }
+      } else {
+        return lastGood;
+      }
     }
   }
   if (params.backupRaw != null && params.backupRaw !== "") {
@@ -492,7 +545,12 @@ async function pickVerifiedRecoveryCandidateAsync(
       now: params.now,
     });
     if (backup && params.validateBackup) {
-      const approved = await params.validateBackup({ raw: backup.raw, parsed: backup.parsed });
+      const approved = await params.validateBackup({
+        source: "backup",
+        path: params.backupPath,
+        raw: backup.raw,
+        parsed: backup.parsed,
+      });
       if (!approved) {
         return null;
       }
@@ -518,7 +576,23 @@ function pickVerifiedRecoveryCandidateSync(
       now: params.now,
     });
     if (lastGood) {
-      return lastGood;
+      if (params.validateBackupSync) {
+        const approved = params.validateBackupSync({
+          source: "last-good",
+          path: params.lastGoodPath,
+          raw: lastGood.raw,
+          parsed: lastGood.parsed,
+        });
+        if (!approved) {
+          params.deps.logger.warn(
+            `Config recovery skipped last-good at ${params.lastGoodPath}: runtime validation rejected it`,
+          );
+        } else {
+          return lastGood;
+        }
+      } else {
+        return lastGood;
+      }
     }
   }
   if (params.backupRaw != null && params.backupRaw !== "") {
@@ -531,7 +605,12 @@ function pickVerifiedRecoveryCandidateSync(
       now: params.now,
     });
     if (backup && params.validateBackupSync) {
-      const approved = params.validateBackupSync({ raw: backup.raw, parsed: backup.parsed });
+      const approved = params.validateBackupSync({
+        source: "backup",
+        path: params.backupPath,
+        raw: backup.raw,
+        parsed: backup.parsed,
+      });
       if (!approved) {
         return null;
       }

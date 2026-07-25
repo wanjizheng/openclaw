@@ -237,6 +237,14 @@ export type ConfigWriteOptions = {
    */
   allowConfigSizeDrop?: boolean;
   /**
+   * Absolute lower bound for the post-write bytes. When set, the writer
+   * rejects any commit whose final size falls below this floor — even when
+   * `allowConfigSizeDrop` is true. This prevents a transaction-level size-drop
+   * opt-in from being "carried" by further untrusted repairs that shrink the
+   * config beyond what the trusted migration itself produced.
+   */
+  sizeFloorBytes?: number;
+  /**
    * Suppress human-readable output logs (overwrite/anomaly messages).
    * Useful when the caller wants machine-readable output only (--json mode).
    */
@@ -532,13 +540,23 @@ function resolveConfigWriteSuspiciousReasons(params: {
 
 function resolveConfigWriteBlockingReasons(
   suspicious: string[],
-  options: Pick<ConfigWriteOptions, "allowConfigSizeDrop"> = {},
+  options: Pick<ConfigWriteOptions, "allowConfigSizeDrop" | "sizeFloorBytes"> = {},
+  nextBytes: number | null,
 ): string[] {
-  return suspicious.filter(
+  const blocked = suspicious.filter(
     (reason) =>
       (reason.startsWith("size-drop:") && options.allowConfigSizeDrop !== true) ||
       reason === "gateway-mode-removed",
   );
+  if (
+    options.allowConfigSizeDrop === true &&
+    typeof options.sizeFloorBytes === "number" &&
+    typeof nextBytes === "number" &&
+    nextBytes < options.sizeFloorBytes
+  ) {
+    blocked.push(`size-drop-below-floor:${options.sizeFloorBytes}->${nextBytes}`);
+  }
+  return blocked;
 }
 
 async function readConfigHealthState(deps: Required<ConfigIoDeps>): Promise<ConfigHealthState> {
@@ -2543,7 +2561,11 @@ export function createConfigIO(
         }),
       });
     };
-    const blockingReasons = resolveConfigWriteBlockingReasons(suspiciousReasons, options);
+    const blockingReasons = resolveConfigWriteBlockingReasons(
+      suspiciousReasons,
+      options,
+      nextBytes,
+    );
     if (blockingReasons.length > 0 && options.allowDestructiveWrite !== true) {
       const rejectedPath = `${configPath}.rejected.${formatConfigArtifactTimestamp(new Date().toISOString())}`;
       await deps.fs.promises
@@ -2870,6 +2892,7 @@ export async function writeConfigFile(
     afterWrite: options.afterWrite,
     allowDestructiveWrite: options.allowDestructiveWrite,
     allowConfigSizeDrop: options.allowConfigSizeDrop,
+    sizeFloorBytes: options.sizeFloorBytes,
     skipRuntimeSnapshotRefresh: options.skipRuntimeSnapshotRefresh,
     skipOutputLogs: options.skipOutputLogs,
     skipPluginValidation: options.skipPluginValidation,

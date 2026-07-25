@@ -1146,6 +1146,159 @@ describe("config io write", () => {
     });
   });
 
+  it("rejects size-drop writes that fall below the trusted migration floor", async () => {
+    // Regression: a transaction-level size-drop opt-in must not be carried by
+    // a later repair that shrinks the config below the trusted migration's
+    // output size. The floor enforces the exact drop the migration produced.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      // The original config is intentionally much larger than the trusted
+      // migration output so the floor delta is unambiguous. The trusted
+      // migration removed the legacy `channels.telegram` block; an untrusted
+      // repair that also strips `gateway.mode` must be rejected.
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        gateway: { mode: "local" },
+        channels: {
+          telegram: {
+            enabled: true,
+            allowFrom: Array.from({ length: 4000 }, (_, index) => `telegram:${index}`),
+          },
+        },
+      } satisfies ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        valid: true,
+        runtimeConfig: original,
+        config: original,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } satisfies ConfigFileSnapshot;
+
+      // The trusted migration removed the legacy `channels.telegram` block.
+      // Its serialized output (with the writer's version stamp) is the size floor.
+      const trustedMigrationOutput = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        gateway: { mode: "local" },
+      };
+
+      // First write at the floor is allowed: matches what the migration produced.
+      const acceptedWrite = await io.writeConfigFile(trustedMigrationOutput, {
+        allowConfigSizeDrop: true,
+        lastTouchedVersionOverride: "2026.4.30",
+        baseSnapshot,
+      });
+      expect(acceptedWrite.persistedConfig.gateway).toEqual({ mode: "local" });
+      // Read the actual file size — this is the canonical floor the writer
+      // will compute. The writer stamps `lastTouchedAt` onto the candidate,
+      // so the candidate's bare byte size is smaller than what the writer
+      // produces.
+      const trustedMigrationFileStat = await fs.stat(configPath);
+      const floorBytes = trustedMigrationFileStat.size;
+      const acceptedSnapshot = await io.readConfigFileSnapshot();
+
+      // A second write that drops BELOW the floor must be rejected, even
+      // though `allowConfigSizeDrop: true` is still set. The untrusted
+      // repair tries to also strip `gateway.mode`, which is a much deeper
+      // drop than the trusted migration produced.
+      const untrustedRepairOutput = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+      };
+      await expectConfigWriteRejected(
+        io.writeConfigFile(untrustedRepairOutput, {
+          allowConfigSizeDrop: true,
+          sizeFloorBytes: floorBytes,
+          lastTouchedVersionOverride: "2026.4.30",
+          baseSnapshot: acceptedSnapshot,
+        }),
+      );
+    });
+  });
+
+  it("emits 'size-drop-below-floor' as the rejection reason", async () => {
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        gateway: { mode: "local" },
+        channels: {
+          telegram: {
+            enabled: true,
+            allowFrom: Array.from({ length: 4000 }, (_, index) => `telegram:${index}`),
+          },
+        },
+      } satisfies ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        valid: true,
+        runtimeConfig: original,
+        config: original,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } satisfies ConfigFileSnapshot;
+
+      const trustedMigrationOutput = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        gateway: { mode: "local" },
+      };
+
+      // Seed the trusted migration output, then read the actual file size
+      // as the floor (this is what the writer produces after stamp).
+      await io.writeConfigFile(trustedMigrationOutput, {
+        allowConfigSizeDrop: true,
+        lastTouchedVersionOverride: "2026.4.30",
+        baseSnapshot,
+      });
+      const trustedMigrationFileStat = await fs.stat(configPath);
+      const floorBytes = trustedMigrationFileStat.size;
+      const acceptedSnapshot = await io.readConfigFileSnapshot();
+
+      await expect(
+        io
+          .writeConfigFile(
+            { meta: { lastTouchedVersion: "2026.4.30" } },
+            {
+              allowConfigSizeDrop: true,
+              sizeFloorBytes: floorBytes,
+              lastTouchedVersionOverride: "2026.4.30",
+              baseSnapshot: acceptedSnapshot,
+            },
+          )
+          .catch((err: { reasons?: string[] }) => err.reasons),
+      ).resolves.toEqual(
+        expect.arrayContaining([expect.stringMatching(/^size-drop-below-floor:/)]),
+      );
+    });
+  });
+
   it("keeps authored agent provider params during narrowed internal agent writes", async () => {
     await withSuiteHome(async (home) => {
       const configPath = path.join(home, ".openclaw", "openclaw.json");

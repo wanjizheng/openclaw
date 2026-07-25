@@ -1295,6 +1295,134 @@ describe("config observe recovery", () => {
     });
   });
 
+  it("falls back to .bak when .last-good is rejected by validateBackup (async)", async () => {
+    // Regression: `.last-good` is verified-good at promotion time, but the
+    // runtime's notion of "good" can change between releases. A stale snapshot
+    // from an older version must still pass current validation before it can
+    // overwrite the main config — otherwise we restore a config that no
+    // longer matches the current runtime.
+    await withSuiteHome(async (home) => {
+      const { deps, configPath, auditPath, warn } = makeDeps(home);
+      const promoted = await makeSnapshot(configPath, recoverableTelegramConfig);
+      await expect(
+        promoteConfigSnapshotToLastKnownGood({ deps, snapshot: promoted, logger: deps.logger }),
+      ).resolves.toBe(true);
+      // .bak is the genuine recovery source.
+      await fsp.writeFile(
+        `${configPath}.bak`,
+        `${JSON.stringify(recoverableTelegramConfig, null, 2)}\n`,
+        "utf-8",
+      );
+      const clobbered = await writeConfigRaw(configPath, {
+        meta: { lastTouchedVersion: "2026.5.28" },
+      });
+
+      // Reject `.last-good` (the stale snapshot from an older release) but
+      // approve `.bak` (the trusted fallback). The validator distinguishes
+      // candidates by the `source` field the picker passes through.
+      const validateBackup = vi.fn(
+        async (candidate: { source: "last-good" | "backup"; raw: string; parsed: unknown }) =>
+          candidate.source !== "last-good",
+      );
+
+      const recovered = await maybeRecoverSuspiciousConfigRead({
+        deps,
+        configPath,
+        raw: clobbered.raw,
+        parsed: clobbered.parsed,
+        validateBackup,
+      });
+
+      // Restored from .bak because .last-good was rejected by runtime validation.
+      expect(
+        (recovered.parsed as { channels?: { telegram?: unknown } }).channels?.telegram,
+      ).toEqual(recoverableTelegramConfig.channels.telegram);
+      const observe = await readLastObserveEvent(auditPath);
+      expect(observe?.restoredBackupPath).toBe(`${configPath}.bak`);
+      expect(validateBackup).toHaveBeenCalledTimes(2);
+      expectWarnContaining(warn, "last-good at");
+      expectWarnContaining(warn, "runtime validation rejected it");
+    });
+  });
+
+  it("uses .last-good when validateBackup approves it (async)", async () => {
+    await withSuiteHome(async (home) => {
+      const { deps, configPath, auditPath } = makeDeps(home);
+      const promoted = await makeSnapshot(configPath, recoverableTelegramConfig);
+      await expect(
+        promoteConfigSnapshotToLastKnownGood({ deps, snapshot: promoted, logger: deps.logger }),
+      ).resolves.toBe(true);
+      // .bak is intentionally a different (older) shape; recovery must prefer
+      // the runtime-validated .last-good over .bak.
+      const olderBackupConfig = {
+        update: { channel: "beta" },
+        gateway: { mode: "remote" },
+      };
+      await fsp.writeFile(
+        `${configPath}.bak`,
+        `${JSON.stringify(olderBackupConfig, null, 2)}\n`,
+        "utf-8",
+      );
+      const clobbered = await writeConfigRaw(configPath, {
+        meta: { lastTouchedVersion: "2026.5.28" },
+      });
+
+      const recovered = await maybeRecoverSuspiciousConfigRead({
+        deps,
+        configPath,
+        raw: clobbered.raw,
+        parsed: clobbered.parsed,
+        validateBackup: async () => true,
+      });
+
+      expect(
+        (recovered.parsed as { channels?: { telegram?: unknown } }).channels?.telegram,
+      ).toEqual(recoverableTelegramConfig.channels.telegram);
+      const observe = await readLastObserveEvent(auditPath);
+      expect(observe?.restoredBackupPath).toBe(resolveLastKnownGoodConfigPath(configPath));
+    });
+  });
+
+  it("falls back to .bak when .last-good is rejected by validateBackupSync (sync)", async () => {
+    await withSuiteHome(async (home) => {
+      const { deps, configPath, auditPath, warn } = makeDeps(home);
+      const promoted = await makeSnapshot(configPath, recoverableTelegramConfig);
+      await expect(
+        promoteConfigSnapshotToLastKnownGood({ deps, snapshot: promoted, logger: deps.logger }),
+      ).resolves.toBe(true);
+      await fsp.writeFile(
+        `${configPath}.bak`,
+        `${JSON.stringify(recoverableTelegramConfig, null, 2)}\n`,
+        "utf-8",
+      );
+      const clobbered = await writeConfigRaw(configPath, {
+        meta: { lastTouchedVersion: "2026.5.28" },
+      });
+
+      const validateBackupSync = vi.fn(
+        (candidate: { source: "last-good" | "backup"; raw: string; parsed: unknown }) =>
+          candidate.source !== "last-good",
+      );
+
+      const recovered = maybeRecoverSuspiciousConfigReadSync({
+        deps,
+        configPath,
+        raw: clobbered.raw,
+        parsed: clobbered.parsed,
+        validateBackupSync,
+      });
+
+      expect(
+        (recovered.parsed as { channels?: { telegram?: unknown } }).channels?.telegram,
+      ).toEqual(recoverableTelegramConfig.channels.telegram);
+      const observe = await readLastObserveEvent(auditPath);
+      expect(observe?.restoredBackupPath).toBe(`${configPath}.bak`);
+      expect(validateBackupSync).toHaveBeenCalledTimes(2);
+      expectWarnContaining(warn, "last-good at");
+      expectWarnContaining(warn, "runtime validation rejected it");
+    });
+  });
+
   it("mirrors async selection in the sync path (last-good preferred, .bak fallback)", async () => {
     await withSuiteHome(async (home) => {
       const { deps, configPath } = makeDeps(home);

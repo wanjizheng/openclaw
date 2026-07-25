@@ -17,6 +17,11 @@ export async function finalizeDoctorConfigFlow(params: {
    * also trips that flag, which previously let unattended update flows
    * silently shrink the user's config and force a `.bak` → main auto-restore
    * on next startup (#80077 regression vector).
+   *
+   * The opt-in is independent of `shouldRepair`: it is validated against the
+   * FINAL write decision, including the interactive `confirm` path, so a
+   * user-confirmed legacy migration in plain `openclaw doctor` still gets
+   * the size-drop override when the upstream migration step set it.
    */
   allowConfigSizeDropOnWrite?: boolean;
 }): Promise<{
@@ -24,8 +29,8 @@ export async function finalizeDoctorConfigFlow(params: {
   shouldWriteConfig: boolean;
   allowConfigSizeDropOnWrite: boolean;
 }> {
-  const baseShouldWrite = params.shouldRepair && params.pendingChanges;
-  const allowConfigSizeDropOnWrite = baseShouldWrite && params.allowConfigSizeDropOnWrite === true;
+  const requestedSizeDropOptIn = params.allowConfigSizeDropOnWrite === true;
+
   if (!params.shouldRepair && params.pendingChanges) {
     const shouldApply = await params.confirm({
       message: "Apply recommended config repairs now?",
@@ -35,7 +40,7 @@ export async function finalizeDoctorConfigFlow(params: {
       return {
         cfg: params.candidate,
         shouldWriteConfig: true,
-        allowConfigSizeDropOnWrite,
+        allowConfigSizeDropOnWrite: requestedSizeDropOptIn,
       };
     }
     if (params.fixHints.length > 0) {
@@ -48,11 +53,11 @@ export async function finalizeDoctorConfigFlow(params: {
     };
   }
 
-  if (baseShouldWrite) {
+  if (params.shouldRepair && params.pendingChanges) {
     return {
       cfg: params.cfg,
       shouldWriteConfig: true,
-      allowConfigSizeDropOnWrite,
+      allowConfigSizeDropOnWrite: requestedSizeDropOptIn,
     };
   }
 

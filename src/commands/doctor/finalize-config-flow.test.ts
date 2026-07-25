@@ -83,6 +83,46 @@ describe("doctor finalize config flow", () => {
     });
   });
 
+  it("propagates allowConfigSizeDropOnWrite in interactive confirm path", async () => {
+    const confirm = vi.fn(async () => true);
+    const result = await finalizeDoctorConfigFlow({
+      cfg: { channels: { signal: { enabled: true } } },
+      candidate: { channels: { signal: { enabled: false } } },
+      pendingChanges: true,
+      shouldRepair: false,
+      fixHints: [],
+      confirm,
+      note: vi.fn(),
+      allowConfigSizeDropOnWrite: true,
+    });
+
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(result).toEqual({
+      cfg: { channels: { signal: { enabled: false } } },
+      shouldWriteConfig: true,
+      allowConfigSizeDropOnWrite: true,
+    });
+  });
+
+  it("does not propagate allowConfigSizeDropOnWrite when interactive confirm is declined", async () => {
+    const result = await finalizeDoctorConfigFlow({
+      cfg: { channels: { signal: { enabled: true } } },
+      candidate: { channels: { signal: { enabled: false } } },
+      pendingChanges: true,
+      shouldRepair: false,
+      fixHints: [],
+      confirm: async () => false,
+      note: vi.fn(),
+      allowConfigSizeDropOnWrite: true,
+    });
+
+    expect(result).toEqual({
+      cfg: { channels: { signal: { enabled: true } } },
+      shouldWriteConfig: false,
+      allowConfigSizeDropOnWrite: false,
+    });
+  });
+
   it("does not propagate allowConfigSizeDropOnWrite when there are no pending changes", async () => {
     const result = await finalizeDoctorConfigFlow({
       cfg: { channels: { signal: { enabled: true } } },

@@ -33,6 +33,14 @@ type DoctorConfigResult = {
    * on next startup (#80077 regression vector).
    */
   allowConfigSizeDropOnWrite?: boolean;
+  /**
+   * Floor in bytes for the post-write size when `allowConfigSizeDropOnWrite`
+   * is set. The writer rejects any commit that lands below this floor even
+   * with the size-drop opt-in, so the opt-in can only authorize the exact
+   * size drop the trusted migration itself produced — subsequent untrusted
+   * repairs cannot ride along and shrink the config further.
+   */
+  trustedMigrationSizeFloorBytes?: number;
   preservedLegacyRootKeys?: readonly string[];
 };
 
@@ -1097,6 +1105,13 @@ async function runWriteConfigHealth(ctx: DoctorHealthFlowContext): Promise<void>
         // the user's config and force a `.bak` → main auto-restore on next
         // startup (#80077 regression vector).
         allowConfigSizeDrop: ctx.configResult.allowConfigSizeDropOnWrite === true,
+        // Bound the size-drop opt-in to the exact size the trusted migration
+        // produced. Without this, any later repair that further shrinks the
+        // config could ride the transaction-level opt-in and bypass the
+        // guard. The writer rejects drops below this floor.
+        ...(typeof ctx.configResult.trustedMigrationSizeFloorBytes === "number"
+          ? { sizeFloorBytes: ctx.configResult.trustedMigrationSizeFloorBytes }
+          : {}),
         skipPluginValidation:
           ctx.configResult.skipPluginValidationOnWrite === true || updateDoctorRun,
         preservedLegacyRootKeys: ctx.configResult.preservedLegacyRootKeys,
