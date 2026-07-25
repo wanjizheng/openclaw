@@ -1,3 +1,4 @@
+import { collectRemovedPaths } from "../../../config/io.write-prepare.js";
 // Doctor config-flow steps for legacy compatibility and unknown-key cleanup.
 import { formatConfigIssueLines } from "../../../config/issue-format.js";
 import { protectActiveAuthProfileConfig } from "../../doctor-auth-profile-config.js";
@@ -16,6 +17,13 @@ export function applyLegacyCompatibilityStep(params: {
   state: DoctorConfigMutationState;
   issueLines: string[];
   changeLines: string[];
+  /**
+   * Paths that existed in the on-disk `snapshot.parsed` but were removed by
+   * the legacy migration. The writer treats these as the only removals the
+   * migration is authorized to perform; any further removal in the same
+   * transaction is rejected.
+   */
+  removedPaths: string[];
   partiallyValid?: boolean;
 } {
   if (params.snapshot.legacyIssues.length === 0) {
@@ -23,6 +31,7 @@ export function applyLegacyCompatibilityStep(params: {
       state: params.state,
       issueLines: [],
       changeLines: [],
+      removedPaths: [],
     };
   }
 
@@ -42,8 +51,16 @@ export function applyLegacyCompatibilityStep(params: {
       },
       issueLines,
       changeLines: changes,
+      removedPaths: [],
     };
   }
+
+  // Diff snapshot.parsed vs migrated to record exactly which paths the legacy
+  // migration removed. The writer uses this as the white-list of authorized
+  // removals: any path removed by subsequent untrusted repairs cannot ride
+  // this list and will be rejected.
+  const removedPaths = new Set<string>();
+  collectRemovedPaths(params.snapshot.parsed, migrated, "", removedPaths);
 
   return {
     state: {
@@ -67,6 +84,7 @@ export function applyLegacyCompatibilityStep(params: {
     },
     issueLines,
     changeLines: changes,
+    removedPaths: [...removedPaths],
     partiallyValid: partiallyValid === true ? true : undefined,
   };
 }

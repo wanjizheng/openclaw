@@ -1169,6 +1169,74 @@ export function collectChangedPaths(
   }
 }
 
+/**
+ * Collect paths that exist in `before` but are missing in `target`. Paths are
+ * formatted with dotted keys and `[index]` for arrays, matching the
+ * `applyUnknownConfigKeyStep.removed` and `formatConfigPath` convention.
+ *
+ * Used by doctor to authorize per-path removals: the legacy migration step
+ * records which paths it actually removed (or rather, which paths disappeared
+ * from the candidate), and the writer verifies no other paths were removed.
+ */
+function collectRemovedLeafPaths(before: unknown, path: string, output: Set<string>): void {
+  if (Array.isArray(before)) {
+    for (let index = 0; index < before.length; index += 1) {
+      const childPath = path ? `${path}[${index}]` : `[${index}]`;
+      collectRemovedLeafPaths(before[index], childPath, output);
+    }
+    return;
+  }
+  if (isRecord(before)) {
+    for (const key of Object.keys(before)) {
+      const childPath = path ? `${path}.${key}` : key;
+      collectRemovedLeafPaths(before[key], childPath, output);
+    }
+    return;
+  }
+  output.add(path);
+}
+
+export function collectRemovedPaths(
+  before: unknown,
+  target: unknown,
+  path: string,
+  output: Set<string>,
+): void {
+  if (Array.isArray(before)) {
+    if (!Array.isArray(target)) {
+      collectRemovedLeafPaths(before, path, output);
+      return;
+    }
+    for (let index = 0; index < before.length; index += 1) {
+      const childPath = path ? `${path}[${index}]` : `[${index}]`;
+      if (index >= target.length) {
+        output.add(childPath);
+        continue;
+      }
+      collectRemovedPaths(before[index], target[index], childPath, output);
+    }
+    return;
+  }
+  if (isRecord(before)) {
+    if (!isRecord(target)) {
+      collectRemovedLeafPaths(before, path, output);
+      return;
+    }
+    for (const key of Object.keys(before)) {
+      const childPath = path ? `${path}.${key}` : key;
+      if (!Object.hasOwn(target, key) || target[key] === undefined) {
+        output.add(childPath);
+        continue;
+      }
+      collectRemovedPaths(before[key], target[key], childPath, output);
+    }
+    return;
+  }
+  // Primitives: if `target` is also a primitive at this path, the caller is
+  // asking about a value change, not a removal. The parent already handles
+  // the case where `before` had a value but `target` doesn't have the key.
+}
+
 function parentPath(value: string): string {
   if (!value) {
     return "";

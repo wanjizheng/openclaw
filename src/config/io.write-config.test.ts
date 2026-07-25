@@ -1146,15 +1146,16 @@ describe("config io write", () => {
     });
   });
 
-  it("rejects size-drop writes that fall below the trusted migration floor", async () => {
+  it("rejects writes that remove paths the trusted migration did not authorize", async () => {
     // Regression: a transaction-level size-drop opt-in must not be carried by
-    // a later repair that shrinks the config below the trusted migration's
-    // output size. The floor enforces the exact drop the migration produced.
+    // a later repair that removes paths the trusted migration did not
+    // authorize. The path-based authorization enforces the exact removal set
+    // the migration itself produced.
     await withSuiteHome(async (home) => {
       const configPath = path.join(home, ".openclaw", "openclaw.json");
       await fs.mkdir(path.dirname(configPath), { recursive: true });
       // The original config is intentionally much larger than the trusted
-      // migration output so the floor delta is unambiguous. The trusted
+      // migration output so the size-drop signal is unambiguous. The trusted
       // migration removed the legacy `channels.telegram` block; an untrusted
       // repair that also strips `gateway.mode` must be rejected.
       const original = {
@@ -1190,38 +1191,34 @@ describe("config io write", () => {
       } satisfies ConfigFileSnapshot;
 
       // The trusted migration removed the legacy `channels.telegram` block.
-      // Its serialized output (with the writer's version stamp) is the size floor.
+      // The writer authorizes the path diff the migration produced.
       const trustedMigrationOutput = {
         meta: { lastTouchedVersion: "2026.4.30" },
         gateway: { mode: "local" },
       };
+      const authorizedRemovedPaths = ["channels"];
 
-      // First write at the floor is allowed: matches what the migration produced.
+      // First write at the authorized set is allowed: matches what the migration produced.
       const acceptedWrite = await io.writeConfigFile(trustedMigrationOutput, {
         allowConfigSizeDrop: true,
+        authorizedRemovedPaths,
         lastTouchedVersionOverride: "2026.4.30",
         baseSnapshot,
       });
       expect(acceptedWrite.persistedConfig.gateway).toEqual({ mode: "local" });
-      // Read the actual file size — this is the canonical floor the writer
-      // will compute. The writer stamps `lastTouchedAt` onto the candidate,
-      // so the candidate's bare byte size is smaller than what the writer
-      // produces.
-      const trustedMigrationFileStat = await fs.stat(configPath);
-      const floorBytes = trustedMigrationFileStat.size;
       const acceptedSnapshot = await io.readConfigFileSnapshot();
 
-      // A second write that drops BELOW the floor must be rejected, even
+      // A second write that drops ADDITIONAL paths must be rejected, even
       // though `allowConfigSizeDrop: true` is still set. The untrusted
-      // repair tries to also strip `gateway.mode`, which is a much deeper
-      // drop than the trusted migration produced.
+      // repair tries to also strip `gateway.mode`, which is NOT in the
+      // authorized set.
       const untrustedRepairOutput = {
         meta: { lastTouchedVersion: "2026.4.30" },
       };
       await expectConfigWriteRejected(
         io.writeConfigFile(untrustedRepairOutput, {
           allowConfigSizeDrop: true,
-          sizeFloorBytes: floorBytes,
+          authorizedRemovedPaths,
           lastTouchedVersionOverride: "2026.4.30",
           baseSnapshot: acceptedSnapshot,
         }),
@@ -1229,7 +1226,7 @@ describe("config io write", () => {
     });
   });
 
-  it("emits 'size-drop-below-floor' as the rejection reason", async () => {
+  it("emits 'unauthorized-removed-paths' as the rejection reason", async () => {
     await withSuiteHome(async (home) => {
       const configPath = path.join(home, ".openclaw", "openclaw.json");
       await fs.mkdir(path.dirname(configPath), { recursive: true });
@@ -1269,16 +1266,15 @@ describe("config io write", () => {
         meta: { lastTouchedVersion: "2026.4.30" },
         gateway: { mode: "local" },
       };
+      const authorizedRemovedPaths = ["channels"];
 
-      // Seed the trusted migration output, then read the actual file size
-      // as the floor (this is what the writer produces after stamp).
+      // Seed the trusted migration output, then read the snapshot back.
       await io.writeConfigFile(trustedMigrationOutput, {
         allowConfigSizeDrop: true,
+        authorizedRemovedPaths,
         lastTouchedVersionOverride: "2026.4.30",
         baseSnapshot,
       });
-      const trustedMigrationFileStat = await fs.stat(configPath);
-      const floorBytes = trustedMigrationFileStat.size;
       const acceptedSnapshot = await io.readConfigFileSnapshot();
 
       await expect(
@@ -1287,14 +1283,14 @@ describe("config io write", () => {
             { meta: { lastTouchedVersion: "2026.4.30" } },
             {
               allowConfigSizeDrop: true,
-              sizeFloorBytes: floorBytes,
+              authorizedRemovedPaths,
               lastTouchedVersionOverride: "2026.4.30",
               baseSnapshot: acceptedSnapshot,
             },
           )
           .catch((err: { reasons?: string[] }) => err.reasons),
       ).resolves.toEqual(
-        expect.arrayContaining([expect.stringMatching(/^size-drop-below-floor:/)]),
+        expect.arrayContaining([expect.stringMatching(/^unauthorized-removed-paths:/)]),
       );
     });
   });

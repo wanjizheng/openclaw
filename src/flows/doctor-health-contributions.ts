@@ -34,13 +34,12 @@ type DoctorConfigResult = {
    */
   allowConfigSizeDropOnWrite?: boolean;
   /**
-   * Floor in bytes for the post-write size when `allowConfigSizeDropOnWrite`
-   * is set. The writer rejects any commit that lands below this floor even
-   * with the size-drop opt-in, so the opt-in can only authorize the exact
-   * size drop the trusted migration itself produced — subsequent untrusted
-   * repairs cannot ride along and shrink the config further.
+   * Paths that the trusted, named migration steps actually removed in this
+   * flow. The writer uses this as the white-list of authorized removals:
+   * any other path removed by an untrusted repair cannot ride this list
+   * and will be rejected, even when the size-drop opt-in is set.
    */
-  trustedMigrationSizeFloorBytes?: number;
+  authorizedRemovedPaths?: readonly string[];
   preservedLegacyRootKeys?: readonly string[];
 };
 
@@ -1105,12 +1104,15 @@ async function runWriteConfigHealth(ctx: DoctorHealthFlowContext): Promise<void>
         // the user's config and force a `.bak` → main auto-restore on next
         // startup (#80077 regression vector).
         allowConfigSizeDrop: ctx.configResult.allowConfigSizeDropOnWrite === true,
-        // Bound the size-drop opt-in to the exact size the trusted migration
-        // produced. Without this, any later repair that further shrinks the
-        // config could ride the transaction-level opt-in and bypass the
-        // guard. The writer rejects drops below this floor.
-        ...(typeof ctx.configResult.trustedMigrationSizeFloorBytes === "number"
-          ? { sizeFloorBytes: ctx.configResult.trustedMigrationSizeFloorBytes }
+        // Bound the size-drop opt-in to the exact paths the trusted migration
+        // itself removed. The writer diffs the on-disk snapshot against the
+        // projected payload and rejects any commit whose diff removes a path
+        // NOT in this list. Without this, any later repair that further
+        // shrinks the config could ride the transaction-level opt-in and
+        // bypass the guard.
+        ...(ctx.configResult.authorizedRemovedPaths &&
+        ctx.configResult.authorizedRemovedPaths.length > 0
+          ? { authorizedRemovedPaths: ctx.configResult.authorizedRemovedPaths }
           : {}),
         skipPluginValidation:
           ctx.configResult.skipPluginValidationOnWrite === true || updateDoctorRun,

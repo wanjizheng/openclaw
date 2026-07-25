@@ -81,6 +81,7 @@ import { resolveConfigObserveSuspiciousReasons } from "./io.observe-suspicious.j
 import { retainGeneratedOwnerDisplaySecret } from "./io.owner-display-secret.js";
 import {
   collectChangedPaths,
+  collectRemovedPaths,
   createMergePatch,
   formatConfigValidationFailure,
   applyUnsetPathsForWrite,
@@ -237,13 +238,18 @@ export type ConfigWriteOptions = {
    */
   allowConfigSizeDrop?: boolean;
   /**
-   * Absolute lower bound for the post-write bytes. When set, the writer
-   * rejects any commit whose final size falls below this floor — even when
-   * `allowConfigSizeDrop` is true. This prevents a transaction-level size-drop
-   * opt-in from being "carried" by further untrusted repairs that shrink the
-   * config beyond what the trusted migration itself produced.
+   * Paths that the current transaction is explicitly authorized to remove
+   * from the on-disk config. The writer diffs the current snapshot against
+   * the projected payload (after `resolvePersistCandidateForWrite`) and
+   * rejects any commit whose diff removes a path NOT in this list. This
+   * prevents a transaction-level size-drop opt-in from being "carried" by
+   * further untrusted repairs that shrink the config beyond what the
+   * trusted migration itself produced.
+   *
+   * Path format follows `formatConfigPath`: dotted keys with `[index]`
+   * for arrays (e.g. `legacy.gateway`, `agents.list[0].unexpected`).
    */
-  sizeFloorBytes?: number;
+  authorizedRemovedPaths?: readonly string[];
   /**
    * Suppress human-readable output logs (overwrite/anomaly messages).
    * Useful when the caller wants machine-readable output only (--json mode).
@@ -540,23 +546,64 @@ function resolveConfigWriteSuspiciousReasons(params: {
 
 function resolveConfigWriteBlockingReasons(
   suspicious: string[],
-  options: Pick<ConfigWriteOptions, "allowConfigSizeDrop" | "sizeFloorBytes"> = {},
-  nextBytes: number | null,
+  options: Pick<ConfigWriteOptions, "allowConfigSizeDrop" | "authorizedRemovedPaths"> = {},
+  payload: {
+    nextBytes: number | null;
+    unauthorizedRemovedPaths: readonly string[];
+  },
 ): string[] {
   const blocked = suspicious.filter(
     (reason) =>
       (reason.startsWith("size-drop:") && options.allowConfigSizeDrop !== true) ||
       reason === "gateway-mode-removed",
   );
+  // Strict path-based authorization only fires when `authorizedRemovedPaths`
+  // is explicitly set. Callers that opt in to `allowConfigSizeDrop` without
+  // the path list keep the legacy "any removal is allowed" semantics, so
+  // intentional flows (e.g. onboard --reset) can still rewrite the file
+  // without enumerating every removed path. The strict check is what the
+  // doctor flow uses to prevent untrusted repairs from riding the size-drop
+  // opt-in.
   if (
     options.allowConfigSizeDrop === true &&
-    typeof options.sizeFloorBytes === "number" &&
-    typeof nextBytes === "number" &&
-    nextBytes < options.sizeFloorBytes
+    options.authorizedRemovedPaths !== undefined &&
+    payload.unauthorizedRemovedPaths.length > 0
   ) {
-    blocked.push(`size-drop-below-floor:${options.sizeFloorBytes}->${nextBytes}`);
+    blocked.push(
+      `unauthorized-removed-paths:${payload.unauthorizedRemovedPaths.length}:${payload.unauthorizedRemovedPaths.slice(0, 5).join(",")}`,
+    );
   }
   return blocked;
+}
+
+/**
+ * Compute the path diff between the on-disk config and the projected payload,
+ * and return the removed paths that are not in the authorized list.
+ *
+ * The diff snaps onto the writer's own canonical payload-preparation step
+ * (`outputConfig` after `resolvePersistCandidateForWrite` + env-restore +
+ * tilde-restore + unset-paths) so env-var/`$include`/version-stamp differences
+ * cannot poison the comparison. When `authorizedRemovedPaths` is undefined,
+ * the size-drop opt-in is meaningless and any removal is unauthorized.
+ */
+function collectUnauthorizedRemovedPaths(params: {
+  snapshotParsed: unknown;
+  outputConfig: unknown;
+  authorizedRemovedPaths: readonly string[] | undefined;
+}): string[] {
+  const removed = new Set<string>();
+  collectRemovedPaths(params.snapshotParsed, params.outputConfig, "", removed);
+  if (removed.size === 0) {
+    return [];
+  }
+  const authorized = new Set(params.authorizedRemovedPaths ?? []);
+  const unauthorized: string[] = [];
+  for (const path of removed) {
+    if (!authorized.has(path)) {
+      unauthorized.push(path);
+    }
+  }
+  return unauthorized;
 }
 
 async function readConfigHealthState(deps: Required<ConfigIoDeps>): Promise<ConfigHealthState> {
@@ -2561,11 +2608,16 @@ export function createConfigIO(
         }),
       });
     };
-    const blockingReasons = resolveConfigWriteBlockingReasons(
-      suspiciousReasons,
-      options,
+    const blockingReasons = resolveConfigWriteBlockingReasons(suspiciousReasons, options, {
       nextBytes,
-    );
+      unauthorizedRemovedPaths: snapshot.exists
+        ? collectUnauthorizedRemovedPaths({
+            snapshotParsed: snapshot.parsed,
+            outputConfig,
+            authorizedRemovedPaths: options.authorizedRemovedPaths,
+          })
+        : [],
+    });
     if (blockingReasons.length > 0 && options.allowDestructiveWrite !== true) {
       const rejectedPath = `${configPath}.rejected.${formatConfigArtifactTimestamp(new Date().toISOString())}`;
       await deps.fs.promises
@@ -2892,7 +2944,7 @@ export async function writeConfigFile(
     afterWrite: options.afterWrite,
     allowDestructiveWrite: options.allowDestructiveWrite,
     allowConfigSizeDrop: options.allowConfigSizeDrop,
-    sizeFloorBytes: options.sizeFloorBytes,
+    authorizedRemovedPaths: options.authorizedRemovedPaths,
     skipRuntimeSnapshotRefresh: options.skipRuntimeSnapshotRefresh,
     skipOutputLogs: options.skipOutputLogs,
     skipPluginValidation: options.skipPluginValidation,

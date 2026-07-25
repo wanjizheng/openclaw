@@ -2,7 +2,6 @@
 import path from "node:path";
 import { note } from "../../packages/terminal-core/src/note.js";
 import { formatCliCommand } from "../cli/command-format.js";
-import { stampConfigWriteMetadata } from "../config/io.meta.js";
 import { CONFIG_PATH } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { callGateway } from "../gateway/call.js";
@@ -371,27 +370,15 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
   }
 
   // When the trusted, named migration steps actually changed the candidate,
-  // record the resulting serialized size as a floor. The downstream writer
-  // rejects any commit that lands below this floor even when the size-drop
-  // opt-in is set, so the opt-in can only authorize the exact size drop the
-  // trusted migration itself produced — subsequent untrusted repairs (e.g.
-  // stale-cleanup, hooks-token repair, channel-doctor) cannot ride along and
-  // shrink the config further. The floor mirrors the writer's serialization
-  // (JSON.stringify indent 2 + trailing LF) AND its version stamp
-  // (lastTouchedVersion + lastTouchedAt) so the byte count matches what the
-  // writer will produce. The fixed timestamp avoids the floor depending on
-  // wall-clock time; the byte length difference between a fixed and current
-  // ISO timestamp is constant and cancels out in the floor comparison.
-  const trustedMigrationChanged =
-    legacyStep.changeLines.length > 0 || unknownStep.removed.length > 0;
-  const trustedMigrationSizeFloorBytes = trustedMigrationChanged
-    ? Buffer.byteLength(
-        JSON.stringify(stampConfigWriteMetadata(candidate, "2026-01-01T00:00:00.000Z"), null, 2)
-          .trimEnd()
-          .concat("\n"),
-        "utf-8",
-      )
-    : undefined;
+  // record exactly which paths they removed. The downstream writer uses this
+  // as the white-list of authorized removals: any other path removed by an
+  // untrusted repair (stale-cleanup, hooks-token repair, channel-doctor, etc.)
+  // cannot ride this list and will be rejected by the writer, even when the
+  // size-drop opt-in is set. The diff is computed BEFORE the untrusted
+  // siblings get a chance to remove paths, so they cannot leak into the
+  // authorized set.
+  const trustedMigrationRemovedPaths = [...legacyStep.removedPaths, ...unknownStep.removed];
+  const trustedMigrationChanged = trustedMigrationRemovedPaths.length > 0;
 
   const finalized = await finalizeDoctorConfigFlow({
     cfg,
@@ -421,8 +408,8 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
     sourceConfigValid: snapshot.valid,
     preservedLegacyRootKeys: ["defaultModel"],
     ...(allowConfigSizeDropOnWrite ? { allowConfigSizeDropOnWrite } : {}),
-    ...(allowConfigSizeDropOnWrite && typeof trustedMigrationSizeFloorBytes === "number"
-      ? { trustedMigrationSizeFloorBytes }
+    ...(allowConfigSizeDropOnWrite && trustedMigrationRemovedPaths.length > 0
+      ? { authorizedRemovedPaths: trustedMigrationRemovedPaths }
       : {}),
     ...(sourceLastTouchedVersion ? { sourceLastTouchedVersion } : {}),
     ...(legacyMigrationPartiallyValid ? { skipPluginValidationOnWrite: true } : {}),

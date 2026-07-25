@@ -1224,6 +1224,82 @@ describe("config observe recovery", () => {
     });
   });
 
+  it("does not use a tampered .last-good as the suspicious baseline (async)", async () => {
+    // Regression: the suspicious baseline (used to decide whether the current
+    // read is suspicious) and the restore source are separate concerns. The
+    // baseline must be gated against entry.lastPromotedGood.hash — otherwise
+    // an attacker who can write to .last-good can dump a tampered baseline
+    // that wedges the current config off the air without even triggering a
+    // restore (the picker still rejects it, but the corruption has already
+    // been recorded as "suspicious"). The .bak fallback has no stored hash
+    // so it remains unverified; only the persisted lastKnownGood / verified
+    // .last-good fingerprint count.
+    await withSuiteHome(async (home) => {
+      const { deps, configPath, auditPath } = makeDeps(home);
+      const promoted = await makeSnapshot(configPath, recoverableTelegramConfig);
+      await expect(
+        promoteConfigSnapshotToLastKnownGood({ deps, snapshot: promoted, logger: deps.logger }),
+      ).resolves.toBe(true);
+      // Tamper the .last-good file with a sanely-shaped but unrelated config.
+      // The hash no longer matches lastPromotedGood, so the baseline picker
+      // must skip it.
+      const tamperedLastGood = {
+        meta: { lastTouchedAt: "2026-04-22T00:00:00.000Z" },
+        gateway: { mode: "remote" },
+        channels: { slack: { enabled: true } },
+      };
+      await fsp.writeFile(
+        resolveLastKnownGoodConfigPath(configPath),
+        `${JSON.stringify(tamperedLastGood, null, 2)}\n`,
+        "utf-8",
+      );
+      // Also tamper .bak so the fallback baseline is also gone.
+      const tamperedBak = {
+        meta: { lastTouchedAt: "2026-04-22T00:00:00.000Z" },
+        gateway: { mode: "remote" },
+      };
+      await fsp.writeFile(
+        `${configPath}.bak`,
+        `${JSON.stringify(tamperedBak, null, 2)}\n`,
+        "utf-8",
+      );
+      // Now write a currently-configured config that matches the tampered
+      // .last-good shape. Without the baseline hash gate, the suspicious
+      // detector would compare it against the tampered baseline and report
+      // "suspicious" — even though the on-disk config is benign.
+      const benign = await writeConfigRaw(configPath, {
+        meta: { lastTouchedAt: "2026-04-22T00:00:00.000Z" },
+        gateway: { mode: "remote" },
+        channels: { slack: { enabled: true } },
+      });
+
+      const recovered = await recoverSuspiciousConfigRead({
+        deps,
+        configPath,
+        ...benign,
+      });
+
+      // The current read is returned unchanged because the baseline is gone
+      // (no verified lastKnownGood, no hash-matching .last-good). The tamper
+      // attempt must not have tricked the observer into a recovery.
+      expect((recovered.parsed as { gateway?: { mode?: string } }).gateway?.mode).toBe("remote");
+      expect((recovered.parsed as { channels?: { slack?: unknown } }).channels?.slack).toEqual({
+        enabled: true,
+      });
+      // Critically, no recovery event should have been recorded. When no
+      // suspicious events are emitted, the audit file may not exist yet —
+      // try/catch around readFile instead of asserting .toBeUndefined().
+      const auditExists = await fsp
+        .stat(auditPath)
+        .then(() => true)
+        .catch(() => false);
+      if (auditExists) {
+        const observeEvents = await readObserveEvents(auditPath);
+        expect(observeEvents).toHaveLength(0);
+      }
+    });
+  });
+
   it("falls back to .bak when .last-good is corrupt JSON5 (async)", async () => {
     await withSuiteHome(async (home) => {
       const { deps, configPath, auditPath } = makeDeps(home);

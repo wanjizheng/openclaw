@@ -763,13 +763,21 @@ function resolveConfigReadRecoveryContext(params: {
 async function readConfigFingerprintForPath(
   deps: ObserveRecoveryDeps,
   targetPath: string,
+  requiredHash?: string | null,
 ): Promise<ConfigHealthFingerprint | null> {
   try {
     const raw = await deps.fs.promises.readFile(targetPath, "utf-8");
+    const actualHash = hashConfigRaw(raw);
+    if (requiredHash && actualHash !== requiredHash) {
+      deps.logger.warn(
+        `Config recovery baseline skipped ${targetPath}: file hash does not match expected hash`,
+      );
+      return null;
+    }
     const stat = await deps.fs.promises.stat(targetPath).catch(() => null);
     const parsed = parseConfigRawOrEmpty(deps, raw);
     return createConfigHealthFingerprint({
-      hash: hashConfigRaw(raw),
+      hash: actualHash,
       raw,
       parsed,
       gatewaySource: parsed,
@@ -784,13 +792,21 @@ async function readConfigFingerprintForPath(
 function readConfigFingerprintForPathSync(
   deps: ObserveRecoveryDeps,
   targetPath: string,
+  requiredHash?: string | null,
 ): ConfigHealthFingerprint | null {
   try {
     const raw = deps.fs.readFileSync(targetPath, "utf-8");
+    const actualHash = hashConfigRaw(raw);
+    if (requiredHash && actualHash !== requiredHash) {
+      deps.logger.warn(
+        `Config recovery baseline skipped ${targetPath}: file hash does not match expected hash`,
+      );
+      return null;
+    }
     const stat = deps.fs.statSync(targetPath, { throwIfNoEntry: false }) ?? null;
     const parsed = parseConfigRawOrEmpty(deps, raw);
     return createConfigHealthFingerprint({
-      hash: hashConfigRaw(raw),
+      hash: actualHash,
       raw,
       parsed,
       gatewaySource: parsed,
@@ -866,7 +882,18 @@ export async function maybeRecoverSuspiciousConfigRead(
   // a freshly-read `.last-good` or `.bak`) to decide whether the current read
   // is suspicious. The actual restore source is picked by `pickVerifiedCandidate`
   // below and is never trusted by the baseline alone.
-  const baselineFromLastGood = await readConfigFingerprintForPath(params.deps, lastGoodPath);
+  //
+  // The `.last-good` baseline is gated against `entry.lastPromotedGood.hash`
+  // so an attacker-supplied `.last-good` file cannot silently widen the
+  // suspicious threshold or trigger a false-positive recovery. The `.bak`
+  // fallback has no stored hash so it remains unverified, but it is only
+  // used as a last resort if no verified baseline exists.
+  const requiredLastGoodHash = entry.lastPromotedGood?.hash;
+  const baselineFromLastGood = await readConfigFingerprintForPath(
+    params.deps,
+    lastGoodPath,
+    requiredLastGoodHash,
+  );
   const baselineFromBackup = await readConfigFingerprintForPath(params.deps, backupPath);
   const backupBaseline =
     entry.lastKnownGood ?? baselineFromLastGood ?? baselineFromBackup ?? undefined;
@@ -880,8 +907,6 @@ export async function maybeRecoverSuspiciousConfigRead(
     return returnOriginalConfigRead(params);
   }
   const { suspicious, suspiciousSignature } = recoveryContext;
-
-  const requiredLastGoodHash = entry.lastPromotedGood?.hash;
   const lastGoodRaw = await params.deps.fs.promises
     .readFile(lastGoodPath, "utf-8")
     .catch(() => null);
@@ -987,7 +1012,18 @@ export function maybeRecoverSuspiciousConfigReadSync(
   // fingerprint we can find, not the restore source. The restore source is
   // picked by `pickVerifiedCandidateSync` and is never trusted by the
   // baseline alone.
-  const baselineFromLastGood = readConfigFingerprintForPathSync(params.deps, lastGoodPath);
+  //
+  // The `.last-good` baseline is gated against `entry.lastPromotedGood.hash`
+  // so an attacker-supplied `.last-good` file cannot silently widen the
+  // suspicious threshold or trigger a false-positive recovery. The `.bak`
+  // fallback has no stored hash so it remains unverified, but it is only
+  // used as a last resort if no verified baseline exists.
+  const requiredLastGoodHash = entry.lastPromotedGood?.hash;
+  const baselineFromLastGood = readConfigFingerprintForPathSync(
+    params.deps,
+    lastGoodPath,
+    requiredLastGoodHash,
+  );
   const baselineFromBackup = readConfigFingerprintForPathSync(params.deps, backupPath);
   const backupBaseline =
     entry.lastKnownGood ?? baselineFromLastGood ?? baselineFromBackup ?? undefined;
@@ -1001,8 +1037,6 @@ export function maybeRecoverSuspiciousConfigReadSync(
     return returnOriginalConfigRead(params);
   }
   const { suspicious, suspiciousSignature } = recoveryContext;
-
-  const requiredLastGoodHash = entry.lastPromotedGood?.hash;
   let lastGoodRaw: string | null = null;
   try {
     lastGoodRaw = params.deps.fs.readFileSync(lastGoodPath, "utf-8");
