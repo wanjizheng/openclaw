@@ -97,7 +97,7 @@ describe("doctor config flow steps", () => {
       warnings: [],
     } satisfies DoctorConfigPreflightResult["snapshot"]);
 
-    expect(result.removedPaths).toContain("heartbeat");
+    expect(result.removedPaths).toContainEqual(["heartbeat"]);
   });
 
   it("keeps pending repair state for legacy issues even when the snapshot is already normalized", () => {

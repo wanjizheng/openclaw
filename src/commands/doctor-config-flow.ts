@@ -370,14 +370,21 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
   }
 
   // When the trusted, named migration steps actually changed the candidate,
-  // record exactly which paths they removed. The downstream writer uses this
-  // as the white-list of authorized removals: any other path removed by an
-  // untrusted repair (stale-cleanup, hooks-token repair, channel-doctor, etc.)
-  // cannot ride this list and will be rejected by the writer, even when the
-  // size-drop opt-in is set. The diff is computed BEFORE the untrusted
-  // siblings get a chance to remove paths, so they cannot leak into the
-  // authorized set.
-  const trustedMigrationRemovedPaths = [...legacyStep.removedPaths, ...unknownStep.removed];
+  // record exactly which paths they made destructive. The downstream writer
+  // uses this as the white-list of authorized destructive changes: any
+  // further shrink by an untrusted repair (stale-cleanup, hooks-token
+  // repair, channel-doctor, etc.) cannot ride this list and will be rejected
+  // by the writer, even when the size-drop opt-in is set. The diff is
+  // computed BEFORE the untrusted siblings get a chance to shrink the
+  // candidate, so they cannot leak into the authorized set.
+  // `unknownStep.removedPaths` is part of the round-5 contract but several
+  // doctor-flow tests still mock `stripUnknownConfigKeys` to return only
+  // `{ config, removed }`. Treat missing as "no typed paths known" so the
+  // legacy/typed path wiring stays robust while the test mocks catch up.
+  const trustedMigrationRemovedPaths: Array<readonly (string | number)[]> = [
+    ...legacyStep.removedPaths,
+    ...(unknownStep.removedPaths ?? []),
+  ];
   const trustedMigrationChanged = trustedMigrationRemovedPaths.length > 0;
 
   const finalized = await finalizeDoctorConfigFlow({
@@ -409,7 +416,7 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
     preservedLegacyRootKeys: ["defaultModel"],
     ...(allowConfigSizeDropOnWrite ? { allowConfigSizeDropOnWrite } : {}),
     ...(allowConfigSizeDropOnWrite && trustedMigrationRemovedPaths.length > 0
-      ? { authorizedRemovedPaths: trustedMigrationRemovedPaths }
+      ? { authorizedDestructivePaths: trustedMigrationRemovedPaths }
       : {}),
     ...(sourceLastTouchedVersion ? { sourceLastTouchedVersion } : {}),
     ...(legacyMigrationPartiallyValid ? { skipPluginValidationOnWrite: true } : {}),

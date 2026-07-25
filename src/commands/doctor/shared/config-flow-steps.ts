@@ -1,4 +1,4 @@
-import { collectRemovedPaths } from "../../../config/io.write-prepare.js";
+import { collectDestructiveChanges } from "../../../config/io.write-prepare.js";
 // Doctor config-flow steps for legacy compatibility and unknown-key cleanup.
 import { formatConfigIssueLines } from "../../../config/issue-format.js";
 import { protectActiveAuthProfileConfig } from "../../doctor-auth-profile-config.js";
@@ -18,12 +18,13 @@ export function applyLegacyCompatibilityStep(params: {
   issueLines: string[];
   changeLines: string[];
   /**
-   * Paths that existed in the on-disk `snapshot.parsed` but were removed by
-   * the legacy migration. The writer treats these as the only removals the
-   * migration is authorized to perform; any further removal in the same
-   * transaction is rejected.
+   * Typed `ConfigPath` set of every destructive change the legacy migration
+   * produced. The writer treats these as the only destructive size changes
+   * the migration is authorized to perform; any further shrink in the same
+   * transaction (path-removal, primitive shorten, container-shrink, array
+   * truncation, object-children-removal) is rejected.
    */
-  removedPaths: string[];
+  removedPaths: Array<readonly (string | number)[]>;
   partiallyValid?: boolean;
 } {
   if (params.snapshot.legacyIssues.length === 0) {
@@ -56,11 +57,14 @@ export function applyLegacyCompatibilityStep(params: {
   }
 
   // Diff snapshot.parsed vs migrated to record exactly which paths the legacy
-  // migration removed. The writer uses this as the white-list of authorized
-  // removals: any path removed by subsequent untrusted repairs cannot ride
-  // this list and will be rejected.
-  const removedPaths = new Set<string>();
-  collectRemovedPaths(params.snapshot.parsed, migrated, "", removedPaths);
+  // migration made destructive (size shrink of any kind). The writer uses
+  // this as the white-list of authorized destructive changes: any further
+  // shrink by untrusted repairs cannot ride this list and will be rejected.
+  const removedPathSet = new Set<string>();
+  collectDestructiveChanges(params.snapshot.parsed, migrated, [], removedPathSet);
+  const removedPaths = Array.from(removedPathSet).map(
+    (key) => JSON.parse(key) as readonly (string | number)[],
+  );
 
   return {
     state: {
@@ -84,7 +88,7 @@ export function applyLegacyCompatibilityStep(params: {
     },
     issueLines,
     changeLines: changes,
-    removedPaths: [...removedPaths],
+    removedPaths,
     partiallyValid: partiallyValid === true ? true : undefined,
   };
 }
@@ -97,12 +101,17 @@ export function applyUnknownConfigKeyStep(params: {
 }): {
   state: DoctorConfigMutationState;
   removed: string[];
+  /**
+   * Typed `ConfigPath` form of `removed`, used by the writer to authorize
+   * destructive size changes without path-string collisions.
+   */
+  removedPaths: Array<readonly (string | number)[]>;
   repairs: string[];
   warnings: string[];
 } {
   const unknown = stripUnknownConfigKeys(params.state.candidate);
   if (unknown.removed.length === 0) {
-    return { state: params.state, removed: [], repairs: [], warnings: [] };
+    return { state: params.state, removed: [], removedPaths: [], repairs: [], warnings: [] };
   }
   const protectedAuth = protectActiveAuthProfileConfig({
     before: params.state.candidate,
@@ -119,6 +128,7 @@ export function applyUnknownConfigKeyStep(params: {
         : [...params.state.fixHints, `Run "${params.doctorFixCommand}" to remove these keys.`],
     },
     removed: unknown.removed,
+    removedPaths: unknown.removedPaths,
     repairs: protectedAuth.repairs,
     warnings: protectedAuth.warnings,
   };

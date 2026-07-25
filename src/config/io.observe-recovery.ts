@@ -885,15 +885,17 @@ export async function maybeRecoverSuspiciousConfigRead(
   //
   // The `.last-good` baseline is gated against `entry.lastPromotedGood.hash`
   // so an attacker-supplied `.last-good` file cannot silently widen the
-  // suspicious threshold or trigger a false-positive recovery. The `.bak`
+  // suspicious threshold or trigger a false-positive recovery. When no
+  // promoted-good hash exists (the very first run before any verification
+  // has happened), we must NOT use `.last-good` as a baseline at all —
+  // there is nothing to compare against, and trusting a freshly-supplied
+  // file would let an attacker reset the suspicious threshold. The `.bak`
   // fallback has no stored hash so it remains unverified, but it is only
   // used as a last resort if no verified baseline exists.
   const requiredLastGoodHash = entry.lastPromotedGood?.hash;
-  const baselineFromLastGood = await readConfigFingerprintForPath(
-    params.deps,
-    lastGoodPath,
-    requiredLastGoodHash,
-  );
+  const baselineFromLastGood = requiredLastGoodHash
+    ? await readConfigFingerprintForPath(params.deps, lastGoodPath, requiredLastGoodHash)
+    : null;
   const baselineFromBackup = await readConfigFingerprintForPath(params.deps, backupPath);
   const backupBaseline =
     entry.lastKnownGood ?? baselineFromLastGood ?? baselineFromBackup ?? undefined;
@@ -1015,15 +1017,17 @@ export function maybeRecoverSuspiciousConfigReadSync(
   //
   // The `.last-good` baseline is gated against `entry.lastPromotedGood.hash`
   // so an attacker-supplied `.last-good` file cannot silently widen the
-  // suspicious threshold or trigger a false-positive recovery. The `.bak`
+  // suspicious threshold or trigger a false-positive recovery. When no
+  // promoted-good hash exists (the very first run before any verification
+  // has happened), we must NOT use `.last-good` as a baseline at all —
+  // there is nothing to compare against, and trusting a freshly-supplied
+  // file would let an attacker reset the suspicious threshold. The `.bak`
   // fallback has no stored hash so it remains unverified, but it is only
   // used as a last resort if no verified baseline exists.
   const requiredLastGoodHash = entry.lastPromotedGood?.hash;
-  const baselineFromLastGood = readConfigFingerprintForPathSync(
-    params.deps,
-    lastGoodPath,
-    requiredLastGoodHash,
-  );
+  const baselineFromLastGood = requiredLastGoodHash
+    ? readConfigFingerprintForPathSync(params.deps, lastGoodPath, requiredLastGoodHash)
+    : null;
   const baselineFromBackup = readConfigFingerprintForPathSync(params.deps, backupPath);
   const backupBaseline =
     entry.lastKnownGood ?? baselineFromLastGood ?? baselineFromBackup ?? undefined;

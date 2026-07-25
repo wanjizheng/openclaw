@@ -34,12 +34,13 @@ type DoctorConfigResult = {
    */
   allowConfigSizeDropOnWrite?: boolean;
   /**
-   * Paths that the trusted, named migration steps actually removed in this
-   * flow. The writer uses this as the white-list of authorized removals:
-   * any other path removed by an untrusted repair cannot ride this list
+   * Typed `ConfigPath` segments that the trusted, named migration steps
+   * actually made destructive (any size shrink, not just removals) in this
+   * flow. The writer uses this as the white-list of authorized destructive
+   * changes: any other shrink by an untrusted repair cannot ride this list
    * and will be rejected, even when the size-drop opt-in is set.
    */
-  authorizedRemovedPaths?: readonly string[];
+  authorizedDestructivePaths?: ReadonlyArray<readonly (string | number)[]>;
   preservedLegacyRootKeys?: readonly string[];
 };
 
@@ -1105,14 +1106,15 @@ async function runWriteConfigHealth(ctx: DoctorHealthFlowContext): Promise<void>
         // startup (#80077 regression vector).
         allowConfigSizeDrop: ctx.configResult.allowConfigSizeDropOnWrite === true,
         // Bound the size-drop opt-in to the exact paths the trusted migration
-        // itself removed. The writer diffs the on-disk snapshot against the
-        // projected payload and rejects any commit whose diff removes a path
-        // NOT in this list. Without this, any later repair that further
-        // shrinks the config could ride the transaction-level opt-in and
-        // bypass the guard.
-        ...(ctx.configResult.authorizedRemovedPaths &&
-        ctx.configResult.authorizedRemovedPaths.length > 0
-          ? { authorizedRemovedPaths: ctx.configResult.authorizedRemovedPaths }
+        // itself made destructive. The writer walks the on-disk snapshot
+        // against the projected payload and rejects any commit whose diff
+        // shrinks a path NOT in this list. Without this, any later repair
+        // that further shrinks the config could ride the transaction-level
+        // opt-in and bypass the guard. Writer-managed unset paths
+        // (`plugins.installs`) are auto-unioned in the writer.
+        ...(ctx.configResult.authorizedDestructivePaths &&
+        ctx.configResult.authorizedDestructivePaths.length > 0
+          ? { authorizedDestructivePaths: ctx.configResult.authorizedDestructivePaths }
           : {}),
         skipPluginValidation:
           ctx.configResult.skipPluginValidationOnWrite === true || updateDoctorRun,

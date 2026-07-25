@@ -1371,6 +1371,57 @@ describe("config observe recovery", () => {
     });
   });
 
+  it("does NOT use a freshly-supplied .last-good as the suspicious baseline when lastPromotedGood.hash is missing (async)", async () => {
+    // Round-5 [P2]: even when no `.bak` exists, a `.last-good` without a
+    // recorded `lastPromotedGood.hash` must not be treated as a baseline.
+    // Otherwise an attacker who can write `.last-good` could reset the
+    // suspicious threshold on the very first run before any verification
+    // has happened. The recovery must instead leave the config alone —
+    // the absence of a recorded promotion hash means we cannot trust any
+    // baseline at all, so the read stands and is recorded as suspicious
+    // only if a baseline existed (here it does not, so the clobber stands).
+    await withSuiteHome(async (home) => {
+      const { deps, configPath, auditPath } = makeDeps(home);
+      await fsp.mkdir(path.dirname(configPath), { recursive: true });
+      // No `.bak`. Only `.last-good`, supplied out-of-band (no promotion).
+      await fsp.writeFile(
+        resolveLastKnownGoodConfigPath(configPath),
+        `${JSON.stringify(recoverableTelegramConfig, null, 2)}\n`,
+        "utf-8",
+      );
+      const clobbered = await writeConfigRaw(configPath, {
+        meta: { lastTouchedVersion: "2026.5.28" },
+      });
+
+      const recovered = await recoverSuspiciousConfigRead({
+        deps,
+        configPath,
+        ...clobbered,
+      });
+
+      // The clobbered config must NOT be auto-restored from `.last-good`:
+      // without a recorded promotion hash, we treat the file as unverified
+      // and let the existing clobber stand.
+      expect(
+        (recovered.parsed as { channels?: { telegram?: unknown } }).channels?.telegram,
+      ).toBeUndefined();
+      // No backup path was used — neither `.last-good` nor `.bak`.
+      // Observe event may or may not be emitted depending on whether the
+      // read was classified suspicious without a baseline; the strict
+      // contract is that no `.last-good` was used as the restore source.
+      try {
+        await fsp.stat(auditPath);
+      } catch {
+        // No audit file means no recovery action was taken at all — also OK.
+        return;
+      }
+      const observe = await readLastObserveEvent(auditPath);
+      if (observe) {
+        expect(observe.restoredBackupPath).toBeUndefined();
+      }
+    });
+  });
+
   it("falls back to .bak when .last-good is rejected by validateBackup (async)", async () => {
     // Regression: `.last-good` is verified-good at promotion time, but the
     // runtime's notion of "good" can change between releases. A stale snapshot

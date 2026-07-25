@@ -1196,12 +1196,12 @@ describe("config io write", () => {
         meta: { lastTouchedVersion: "2026.4.30" },
         gateway: { mode: "local" },
       };
-      const authorizedRemovedPaths = ["channels"];
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["channels"]];
 
       // First write at the authorized set is allowed: matches what the migration produced.
       const acceptedWrite = await io.writeConfigFile(trustedMigrationOutput, {
         allowConfigSizeDrop: true,
-        authorizedRemovedPaths,
+        authorizedDestructivePaths,
         lastTouchedVersionOverride: "2026.4.30",
         baseSnapshot,
       });
@@ -1218,7 +1218,7 @@ describe("config io write", () => {
       await expectConfigWriteRejected(
         io.writeConfigFile(untrustedRepairOutput, {
           allowConfigSizeDrop: true,
-          authorizedRemovedPaths,
+          authorizedDestructivePaths,
           lastTouchedVersionOverride: "2026.4.30",
           baseSnapshot: acceptedSnapshot,
         }),
@@ -1226,7 +1226,7 @@ describe("config io write", () => {
     });
   });
 
-  it("emits 'unauthorized-removed-paths' as the rejection reason", async () => {
+  it("emits 'unauthorized-destructive-paths' as the rejection reason", async () => {
     await withSuiteHome(async (home) => {
       const configPath = path.join(home, ".openclaw", "openclaw.json");
       await fs.mkdir(path.dirname(configPath), { recursive: true });
@@ -1266,12 +1266,12 @@ describe("config io write", () => {
         meta: { lastTouchedVersion: "2026.4.30" },
         gateway: { mode: "local" },
       };
-      const authorizedRemovedPaths = ["channels"];
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["channels"]];
 
       // Seed the trusted migration output, then read the snapshot back.
       await io.writeConfigFile(trustedMigrationOutput, {
         allowConfigSizeDrop: true,
-        authorizedRemovedPaths,
+        authorizedDestructivePaths,
         lastTouchedVersionOverride: "2026.4.30",
         baseSnapshot,
       });
@@ -1283,14 +1283,210 @@ describe("config io write", () => {
             { meta: { lastTouchedVersion: "2026.4.30" } },
             {
               allowConfigSizeDrop: true,
-              authorizedRemovedPaths,
+              authorizedDestructivePaths,
               lastTouchedVersionOverride: "2026.4.30",
               baseSnapshot: acceptedSnapshot,
             },
           )
           .catch((err: { reasons?: string[] }) => err.reasons),
       ).resolves.toEqual(
-        expect.arrayContaining([expect.stringMatching(/^unauthorized-removed-paths:/)]),
+        expect.arrayContaining([expect.stringMatching(/^unauthorized-destructive-paths:/)]),
+      );
+    });
+  });
+
+  it("rejects writes whose primitive value shrinks without removing a path (round-5 destructive)", async () => {
+    // Round-5 [P1]: the authorized set covers path REMOVALS, but a primitive
+    // can shrink in place (long string → short string, integer → null) without
+    // the path itself disappearing. The destructive-diff model must catch this.
+    //
+    // Setup: write a config that has BOTH a long primitive (`gateway.mode`)
+    // and a long array (`heartbeat.endpoints`). Authorize ONLY the array
+    // removal. The primitive shrink is not authorized and must be rejected.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const longMode = "x".repeat(4000);
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        gateway: { mode: longMode },
+        heartbeat: { endpoints: Array.from({ length: 100 }, (_, i) => `ep-${i}`) },
+      } satisfies ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        valid: true,
+        runtimeConfig: original,
+        config: original,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } satisfies ConfigFileSnapshot;
+
+      // Trusted migration authorized ONLY the `heartbeat` removal. The
+      // primitive shrink on `gateway.mode` is NOT in the authorized set.
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["heartbeat"]];
+
+      let caught: unknown = undefined;
+      try {
+        await io.writeConfigFile(
+          {
+            meta: { lastTouchedVersion: "2026.4.30" },
+            // gateway.mode shrunk to a short string (destructive), heartbeat
+            // was removed (authorized).
+            gateway: { mode: "local" },
+          },
+          {
+            allowConfigSizeDrop: true,
+            authorizedDestructivePaths,
+            lastTouchedVersionOverride: "2026.4.30",
+            baseSnapshot,
+          },
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect((caught as { code?: string } | undefined)?.code).toBe("CONFIG_WRITE_REJECTED");
+    });
+  });
+
+  it("auto-unions writer-managed plugins.installs into the authorized destructive set (round-5 writer-managed)", async () => {
+    // Round-5 [P1]: the writer's own canonical payload-preparation removes
+    // `plugins.installs` on every commit. Without auto-union, the writer
+    // would self-reject every config write that doesn't enumerate
+    // `plugins.installs` in the authorized set.
+    //
+    // We trigger this by writing a small `heartbeat` block (which is the
+    // sole authorized destructive change) while the on-disk config has a
+    // long `plugins.installs` record. The size drop is unambiguous, the
+    // size-drop opt-in is on, and the only thing the writer needs to also
+    // remove is `plugins.installs` (writer-managed, auto-unioned).
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        heartbeat: { interval: 30 },
+        plugins: {
+          installs: {
+            "telegram@1.0.0": { version: "1.0.0", long: "x".repeat(4000) },
+            "discord@2.0.0": { version: "2.0.0", long: "y".repeat(4000) },
+          },
+        },
+      } satisfies ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        valid: true,
+        runtimeConfig: original,
+        config: original,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } satisfies ConfigFileSnapshot;
+
+      // Authorize ONLY the heartbeat removal. The writer will also strip
+      // `plugins.installs`; the write must succeed because that path is
+      // writer-managed and auto-unioned.
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["heartbeat"]];
+
+      const result = await io.writeConfigFile(
+        { meta: { lastTouchedVersion: "2026.4.30" } },
+        {
+          allowConfigSizeDrop: true,
+          authorizedDestructivePaths,
+          lastTouchedVersionOverride: "2026.4.30",
+          baseSnapshot,
+        },
+      );
+      expect(result.persistedConfig.meta).toBeDefined();
+    });
+  });
+
+  it("rejects destructive paths under a top-level key whose literal name is dotted (round-5 collision)", async () => {
+    // Round-5 [P2]: a top-level key literally named `"agents.list"` (with a
+    // dot inside its name) must NOT cover the nested path `agents.list`
+    // (an array of agents). The old dotted-string implementation would
+    // have falsely authorized the nested removal.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        // Top-level key whose name is literally "agents.list" (no nesting).
+        "agents.list": { some: "long string that shrinks on write" },
+        // Nested array at `agents.list` (the real agents list).
+        agents: {
+          list: [
+            { id: "alpha", params: { model: "x" } },
+            { id: "beta", params: { model: "y" } },
+          ],
+        },
+      } satisfies ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        valid: true,
+        runtimeConfig: original,
+        config: original,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } satisfies ConfigFileSnapshot;
+
+      // Authorize ONLY the top-level dotted key (literal `"agents.list"`).
+      // The destructive removal of the nested `agents.list` array must NOT
+      // be covered.
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["agents.list"]];
+
+      await expectConfigWriteRejected(
+        io.writeConfigFile(
+          {
+            meta: { lastTouchedVersion: "2026.4.30" },
+            // Truncate the nested agents.list to one element. The literal
+            // top-level "agents.list" key is preserved (not a path removal).
+            agents: { list: [{ id: "alpha", params: { model: "x" } }] },
+          },
+          {
+            allowConfigSizeDrop: true,
+            authorizedDestructivePaths,
+            lastTouchedVersionOverride: "2026.4.30",
+            baseSnapshot,
+          },
+        ),
       );
     });
   });

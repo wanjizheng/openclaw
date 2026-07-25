@@ -13,6 +13,68 @@ const OPEN_DM_POLICY_ALLOW_FROM_RE =
 
 const MANAGED_CONFIG_UNSET_PATHS = [["plugins", "installs"]] as const;
 
+/**
+ * Typed identity for a config location. Segments are object keys (string) or
+ * array indices (number). We compare segment-by-segment — never join to a
+ * dotted string — so two structurally distinct paths cannot collide (e.g. a
+ * top-level key `"agents.list"` cannot match a nested `agents.list`).
+ */
+export type ConfigPath = readonly (string | number)[];
+
+/** Stable string key for a `ConfigPath`, suitable for `Set` / `Map` lookup. */
+export function configPathKey(path: ConfigPath): string {
+  return JSON.stringify(path);
+}
+
+/** Segment-by-segment equality. */
+export function configPathEquals(a: ConfigPath, b: ConfigPath): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/** True when `path` starts with `prefix` (or is equal). */
+export function configPathHasPrefix(path: ConfigPath, prefix: ConfigPath): boolean {
+  if (prefix.length > path.length) return false;
+  for (let i = 0; i < prefix.length; i += 1) {
+    if (path[i] !== prefix[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * Path overlaps another when either is a (strict or non-strict) prefix of the
+ * other. We treat overlapping authorized paths as "covers" — authorizing
+ * `channels` covers a `channels.telegram.token` removal.
+ */
+export function configPathOverlaps(a: ConfigPath, b: ConfigPath): boolean {
+  return configPathHasPrefix(a, b) || configPathHasPrefix(b, a);
+}
+
+/**
+ * Approximate byte cost of a serialized config value. Used to detect
+ * destructive size changes (e.g. a long string replaced by a short string)
+ * that path-removal tracking would miss.
+ *
+ * Cheap upper bound: JSON.stringify length, or 0 for undefined. This is
+ * not byte-precise against the writer's pretty-printer — it is intended as a
+ * monotonic shrink detector, not a wire-format check.
+ */
+export function approxSerializedSize(value: unknown): number {
+  if (value === undefined || value === null) return 4;
+  if (typeof value === "string") return value.length + 2;
+  if (typeof value === "number") return String(value).length;
+  if (typeof value === "boolean") return value ? 4 : 5;
+  try {
+    return JSON.stringify(value)?.length ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
 type ManifestModelIdNormalizationProvider = {
   aliases?: Record<string, string>;
   stripPrefixes?: string[];
@@ -1132,6 +1194,20 @@ export function resolveManagedUnsetPathsForWrite(
   return next;
 }
 
+/**
+ * Writer-managed unset paths (paths the writer itself removes from the
+ * output every commit). These are auto-authorized for destructive writes
+ * because their removal is not driven by untrusted repairs — it is part
+ * of the writer's canonical payload-preparation contract.
+ *
+ * Today this is just `plugins.installs`, the install-state record that the
+ * plugin manager maintains; it would otherwise be wiped by every
+ * config write and look like an "unauthorized removal".
+ */
+export function resolveWriterManagedConfigPathsForWrite(): ConfigPath[] {
+  return MANAGED_CONFIG_UNSET_PATHS.map((p) => p.map(String));
+}
+
 export function collectChangedPaths(
   base: unknown,
   target: unknown,
@@ -1170,71 +1246,73 @@ export function collectChangedPaths(
 }
 
 /**
- * Collect paths that exist in `before` but are missing in `target`. Paths are
- * formatted with dotted keys and `[index]` for arrays, matching the
- * `applyUnknownConfigKeyStep.removed` and `formatConfigPath` convention.
+ * Collect every path whose serialized size shrinks from `before` to `target`.
  *
- * Used by doctor to authorize per-path removals: the legacy migration step
- * records which paths it actually removed (or rather, which paths disappeared
- * from the candidate), and the writer verifies no other paths were removed.
+ * Unlike `collectRemovedPaths`, which only tracks paths that disappear, this
+ * also flags:
+ *   - primitives replaced by a shorter primitive (`"a very long token"` →
+ *     `""` or `null`)
+ *   - containers replaced by smaller containers (record → array of length 1)
+ *   - arrays shortened (`[a, b, c]` → `[a]`)
+ *   - object children removed
+ *
+ * The output uses `ConfigPath` so two structurally distinct paths (a key
+ * containing a dot vs. a nested segment) cannot collide.
+ *
+ * Used by doctor to authorize destructive size changes: the migration step
+ * records every path whose cost shrinks, and the writer verifies no other
+ * paths shrink beyond the authorized set.
  */
-function collectRemovedLeafPaths(before: unknown, path: string, output: Set<string>): void {
-  if (Array.isArray(before)) {
-    for (let index = 0; index < before.length; index += 1) {
-      const childPath = path ? `${path}[${index}]` : `[${index}]`;
-      collectRemovedLeafPaths(before[index], childPath, output);
-    }
-    return;
-  }
-  if (isRecord(before)) {
-    for (const key of Object.keys(before)) {
-      const childPath = path ? `${path}.${key}` : key;
-      collectRemovedLeafPaths(before[key], childPath, output);
-    }
-    return;
-  }
-  output.add(path);
-}
-
-export function collectRemovedPaths(
+export function collectDestructiveChanges(
   before: unknown,
   target: unknown,
-  path: string,
+  path: ConfigPath,
   output: Set<string>,
 ): void {
-  if (Array.isArray(before)) {
-    if (!Array.isArray(target)) {
-      collectRemovedLeafPaths(before, path, output);
-      return;
+  const beforeSize = approxSerializedSize(before);
+  const targetSize = approxSerializedSize(target);
+
+  // Pure removal — emit the path and stop descending; everything under it
+  // is already known to be gone.
+  if (before !== undefined && (target === undefined || target === null)) {
+    output.add(configPathKey(path));
+    return;
+  }
+  // Same shape (both arrays, both records, both primitives): descend. The
+  // post-order check below will flag each path that shrinks.
+  if (Array.isArray(before) && Array.isArray(target)) {
+    const max = Math.max(before.length, target.length);
+    for (let index = 0; index < max; index += 1) {
+      const childBefore = index < before.length ? before[index] : undefined;
+      const childTarget = index < target.length ? target[index] : undefined;
+      collectDestructiveChanges(childBefore, childTarget, [...path, index], output);
     }
-    for (let index = 0; index < before.length; index += 1) {
-      const childPath = path ? `${path}[${index}]` : `[${index}]`;
-      if (index >= target.length) {
-        output.add(childPath);
-        continue;
-      }
-      collectRemovedPaths(before[index], target[index], childPath, output);
+    if (before.length > target.length) {
+      output.add(configPathKey(path));
     }
     return;
   }
-  if (isRecord(before)) {
-    if (!isRecord(target)) {
-      collectRemovedLeafPaths(before, path, output);
-      return;
+  if (isRecord(before) && isRecord(target)) {
+    const keys = new Set([...Object.keys(before), ...Object.keys(target)]);
+    for (const key of keys) {
+      const childBefore = Object.hasOwn(before, key) ? before[key] : undefined;
+      const childTarget = Object.hasOwn(target, key) ? target[key] : undefined;
+      collectDestructiveChanges(childBefore, childTarget, [...path, key], output);
     }
-    for (const key of Object.keys(before)) {
-      const childPath = path ? `${path}.${key}` : key;
-      if (!Object.hasOwn(target, key) || target[key] === undefined) {
-        output.add(childPath);
-        continue;
-      }
-      collectRemovedPaths(before[key], target[key], childPath, output);
+    if (Object.keys(before).length > Object.keys(target).length) {
+      output.add(configPathKey(path));
     }
     return;
   }
-  // Primitives: if `target` is also a primitive at this path, the caller is
-  // asking about a value change, not a removal. The parent already handles
-  // the case where `before` had a value but `target` doesn't have the key.
+  // Shape change or primitive change: flag the current path. Children have
+  // already been handled by the removal branch above when applicable.
+  if (!isDeepStrictEqual(before, target)) {
+    output.add(configPathKey(path));
+    return;
+  }
+  // Equal value — no shrink.
+  void beforeSize;
+  void targetSize;
 }
 
 function parentPath(value: string): string {
