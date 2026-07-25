@@ -1186,30 +1186,47 @@ export function resolveManagedUnsetPathsForWrite(
 }
 
 /**
+ * Compute the writer-managed destructive paths for the current snapshot.
+ *
  * Writer-managed unset paths (paths the writer itself removes from the
- * output every commit). These are auto-authorized for destructive writes
- * because their removal is not driven by untrusted repairs — it is part
- * of the writer's canonical payload-preparation contract.
+ * output every commit — today this is just `plugins.installs`, the
+ * install-state record that the plugin manager maintains) are
+ * auto-authorized for destructive writes because their removal is not
+ * driven by untrusted repairs — it is part of the writer's canonical
+ * payload-preparation contract.
  *
- * Today this is just `plugins.installs`, the install-state record that the
- * plugin manager maintains; it would otherwise be wiped by every
- * config write and look like an "unauthorized removal".
+ * The authorization is computed DYNAMICALLY from the snapshot rather
+ * than statically promoted to the parent. Statically promoting
+ * `["plugins", "installs"]` to `["plugins"]` would let the writer-managed
+ * authorization cover any unrelated destructive change inside the
+ * `plugins` subtree (e.g. `plugins.entries`, `plugins.allow`,
+ * `plugins.deny`) or the entire `plugins` object.
  *
- * The returned paths are the PARENT of each writer-managed unset path.
- * Authorizing the parent (not the leaf) reflects what the writer actually
- * does at write time: when the only child of `plugins` is `installs` and
- * `installs` is stripped by the writer, the cleanup also drops the empty
- * `plugins` parent. With directional coverage (an authorized ancestor
- * covers a destructive descendant) we need the parent in the authorized
- * set so the resulting `["plugins"]` removal is covered too.
+ * Instead, we run the writer's own unset-paths transform on the snapshot
+ * and diff the result against the snapshot to recover the EXACT paths the
+ * writer would destructively remove. With directional coverage (an
+ * authorized ancestor covers a destructive descendant), this yields:
+ *
+ *   - When `installs` has a sibling: the diff emits
+ *     `["plugins", "installs"]`. The child is authorized, the parent
+ *     is not, so unrelated `plugins.entries`/etc. are still rejected.
+ *   - When `installs` is the only child of `plugins`: the unset
+ *     transform prunes the empty parent, the diff emits
+ *     `["plugins"]`, and the empty-parent prune is authorized.
  */
-export function resolveWriterManagedConfigPathsForWrite(): ConfigPath[] {
-  return MANAGED_CONFIG_UNSET_PATHS.map((p) => {
-    if (p.length <= 1) {
-      return p.map(String);
-    }
-    return p.slice(0, -1).map(String);
-  });
+export function resolveWriterManagedConfigPathsForWrite(snapshot: unknown): ConfigPath[] {
+  if (!isRecord(snapshot)) {
+    return [];
+  }
+  const managedUnset = resolveManagedUnsetPathsForWrite(undefined);
+  const managedOnlyOutput = applyUnsetPathsForWrite(snapshot as OpenClawConfig, managedUnset);
+  const destructive = new Set<string>();
+  collectDestructiveChanges(snapshot, managedOnlyOutput, [], destructive);
+  const out: ConfigPath[] = [];
+  for (const key of destructive) {
+    out.push(JSON.parse(key) as ConfigPath);
+  }
+  return out;
 }
 
 export function collectChangedPaths(

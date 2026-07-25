@@ -1427,6 +1427,130 @@ describe("config io write", () => {
     });
   });
 
+  it("rejects a whole-plugins removal when a sibling plugin entry also exists (round-7 [P1] sibling)", async () => {
+    // Round-7 [P1]: when the on-disk config has BOTH `plugins.installs`
+    // (writer-managed) and `plugins.entries` (owner-managed), the writer's
+    // own unset-paths transform must NOT promote its destructive
+    // authorization to the entire `plugins` subtree. If the next config
+    // accidentally removes the entire `plugins` object, the writer must
+    // still reject the write because the parent `plugins` removal is not
+    // covered by the writer-managed `["plugins", "installs"]` child.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        heartbeat: { interval: 30 },
+        plugins: {
+          installs: {
+            "telegram@1.0.0": { version: "1.0.0", long: "x".repeat(4000) },
+          },
+          entries: {
+            telegram: { enabled: true },
+          },
+        },
+      } as Record<string, unknown> as ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        runtimeConfig: original,
+        config: original,
+        valid: true,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } as ConfigFileSnapshot;
+
+      // Authorize ONLY an unrelated path. The whole `plugins` object
+      // removal is NOT in the writer-managed set (which is
+      // `["plugins","installs"]` only because `entries` is a sibling).
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["heartbeat"]];
+
+      await expectConfigWriteRejected(
+        io.writeConfigFile(
+          { meta: { lastTouchedVersion: "2026.4.30" } },
+          {
+            allowConfigSizeDrop: true,
+            authorizedDestructivePaths,
+            lastTouchedVersionOverride: "2026.4.30",
+            baseSnapshot,
+          },
+        ),
+      );
+    });
+  });
+
+  it("accepts the installs-only empty-parent prune (round-7 [P1] prune)", async () => {
+    // Round-7 [P1]: when `plugins.installs` is the ONLY child of
+    // `plugins`, the writer's unset transform prunes the empty parent —
+    // the destructive diff is `["plugins"]`, which directional coverage
+    // must approve under the writer-managed authorization computed
+    // dynamically from the snapshot.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        heartbeat: { interval: 30 },
+        plugins: {
+          installs: {
+            "telegram@1.0.0": { version: "1.0.0", long: "x".repeat(4000) },
+          },
+        },
+      } as Record<string, unknown> as ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        runtimeConfig: original,
+        config: original,
+        valid: true,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } as ConfigFileSnapshot;
+
+      // Authorize ONLY the heartbeat removal. The writer also prunes
+      // the empty `plugins` parent after removing `plugins.installs`;
+      // the dynamic writer-managed authorization must cover that.
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["heartbeat"]];
+
+      const result = await io.writeConfigFile(
+        { meta: { lastTouchedVersion: "2026.4.30" } },
+        {
+          allowConfigSizeDrop: true,
+          authorizedDestructivePaths,
+          lastTouchedVersionOverride: "2026.4.30",
+          baseSnapshot,
+        },
+      );
+      expect(result.persistedConfig.meta).toBeDefined();
+      const persistedPlugins = (result.persistedConfig as { plugins?: unknown }).plugins;
+      expect(persistedPlugins).toBeUndefined();
+    });
+  });
+
   it("rejects destructive paths under a top-level key whose literal name is dotted (round-5 collision)", async () => {
     // Round-5 [P2]: a top-level key literally named `"agents.list"` (with a
     // dot inside its name) must NOT cover the nested path `agents.list`
@@ -1605,72 +1729,155 @@ describe("config io write", () => {
     });
   });
 
-  it("supports the full doctor write chain with a real legacy migration (round-6 [P1-3])", async () => {
-    // Round-6 [P1-3]: the complete doctor write path — a real trusted
-    // legacy migration → loadAndMaybeMigrateDoctorConfig → replaceConfigFile
-    // — must succeed end-to-end. The earlier round-5 implementation would
-    // have rejected the write because the wizard metadata + plugin
-    // auto-enable blocks added/updated fields that the destructive-delta
-    // model mistakenly classified as destructive.
+  it("supports the full doctor write chain with a real legacy migration (round-6 [P1-3] / round-7 strict)", async () => {
+    // Round-6 [P1-3] / round-7 strict: the complete doctor write path —
+    // a real trusted legacy migration → applyLegacyCompatibilityStep →
+    // applyWizardMetadata → real replaceConfigFile — must succeed
+    // end-to-end. The earlier round-5 implementation would have rejected
+    // the write because the wizard metadata + plugin auto-enable blocks
+    // added/updated fields that the destructive-delta model mistakenly
+    // classified as destructive.
     //
-    // This test exercises the real chain, not `io.writeConfigFile` in
-    // isolation: it sets up a real on-disk config with a legacy
-    // `threadBindings.ttlHours` key (handled by the doctor legacy
-    // migration), runs `loadAndMaybeMigrateDoctorConfig` (real), and
-    // passes the returned `authorizedDestructivePaths` to the real
-    // `replaceConfigFile`. The wizard metadata block adds new fields
-    // during the write; that growth must NOT be rejected.
+    // The previous version of this test asserted `authorizedDestructivePaths`
+    // was *optionally* present and never exercised the size-drop opt-in,
+    // which meant the contract was only proven when doctor happened to
+    // produce an empty `removedPaths` (the inverse of the trust boundary).
+    //
+    // This version uses a fixture that DEFINITELY produces a trusted
+    // destructive migration: `session.parentForkMaxTokens` is a core-level
+    // legacy key that the runtime migration removes entirely (no
+    // replacement). The diff therefore records
+    // `["session","parentForkMaxTokens"]` in `removedPaths`, and the
+    // trust contract requires the writer to accept that removal AND any
+    // non-destructive growth (wizard metadata added by the wizard owner)
+    // without rejecting either.
+    //
+    // The test exercises the real `applyLegacyCompatibilityStep` (the
+    // trusted migration owner) directly, then applies `applyWizardMetadata`
+    // (the real wizard owner path) before calling the real
+    // `replaceConfigFile` with the recovered `authorizedDestructivePaths`
+    // and `allowConfigSizeDrop` flags. The chain fails closed otherwise:
+    // any untrusted shrink in this transaction would be rejected.
     await withSuiteHome(async (home) => {
       const configDir = path.join(home, ".openclaw");
       const configPath = path.join(configDir, "openclaw.json");
       await fs.mkdir(configDir, { recursive: true });
       const original = {
         meta: { lastTouchedVersion: "2026.4.30" },
-        channels: {
-          discord: {
-            threadBindings: { ttlHours: 24 },
-          },
+        session: {
+          parentForkMaxTokens: 4096,
         },
       } as Record<string, unknown> as ConfigFileSnapshot["config"];
       const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
       await fs.writeFile(configPath, originalRaw, "utf-8");
 
-      // Run the real `loadAndMaybeMigrateDoctorConfig` against the
-      // on-disk config. The legacy migration in this test environment
-      // does NOT touch `threadBindings.ttlHours` (we picked a non-shipped
-      // legacy surface), so the trust contract here is "the migration is
-      // allowed to add/modify wizard fields" — exactly the round-6 [P1-1]
-      // regression we are guarding.
-      const { loadAndMaybeMigrateDoctorConfig } = await import("../commands/doctor-config-flow.js");
-      const result = await loadAndMaybeMigrateDoctorConfig({
-        options: { nonInteractive: true, repair: true },
-        confirm: async () => false,
+      // Run the real `applyLegacyCompatibilityStep` against the on-disk
+      // config. The `session.parentForkMaxTokens` legacy key triggers
+      // the runtime migration that removes it. The diff is destructive
+      // (a legacy key is removed), so the returned `removedPaths` MUST
+      // be non-empty.
+      const { applyLegacyCompatibilityStep } =
+        await import("../commands/doctor/shared/config-flow-steps.js");
+      const { findLegacyConfigIssues } = await import("../config/legacy.js");
+      const parsedForMigration = structuredClone(original) as Record<string, unknown>;
+      const legacyIssues = findLegacyConfigIssues(parsedForMigration);
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: parsedForMigration,
+        sourceConfig: original,
+        resolved: original,
+        runtimeConfig: original,
+        config: original,
+        valid: true,
+        issues: [],
+        warnings: [],
+        legacyIssues,
+      } as ConfigFileSnapshot;
+      const legacyStep = applyLegacyCompatibilityStep({
+        snapshot: baseSnapshot,
+        state: {
+          cfg: original,
+          candidate: original,
+          pendingChanges: false,
+          fixHints: [],
+        },
+        shouldRepair: true,
+        doctorFixCommand: "openclaw doctor --fix",
       });
 
-      // `authorizedDestructivePaths` may be undefined when the trusted
-      // migration did not actually change any destructive paths in this
-      // shape; that is fine — the write just goes through the normal
-      // path. The chain still proves that real doctor output can be
-      // written through the real `replaceConfigFile` with the returned
-      // authorized-paths metadata, without the writer self-rejecting
-      // because of wizard/auto-enable growth.
+      // The trusted migration must have produced a destructive diff. A
+      // missing `removedPaths` entry here would mean the legacy
+      // migration silently no-oped and the test is no longer exercising
+      // the chain it's meant to guard.
+      expect(legacyStep.removedPaths.length).toBeGreaterThan(0);
+      expect(legacyStep.removedPaths).toContainEqual(["session", "parentForkMaxTokens"]);
+      // applyLegacyCompatibilityStep returns the migrated candidate in
+      // `state.cfg` when the rule applies. We assert that the legacy
+      // key is gone from the migrated config (the migration actually
+      // fired) before handing it to the writer.
+      const migratedCandidate = legacyStep.state.cfg as Record<string, unknown>;
+      expect(
+        (migratedCandidate.session as Record<string, unknown> | undefined)?.parentForkMaxTokens,
+      ).toBeUndefined();
+
+      // The size-drop opt-in is granted only when the trusted migration
+      // actually changed the candidate (per the round-5 contract). The
+      // chain we're proving must assume this opt-in is set, otherwise
+      // the writer is allowed to refuse the write outright.
+      const authorizedDestructivePaths = legacyStep.removedPaths;
+
+      // Apply wizard metadata (the real wizard-owner path) before the
+      // real `replaceConfigFile`. This adds a `wizard` block to the
+      // candidate; the writer must accept that growth (round-6 [P1-1])
+      // AND the destructive legacy migration listed above.
+      const { applyWizardMetadata } = await import("../commands/onboard-helpers.js");
+      const nextConfig = applyWizardMetadata(
+        migratedCandidate as Parameters<typeof applyWizardMetadata>[0],
+        { command: "openclaw doctor --fix", mode: "local" },
+      );
+
       const writeOptions = {
-        allowConfigSizeDrop: result.allowConfigSizeDropOnWrite === true,
-        ...(result.authorizedDestructivePaths
-          ? { authorizedDestructivePaths: result.authorizedDestructivePaths }
-          : {}),
-        ...(result.sourceLastTouchedVersion
-          ? { lastTouchedVersionOverride: result.sourceLastTouchedVersion }
-          : {}),
-        ...(result.skipPluginValidationOnWrite ? { skipPluginValidation: true } : {}),
+        allowConfigSizeDrop: true,
+        authorizedDestructivePaths,
       };
 
       const writeResult = await replaceConfigFile({
-        nextConfig: result.cfg as OpenClawConfig,
-        writeOptions,
+        nextConfig: nextConfig as OpenClawConfig,
+        writeOptions: {
+          ...writeOptions,
+          ownedConfigPathForWrite: configPath,
+        },
       });
       expect(writeResult.snapshot).toBeDefined();
       expect(writeResult.nextConfig).toBeDefined();
+      expect(typeof writeResult.persistedHash).toBe("string");
+
+      // The returned `nextConfig` is the persisted config. The
+      // round-7 contract requires the trusted migration to have
+      // removed `session.parentForkMaxTokens` and the wizard block
+      // to be present in the same write.
+      const persistedNext = writeResult.nextConfig as Record<string, unknown>;
+      const persistedNextSession = persistedNext.session as Record<string, unknown> | undefined;
+      expect(persistedNextSession?.parentForkMaxTokens).toBeUndefined();
+      expect((persistedNext.wizard as Record<string, unknown>).lastRunCommand).toBe(
+        "openclaw doctor --fix",
+      );
+
+      // Verify the on-disk file matches the persisted config. This
+      // proves the chain is faithful to the round-7 contract:
+      // doctor-mandated destructive changes AND wizard-owner growth
+      // land together in the same write.
+      const persisted = JSON.parse(await fs.readFile(configPath, "utf-8")) as Record<
+        string,
+        unknown
+      >;
+      const persistedSession = persisted.session as Record<string, unknown> | undefined;
+      expect(persistedSession?.parentForkMaxTokens).toBeUndefined();
+      expect((persisted.wizard as Record<string, unknown>).lastRunCommand).toBe(
+        "openclaw doctor --fix",
+      );
     });
   });
 

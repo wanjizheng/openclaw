@@ -2661,7 +2661,7 @@ export function createConfigIO(
             snapshotParsed: snapshot.parsed,
             outputConfig,
             authorizedDestructivePaths: options.authorizedDestructivePaths,
-            writerManagedPaths: resolveWriterManagedConfigPathsForWrite(),
+            writerManagedPaths: resolveWriterManagedConfigPathsForWrite(snapshot.parsed),
           })
         : [],
     });
