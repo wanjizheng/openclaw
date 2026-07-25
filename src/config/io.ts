@@ -83,9 +83,9 @@ import {
   applyUnsetPathsForWrite,
   collectChangedPaths,
   collectDestructiveChanges,
+  configPathHasPrefix,
   configPathKey,
-  configPathOverlaps,
-  ConfigPath,
+  type ConfigPath,
   createMergePatch,
   formatConfigValidationFailure,
   preserveIncludeOwnedConfigForWrite,
@@ -602,8 +602,14 @@ function resolveConfigWriteBlockingReasons(
  * the writer's canonical contract, not an untrusted repair.
  *
  * Comparison uses `ConfigPath` segments so a top-level key `"agents.list"`
- * cannot collide with the nested path `agents.list`. Overlapping authorized
- * paths (e.g. `channels` covers `channels.telegram.token`) are honored.
+ * cannot collide with the nested path `agents.list`. Authorization coverage
+ * is DIRECTIONAL: an authorized ancestor path covers any destructive
+ * descendant, but an authorized descendant path does NOT cover the
+ * destruction of its ancestor. Concretely:
+ *   - authorized `["channels"]` covers destructive `["channels", "telegram"]`
+ *   - authorized `["channels", "telegram"]` does NOT cover destructive
+ *     `["channels"]` (replacing/removing the parent must be re-authorized
+ *     explicitly)
  */
 function collectUnauthorizedDestructivePaths(params: {
   snapshotParsed: unknown;
@@ -611,7 +617,6 @@ function collectUnauthorizedDestructivePaths(params: {
   authorizedDestructivePaths: readonly ConfigPath[] | undefined;
   writerManagedPaths: readonly ConfigPath[];
 }): string[] {
-  // Debug removed.
   if (params.authorizedDestructivePaths === undefined) {
     // Strict check is opt-in. When the caller has not enumerated authorized
     // paths, we treat every shrink as unauthorized only if a future caller
@@ -621,7 +626,6 @@ function collectUnauthorizedDestructivePaths(params: {
   }
   const destructive = new Set<string>();
   collectDestructiveChanges(params.snapshotParsed, params.outputConfig, [], destructive);
-  // Debug removed.
   if (destructive.size === 0) {
     return [];
   }
@@ -633,9 +637,13 @@ function collectUnauthorizedDestructivePaths(params: {
   const unauthorized: string[] = [];
   for (const pathKey of destructive) {
     const segments = JSON.parse(pathKey) as ConfigPath;
+    // Directional: an authorized ancestor may cover a destructive descendant,
+    // but an authorized descendant must never cover destruction of its
+    // ancestor. This prevents a single authorized leaf from accidentally
+    // authorizing the deletion of its parent object.
     const covered = authorizedKeys.some((authKey) => {
       const authSegments = JSON.parse(authKey) as ConfigPath;
-      return configPathOverlaps(segments, authSegments);
+      return configPathHasPrefix(segments, authSegments);
     });
     if (!covered) {
       unauthorized.push(pathKey);
