@@ -1081,7 +1081,12 @@ async function runWriteConfigHealth(ctx: DoctorHealthFlowContext): Promise<void>
       nextConfig: ctx.cfg,
       afterWrite: { mode: "auto" },
       writeOptions: {
-        allowConfigSizeDrop: ctx.configResult.shouldWriteConfig === true || updateDoctorRun,
+        // Only the explicit doctor --fix pending-changes path may bypass the
+        // 50% size-drop guard. The cfg-vs-cfgForPersistence auto-write path
+        // (e.g. wizard metadata tweak during update) must stay guarded, or
+        // auto-updates will silently shrink the user's config and force a
+        // .bak → main auto-restore on next startup (#80077 regression vector).
+        allowConfigSizeDrop: ctx.configResult.shouldWriteConfig === true,
         skipPluginValidation:
           ctx.configResult.skipPluginValidationOnWrite === true || updateDoctorRun,
         preservedLegacyRootKeys: ctx.configResult.preservedLegacyRootKeys,

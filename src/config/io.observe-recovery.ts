@@ -583,9 +583,16 @@ export async function maybeRecoverSuspiciousConfigRead(
 
   let healthState = await readConfigHealthState(params.deps);
   const entry = getConfigHealthEntry(healthState, params.configPath);
+  // Prefer `.last-good` over `.bak`: `.bak` is rotated on every successful
+  // doctor --fix write, so by the time auto-update triggers recovery it can
+  // already be a doctor-shrunken copy. `.last-good` is only promoted after a
+  // verified-good read, so it is the safer restore source. Fall back to
+  // `.bak` for users on older installs that never wrote a `.last-good`.
+  const lastGoodPath = resolveLastKnownGoodConfigPath(params.configPath);
   const backupPath = `${params.configPath}.bak`;
   const backupBaseline =
     entry.lastKnownGood ??
+    (await readConfigFingerprintForPath(params.deps, lastGoodPath)) ??
     (await readConfigFingerprintForPath(params.deps, backupPath)) ??
     undefined;
   const recoveryContext = resolveConfigReadRecoveryContext({
@@ -599,7 +606,10 @@ export async function maybeRecoverSuspiciousConfigRead(
   }
   const { suspicious, suspiciousSignature } = recoveryContext;
 
-  const backupRaw = await params.deps.fs.promises.readFile(backupPath, "utf-8").catch(() => null);
+  let backupRaw = await params.deps.fs.promises.readFile(lastGoodPath, "utf-8").catch(() => null);
+  if (backupRaw == null) {
+    backupRaw = await params.deps.fs.promises.readFile(backupPath, "utf-8").catch(() => null);
+  }
   if (!backupRaw) {
     return returnOriginalConfigRead(params);
   }
@@ -613,7 +623,10 @@ export async function maybeRecoverSuspiciousConfigRead(
   ) {
     return returnOriginalConfigRead(params);
   }
-  const backup = backupBaseline ?? (await readConfigFingerprintForPath(params.deps, backupPath));
+  const backup =
+    backupBaseline ??
+    (await readConfigFingerprintForPath(params.deps, lastGoodPath)) ??
+    (await readConfigFingerprintForPath(params.deps, backupPath));
   if (!backup?.gatewayMode) {
     return returnOriginalConfigRead(params);
   }
@@ -696,9 +709,17 @@ export function maybeRecoverSuspiciousConfigReadSync(
 
   let healthState = readConfigHealthStateSync(params.deps);
   const entry = getConfigHealthEntry(healthState, params.configPath);
+  // Mirror the async path: try `.last-good` first, then `.bak`. `.last-good`
+  // is only promoted after a verified-good read, so it is the safer restore
+  // source when auto-update triggered recovery against a doctor-shrunken
+  // config. Fall back to `.bak` for users on older installs.
+  const lastGoodPath = resolveLastKnownGoodConfigPath(params.configPath);
   const backupPath = `${params.configPath}.bak`;
   const backupBaseline =
-    entry.lastKnownGood ?? readConfigFingerprintForPathSync(params.deps, backupPath) ?? undefined;
+    entry.lastKnownGood ??
+    readConfigFingerprintForPathSync(params.deps, lastGoodPath) ??
+    readConfigFingerprintForPathSync(params.deps, backupPath) ??
+    undefined;
   const recoveryContext = resolveConfigReadRecoveryContext({
     current,
     parsed: params.parsed,
@@ -712,9 +733,13 @@ export function maybeRecoverSuspiciousConfigReadSync(
 
   let backupRaw: string;
   try {
-    backupRaw = params.deps.fs.readFileSync(backupPath, "utf-8");
+    backupRaw = params.deps.fs.readFileSync(lastGoodPath, "utf-8");
   } catch {
-    return returnOriginalConfigRead(params);
+    try {
+      backupRaw = params.deps.fs.readFileSync(backupPath, "utf-8");
+    } catch {
+      return returnOriginalConfigRead(params);
+    }
   }
   const backupParse = parseBackupConfigRaw(params.deps, backupRaw);
   if (!backupParse) {
@@ -726,7 +751,10 @@ export function maybeRecoverSuspiciousConfigReadSync(
   ) {
     return returnOriginalConfigRead(params);
   }
-  const backup = backupBaseline ?? readConfigFingerprintForPathSync(params.deps, backupPath);
+  const backup =
+    backupBaseline ??
+    readConfigFingerprintForPathSync(params.deps, lastGoodPath) ??
+    readConfigFingerprintForPathSync(params.deps, backupPath);
   if (!backup?.gatewayMode) {
     return returnOriginalConfigRead(params);
   }
