@@ -24,6 +24,15 @@ type DoctorConfigResult = {
   sourceConfigValid?: boolean;
   sourceLastTouchedVersion?: string;
   skipPluginValidationOnWrite?: boolean;
+  /**
+   * Explicit opt-in for the 50% size-drop guard. Only a named, auditable
+   * migration step may set this true — generic `shouldWriteConfig` is no
+   * longer enough because auto-update's `doctor --fix` non-interactive pass
+   * also trips that flag, which previously let unattended update flows
+   * silently shrink the user's config and force a `.bak` → main auto-restore
+   * on next startup (#80077 regression vector).
+   */
+  allowConfigSizeDropOnWrite?: boolean;
   preservedLegacyRootKeys?: readonly string[];
 };
 
@@ -1081,12 +1090,13 @@ async function runWriteConfigHealth(ctx: DoctorHealthFlowContext): Promise<void>
       nextConfig: ctx.cfg,
       afterWrite: { mode: "auto" },
       writeOptions: {
-        // Only the explicit doctor --fix pending-changes path may bypass the
-        // 50% size-drop guard. The cfg-vs-cfgForPersistence auto-write path
-        // (e.g. wizard metadata tweak during update) must stay guarded, or
-        // auto-updates will silently shrink the user's config and force a
-        // .bak → main auto-restore on next startup (#80077 regression vector).
-        allowConfigSizeDrop: ctx.configResult.shouldWriteConfig === true,
+        // Only a named, auditable migration step may bypass the 50% size-drop
+        // guard. Generic `shouldWriteConfig` is no longer sufficient because
+        // auto-update's `doctor --fix` non-interactive pass also trips that
+        // flag, which previously let unattended update flows silently shrink
+        // the user's config and force a `.bak` → main auto-restore on next
+        // startup (#80077 regression vector).
+        allowConfigSizeDrop: ctx.configResult.allowConfigSizeDropOnWrite === true,
         skipPluginValidation:
           ctx.configResult.skipPluginValidationOnWrite === true || updateDoctorRun,
         preservedLegacyRootKeys: ctx.configResult.preservedLegacyRootKeys,

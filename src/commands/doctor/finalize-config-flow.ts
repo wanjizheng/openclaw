@@ -10,7 +10,22 @@ export async function finalizeDoctorConfigFlow(params: {
   fixHints: string[];
   confirm: (p: { message: string; initialValue: boolean }) => Promise<boolean>;
   note: (message: string, title?: string) => void;
-}): Promise<{ cfg: OpenClawConfig; shouldWriteConfig: boolean }> {
+  /**
+   * Explicit opt-in for the 50% size-drop guard. Owner: a named migration
+   * step that knows it must remove legacy keys. Generic `shouldWriteConfig`
+   * is no longer enough — auto-update's `doctor --fix` non-interactive pass
+   * also trips that flag, which previously let unattended update flows
+   * silently shrink the user's config and force a `.bak` → main auto-restore
+   * on next startup (#80077 regression vector).
+   */
+  allowConfigSizeDropOnWrite?: boolean;
+}): Promise<{
+  cfg: OpenClawConfig;
+  shouldWriteConfig: boolean;
+  allowConfigSizeDropOnWrite: boolean;
+}> {
+  const baseShouldWrite = params.shouldRepair && params.pendingChanges;
+  const allowConfigSizeDropOnWrite = baseShouldWrite && params.allowConfigSizeDropOnWrite === true;
   if (!params.shouldRepair && params.pendingChanges) {
     const shouldApply = await params.confirm({
       message: "Apply recommended config repairs now?",
@@ -20,6 +35,7 @@ export async function finalizeDoctorConfigFlow(params: {
       return {
         cfg: params.candidate,
         shouldWriteConfig: true,
+        allowConfigSizeDropOnWrite,
       };
     }
     if (params.fixHints.length > 0) {
@@ -28,18 +44,21 @@ export async function finalizeDoctorConfigFlow(params: {
     return {
       cfg: params.cfg,
       shouldWriteConfig: false,
+      allowConfigSizeDropOnWrite: false,
     };
   }
 
-  if (params.shouldRepair && params.pendingChanges) {
+  if (baseShouldWrite) {
     return {
       cfg: params.cfg,
       shouldWriteConfig: true,
+      allowConfigSizeDropOnWrite,
     };
   }
 
   return {
     cfg: params.cfg,
     shouldWriteConfig: false,
+    allowConfigSizeDropOnWrite: false,
   };
 }

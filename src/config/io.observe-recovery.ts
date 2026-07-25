@@ -339,15 +339,208 @@ function writeConfigHealthStateSync(deps: ObserveRecoveryDeps, state: ConfigHeal
   writeConfigHealthStateToStore(deps, state);
 }
 
-function parseBackupConfigRaw(
-  deps: ObserveRecoveryDeps,
-  backupRaw: string,
-): { parsed: unknown } | null {
+type VerifiedRecoveryCandidate = {
+  source: "last-good" | "backup";
+  path: string;
+  raw: string;
+  parsed: unknown;
+  fingerprint: ConfigHealthFingerprint;
+};
+
+type RecoveryCandidateCommon = {
+  deps: ObserveRecoveryDeps;
+  source: "last-good" | "backup";
+  path: string;
+  raw: string;
+  // Hash from `entry.lastPromotedGood.hash`. When set, the candidate raw must
+  // hash-match. Absence is treated as "no integrity record" — the candidate is
+  // rejected because we cannot prove it was a verified-good promotion.
+  requiredHash?: string;
+  // Caller-level policy: some callers (e.g. small valid clobbers outside the
+  // gateway-mode-missing path) do not require a `gateway.mode` value.
+  requireGatewayMode: boolean;
+  now: string;
+};
+
+/**
+ * Validates a single raw candidate before it is allowed to overwrite the main
+ * config. A candidate is accepted only when every check passes; the rejection
+ * reason is logged so the caller can pick the next candidate.
+ *
+ * Checks, in order:
+ *   1. JSON5 parse
+ *   2. Hash match against `entry.lastPromotedGood.hash` (when present)
+ *   3. No redacted/polluted secret placeholders
+ *   4. `gateway.mode` present (when required by the caller)
+ *
+ * The caller still owns the optional `validateBackup` runtime gate, because
+ * its async/sync dispatch differs and its semantics are `.bak`-only (the
+ * `.last-good` candidate is already verified-good on disk).
+ */
+function verifyRecoveryCandidate(
+  params: RecoveryCandidateCommon,
+): VerifiedRecoveryCandidate | null {
+  let parsed: unknown;
   try {
-    return { parsed: deps.json5.parse(backupRaw) };
+    parsed = params.deps.json5.parse(params.raw);
   } catch {
+    params.deps.logger.warn(
+      `Config recovery skipped ${params.source} at ${params.path}: invalid JSON5`,
+    );
     return null;
   }
+  if (params.requiredHash) {
+    const hash = hashConfigRaw(params.raw);
+    if (hash !== params.requiredHash) {
+      params.deps.logger.warn(
+        `Config recovery skipped ${params.source} at ${params.path}: hash does not match lastPromotedGood`,
+      );
+      return null;
+    }
+  }
+  const polluted = collectPollutedSecretPlaceholders(parsed);
+  if (polluted.length > 0) {
+    params.deps.logger.warn(
+      `Config recovery skipped ${params.source} at ${params.path}: redacted secret placeholder at ${polluted[0]}`,
+    );
+    return null;
+  }
+  const fingerprint = createConfigHealthFingerprint({
+    hash: hashConfigRaw(params.raw),
+    raw: params.raw,
+    parsed,
+    gatewaySource: parsed,
+    stat: null,
+    observedAt: params.now,
+  });
+  if (params.requireGatewayMode && !fingerprint.gatewayMode) {
+    return null;
+  }
+  return {
+    source: params.source,
+    path: params.path,
+    raw: params.raw,
+    parsed,
+    fingerprint,
+  };
+}
+
+type PickVerifiedCandidateAsyncParams = {
+  deps: ObserveRecoveryDeps;
+  now: string;
+  lastGoodPath: string;
+  lastGoodRaw: string | null;
+  requiredLastGoodHash: string | undefined;
+  backupPath: string;
+  backupRaw: string | null;
+  requireGatewayMode: boolean;
+  validateBackup?: (backup: { raw: string; parsed: unknown }) => Promise<boolean>;
+};
+
+type PickVerifiedCandidateSyncParams = {
+  deps: ObserveRecoveryDeps;
+  now: string;
+  lastGoodPath: string;
+  lastGoodRaw: string | null;
+  requiredLastGoodHash: string | undefined;
+  backupPath: string;
+  backupRaw: string | null;
+  requireGatewayMode: boolean;
+  validateBackupSync?: (backup: { raw: string; parsed: unknown }) => boolean;
+};
+
+/**
+ * Picks the first verified recovery candidate. `.last-good` is preferred
+ * because it is only ever written after a verified-good promotion; we require
+ * its raw hash to match `entry.lastPromotedGood.hash` so a corrupted or
+ * doctor-shrunken `.last-good` file cannot silently overwrite the main config.
+ *
+ * If `entry.lastPromotedGood.hash` is missing, `.last-good` is treated as
+ * untrustworthy and we skip straight to `.bak` — the same invariant that
+ * `recoverConfigFromLastKnownGood` enforces. This avoids letting a `.last-good`
+ * file placed by an external party (or by a partial doctor pass) bypass the
+ * size-drop guard.
+ *
+ * `.bak` is used as a fallback for users on older installs that never wrote a
+ * `.last-good`. It is also reached when `.last-good` exists but is corrupt,
+ * hash-mismatched, polluted, or missing the required `gateway.mode` shape.
+ */
+async function pickVerifiedRecoveryCandidateAsync(
+  params: PickVerifiedCandidateAsyncParams,
+): Promise<VerifiedRecoveryCandidate | null> {
+  if (params.requiredLastGoodHash && params.lastGoodRaw != null && params.lastGoodRaw !== "") {
+    const lastGood = verifyRecoveryCandidate({
+      deps: params.deps,
+      source: "last-good",
+      path: params.lastGoodPath,
+      raw: params.lastGoodRaw,
+      requiredHash: params.requiredLastGoodHash,
+      requireGatewayMode: params.requireGatewayMode,
+      now: params.now,
+    });
+    if (lastGood) {
+      return lastGood;
+    }
+  }
+  if (params.backupRaw != null && params.backupRaw !== "") {
+    const backup = verifyRecoveryCandidate({
+      deps: params.deps,
+      source: "backup",
+      path: params.backupPath,
+      raw: params.backupRaw,
+      requireGatewayMode: params.requireGatewayMode,
+      now: params.now,
+    });
+    if (backup && params.validateBackup) {
+      const approved = await params.validateBackup({ raw: backup.raw, parsed: backup.parsed });
+      if (!approved) {
+        return null;
+      }
+    }
+    if (backup) {
+      return backup;
+    }
+  }
+  return null;
+}
+
+function pickVerifiedRecoveryCandidateSync(
+  params: PickVerifiedCandidateSyncParams,
+): VerifiedRecoveryCandidate | null {
+  if (params.requiredLastGoodHash && params.lastGoodRaw != null && params.lastGoodRaw !== "") {
+    const lastGood = verifyRecoveryCandidate({
+      deps: params.deps,
+      source: "last-good",
+      path: params.lastGoodPath,
+      raw: params.lastGoodRaw,
+      requiredHash: params.requiredLastGoodHash,
+      requireGatewayMode: params.requireGatewayMode,
+      now: params.now,
+    });
+    if (lastGood) {
+      return lastGood;
+    }
+  }
+  if (params.backupRaw != null && params.backupRaw !== "") {
+    const backup = verifyRecoveryCandidate({
+      deps: params.deps,
+      source: "backup",
+      path: params.backupPath,
+      raw: params.backupRaw,
+      requireGatewayMode: params.requireGatewayMode,
+      now: params.now,
+    });
+    if (backup && params.validateBackupSync) {
+      const approved = params.validateBackupSync({ raw: backup.raw, parsed: backup.parsed });
+      if (!approved) {
+        return null;
+      }
+    }
+    if (backup) {
+      return backup;
+    }
+  }
+  return null;
 }
 
 function getConfigHealthEntry(state: ConfigHealthState, configPath: string): ConfigHealthEntry {
@@ -399,18 +592,22 @@ function createRecoveredSuspiciousHealthState(params: {
 function logBackupRestoreResult(params: {
   deps: ObserveRecoveryDeps;
   configPath: string;
+  restoredSourcePath: string | null;
   suspicious: string[];
   restoredFromBackup: boolean;
   restoreErrorMessage: string | null;
 }): void {
+  const sourceLabel = params.restoredSourcePath?.endsWith(".last-good")
+    ? "last-known-good"
+    : "backup";
   if (params.restoredFromBackup) {
     params.deps.logger.warn(
-      `Config auto-restored from backup: ${params.configPath} (${params.suspicious.join(", ")})`,
+      `Config auto-restored from ${sourceLabel}: ${params.configPath} (${params.suspicious.join(", ")})`,
     );
     return;
   }
   params.deps.logger.warn(
-    `Config auto-restore from backup failed: ${params.configPath} (${params.suspicious.join(", ")}${
+    `Config auto-restore from ${sourceLabel} failed: ${params.configPath} (${params.suspicious.join(", ")}${
       params.restoreErrorMessage ? `; ${params.restoreErrorMessage}` : ""
     })`,
   );
@@ -583,18 +780,17 @@ export async function maybeRecoverSuspiciousConfigRead(
 
   let healthState = await readConfigHealthState(params.deps);
   const entry = getConfigHealthEntry(healthState, params.configPath);
-  // Prefer `.last-good` over `.bak`: `.bak` is rotated on every successful
-  // doctor --fix write, so by the time auto-update triggers recovery it can
-  // already be a doctor-shrunken copy. `.last-good` is only promoted after a
-  // verified-good read, so it is the safer restore source. Fall back to
-  // `.bak` for users on older installs that never wrote a `.last-good`.
   const lastGoodPath = resolveLastKnownGoodConfigPath(params.configPath);
   const backupPath = `${params.configPath}.bak`;
+  // The recovery baseline is separate from the restore source. We use the
+  // most recent verified-good fingerprint (entry.lastKnownGood, fallback to
+  // a freshly-read `.last-good` or `.bak`) to decide whether the current read
+  // is suspicious. The actual restore source is picked by `pickVerifiedCandidate`
+  // below and is never trusted by the baseline alone.
+  const baselineFromLastGood = await readConfigFingerprintForPath(params.deps, lastGoodPath);
+  const baselineFromBackup = await readConfigFingerprintForPath(params.deps, backupPath);
   const backupBaseline =
-    entry.lastKnownGood ??
-    (await readConfigFingerprintForPath(params.deps, lastGoodPath)) ??
-    (await readConfigFingerprintForPath(params.deps, backupPath)) ??
-    undefined;
+    entry.lastKnownGood ?? baselineFromLastGood ?? baselineFromBackup ?? undefined;
   const recoveryContext = resolveConfigReadRecoveryContext({
     current,
     parsed: params.parsed,
@@ -606,28 +802,24 @@ export async function maybeRecoverSuspiciousConfigRead(
   }
   const { suspicious, suspiciousSignature } = recoveryContext;
 
-  let backupRaw = await params.deps.fs.promises.readFile(lastGoodPath, "utf-8").catch(() => null);
-  if (backupRaw == null) {
-    backupRaw = await params.deps.fs.promises.readFile(backupPath, "utf-8").catch(() => null);
-  }
-  if (!backupRaw) {
-    return returnOriginalConfigRead(params);
-  }
-  const backupParse = parseBackupConfigRaw(params.deps, backupRaw);
-  if (!backupParse) {
-    return returnOriginalConfigRead(params);
-  }
-  if (
-    params.validateBackup &&
-    !(await params.validateBackup({ raw: backupRaw, parsed: backupParse.parsed }))
-  ) {
-    return returnOriginalConfigRead(params);
-  }
-  const backup =
-    backupBaseline ??
-    (await readConfigFingerprintForPath(params.deps, lastGoodPath)) ??
-    (await readConfigFingerprintForPath(params.deps, backupPath));
-  if (!backup?.gatewayMode) {
+  const requiredLastGoodHash = entry.lastPromotedGood?.hash;
+  const lastGoodRaw = await params.deps.fs.promises
+    .readFile(lastGoodPath, "utf-8")
+    .catch(() => null);
+  const backupRaw = await params.deps.fs.promises.readFile(backupPath, "utf-8").catch(() => null);
+
+  const candidate = await pickVerifiedRecoveryCandidateAsync({
+    deps: params.deps,
+    now,
+    lastGoodPath,
+    lastGoodRaw,
+    requiredLastGoodHash,
+    backupPath,
+    backupRaw,
+    requireGatewayMode: true,
+    validateBackup: params.validateBackup,
+  });
+  if (!candidate) {
     return returnOriginalConfigRead(params);
   }
   if (params.allowBackupRecovery && !(await params.allowBackupRecovery())) {
@@ -644,7 +836,7 @@ export async function maybeRecoverSuspiciousConfigRead(
   let restoredFromBackup = false;
   let restoreError: unknown;
   try {
-    await params.deps.fs.promises.writeFile(params.configPath, backupRaw, {
+    await params.deps.fs.promises.writeFile(params.configPath, candidate.raw, {
       encoding: "utf-8",
       mode: 0o600,
     });
@@ -661,6 +853,7 @@ export async function maybeRecoverSuspiciousConfigRead(
   logBackupRestoreResult({
     deps: params.deps,
     configPath: params.configPath,
+    restoredSourcePath: candidate.path,
     suspicious,
     restoredFromBackup,
     restoreErrorMessage: restoreErrorDetails.message,
@@ -674,9 +867,9 @@ export async function maybeRecoverSuspiciousConfigRead(
       current,
       suspicious,
       entry,
-      backup,
+      backup: candidate.fingerprint,
       clobberedPath,
-      backupPath,
+      backupPath: candidate.path,
       restoreErrorDetails,
     }),
   );
@@ -690,7 +883,7 @@ export async function maybeRecoverSuspiciousConfigRead(
     });
     await writeConfigHealthState(params.deps, healthState);
   }
-  return { raw: backupRaw, parsed: backupParse.parsed };
+  return { raw: candidate.raw, parsed: candidate.parsed };
 }
 
 export function maybeRecoverSuspiciousConfigReadSync(
@@ -709,17 +902,16 @@ export function maybeRecoverSuspiciousConfigReadSync(
 
   let healthState = readConfigHealthStateSync(params.deps);
   const entry = getConfigHealthEntry(healthState, params.configPath);
-  // Mirror the async path: try `.last-good` first, then `.bak`. `.last-good`
-  // is only promoted after a verified-good read, so it is the safer restore
-  // source when auto-update triggered recovery against a doctor-shrunken
-  // config. Fall back to `.bak` for users on older installs.
   const lastGoodPath = resolveLastKnownGoodConfigPath(params.configPath);
   const backupPath = `${params.configPath}.bak`;
+  // Mirror the async path: the baseline is the most recent verified-good
+  // fingerprint we can find, not the restore source. The restore source is
+  // picked by `pickVerifiedCandidateSync` and is never trusted by the
+  // baseline alone.
+  const baselineFromLastGood = readConfigFingerprintForPathSync(params.deps, lastGoodPath);
+  const baselineFromBackup = readConfigFingerprintForPathSync(params.deps, backupPath);
   const backupBaseline =
-    entry.lastKnownGood ??
-    readConfigFingerprintForPathSync(params.deps, lastGoodPath) ??
-    readConfigFingerprintForPathSync(params.deps, backupPath) ??
-    undefined;
+    entry.lastKnownGood ?? baselineFromLastGood ?? baselineFromBackup ?? undefined;
   const recoveryContext = resolveConfigReadRecoveryContext({
     current,
     parsed: params.parsed,
@@ -731,31 +923,28 @@ export function maybeRecoverSuspiciousConfigReadSync(
   }
   const { suspicious, suspiciousSignature } = recoveryContext;
 
-  let backupRaw: string;
+  const requiredLastGoodHash = entry.lastPromotedGood?.hash;
+  let lastGoodRaw: string | null = null;
   try {
-    backupRaw = params.deps.fs.readFileSync(lastGoodPath, "utf-8");
-  } catch {
-    try {
-      backupRaw = params.deps.fs.readFileSync(backupPath, "utf-8");
-    } catch {
-      return returnOriginalConfigRead(params);
-    }
-  }
-  const backupParse = parseBackupConfigRaw(params.deps, backupRaw);
-  if (!backupParse) {
-    return returnOriginalConfigRead(params);
-  }
-  if (
-    params.validateBackupSync &&
-    !params.validateBackupSync({ raw: backupRaw, parsed: backupParse.parsed })
-  ) {
-    return returnOriginalConfigRead(params);
-  }
-  const backup =
-    backupBaseline ??
-    readConfigFingerprintForPathSync(params.deps, lastGoodPath) ??
-    readConfigFingerprintForPathSync(params.deps, backupPath);
-  if (!backup?.gatewayMode) {
+    lastGoodRaw = params.deps.fs.readFileSync(lastGoodPath, "utf-8");
+  } catch {}
+  let backupRaw: string | null = null;
+  try {
+    backupRaw = params.deps.fs.readFileSync(backupPath, "utf-8");
+  } catch {}
+
+  const candidate = pickVerifiedRecoveryCandidateSync({
+    deps: params.deps,
+    now,
+    lastGoodPath,
+    lastGoodRaw,
+    requiredLastGoodHash,
+    backupPath,
+    backupRaw,
+    requireGatewayMode: true,
+    validateBackupSync: params.validateBackupSync,
+  });
+  if (!candidate) {
     return returnOriginalConfigRead(params);
   }
 
@@ -769,7 +958,7 @@ export function maybeRecoverSuspiciousConfigReadSync(
   let restoredFromBackup = false;
   let restoreError: unknown;
   try {
-    params.deps.fs.writeFileSync(params.configPath, backupRaw, {
+    params.deps.fs.writeFileSync(params.configPath, candidate.raw, {
       encoding: "utf-8",
       mode: 0o600,
     });
@@ -788,6 +977,7 @@ export function maybeRecoverSuspiciousConfigReadSync(
   logBackupRestoreResult({
     deps: params.deps,
     configPath: params.configPath,
+    restoredSourcePath: candidate.path,
     suspicious,
     restoredFromBackup,
     restoreErrorMessage: restoreErrorDetails.message,
@@ -801,9 +991,9 @@ export function maybeRecoverSuspiciousConfigReadSync(
       current,
       suspicious,
       entry,
-      backup,
+      backup: candidate.fingerprint,
       clobberedPath,
-      backupPath,
+      backupPath: candidate.path,
       restoreErrorDetails,
     }),
   );
@@ -817,7 +1007,7 @@ export function maybeRecoverSuspiciousConfigReadSync(
     });
     writeConfigHealthStateSync(params.deps, healthState);
   }
-  return { raw: backupRaw, parsed: backupParse.parsed };
+  return { raw: candidate.raw, parsed: candidate.parsed };
 }
 
 export async function promoteConfigSnapshotToLastKnownGood(params: {

@@ -11,7 +11,6 @@ import {
   noteOpencodeProviderOverrides,
 } from "./doctor-config-analysis.js";
 import { runDoctorConfigPreflight } from "./doctor-config-preflight.js";
-import { normalizeCompatibilityConfigValues } from "./doctor/shared/legacy-config-core-migrate.js";
 import type { DoctorOptions, DoctorPrompter } from "./doctor-prompter.js";
 import { emitDoctorNotes, sanitizeDoctorNote } from "./doctor/emit-notes.js";
 import { finalizeDoctorConfigFlow } from "./doctor/finalize-config-flow.js";
@@ -24,6 +23,7 @@ import {
   collectMissingDefaultAccountBindingWarnings,
   collectMissingExplicitDefaultAccountWarnings,
 } from "./doctor/shared/default-account-warnings.js";
+import { normalizeCompatibilityConfigValues } from "./doctor/shared/legacy-config-core-migrate.js";
 
 function hasLegacyInternalHookHandlers(raw: unknown): boolean {
   const handlers = (raw as { hooks?: { internal?: { handlers?: unknown } } })?.hooks?.internal
@@ -377,8 +377,15 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
     fixHints,
     confirm: params.confirm,
     note,
+    // Set the size-drop opt-in only when trusted, named migration steps in
+    // this flow actually changed the candidate. Generic `shouldWriteConfig`
+    // is no longer enough — auto-update's `doctor --fix` non-interactive
+    // pass also trips that flag and would otherwise silently shrink the
+    // user's config #80077.
+    allowConfigSizeDropOnWrite: legacyStep.changeLines.length > 0 || unknownStep.removed.length > 0,
   });
   cfg = finalized.cfg;
+  const allowConfigSizeDropOnWrite = finalized.allowConfigSizeDropOnWrite;
 
   noteOpencodeProviderOverrides(cfg);
   noteImplicitFallbackClobberWarnings(cfg);
@@ -389,6 +396,7 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
     shouldWriteConfig: finalized.shouldWriteConfig,
     sourceConfigValid: snapshot.valid,
     preservedLegacyRootKeys: ["defaultModel"],
+    ...(allowConfigSizeDropOnWrite ? { allowConfigSizeDropOnWrite } : {}),
     ...(sourceLastTouchedVersion ? { sourceLastTouchedVersion } : {}),
     ...(legacyMigrationPartiallyValid ? { skipPluginValidationOnWrite: true } : {}),
   };

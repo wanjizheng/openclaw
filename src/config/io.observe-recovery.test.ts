@@ -1147,4 +1147,187 @@ describe("config observe recovery", () => {
       expectWarnContaining(warn, "Config last-known-good promotion skipped");
     });
   });
+
+  it("prefers hash-verified .last-good over .bak when both exist (async)", async () => {
+    await withSuiteHome(async (home) => {
+      const { deps, configPath, auditPath } = makeDeps(home);
+      const lastGood = await makeSnapshot(configPath, recoverableTelegramConfig);
+      await expect(
+        promoteConfigSnapshotToLastKnownGood({ deps, snapshot: lastGood, logger: deps.logger }),
+      ).resolves.toBe(true);
+      // .bak is intentionally a different (stale) shape; recovery must prefer
+      // the promoted .last-good and ignore .bak.
+      await fsp.writeFile(
+        `${configPath}.bak`,
+        `${JSON.stringify({ gateway: { mode: "remote" } }, null, 2)}\n`,
+        "utf-8",
+      );
+      const clobbered = await writeConfigRaw(configPath, {
+        meta: { lastTouchedVersion: "2026.5.28" },
+      });
+
+      const recovered = await recoverSuspiciousConfigRead({
+        deps,
+        configPath,
+        ...clobbered,
+      });
+
+      expect(
+        (recovered.parsed as { channels?: { telegram?: unknown } }).channels?.telegram,
+      ).toEqual(recoverableTelegramConfig.channels.telegram);
+      const observe = await readLastObserveEvent(auditPath);
+      expect(observe?.restoredFromBackup).toBe(true);
+      expect(observe?.restoredBackupPath).toBe(resolveLastKnownGoodConfigPath(configPath));
+    });
+  });
+
+  it("falls back to .bak when .last-good hash mismatches lastPromotedGood (async)", async () => {
+    await withSuiteHome(async (home) => {
+      const { deps, configPath, auditPath } = makeDeps(home);
+      const promoted = await makeSnapshot(configPath, recoverableTelegramConfig);
+      await expect(
+        promoteConfigSnapshotToLastKnownGood({ deps, snapshot: promoted, logger: deps.logger }),
+      ).resolves.toBe(true);
+      // Wait — the promotion also wrote .last-good. Replace it with a
+      // tampered copy whose hash no longer matches lastPromotedGood.
+      const tamperedConfig = {
+        ...recoverableTelegramConfig,
+        channels: { telegram: { enabled: false, dmPolicy: "pairing" } },
+      };
+      await fsp.writeFile(
+        resolveLastKnownGoodConfigPath(configPath),
+        `${JSON.stringify(tamperedConfig, null, 2)}\n`,
+        "utf-8",
+      );
+      // .bak is the genuine recovery source.
+      await fsp.writeFile(
+        `${configPath}.bak`,
+        `${JSON.stringify(recoverableTelegramConfig, null, 2)}\n`,
+        "utf-8",
+      );
+      const clobbered = await writeConfigRaw(configPath, {
+        meta: { lastTouchedVersion: "2026.5.28" },
+      });
+
+      const recovered = await recoverSuspiciousConfigRead({
+        deps,
+        configPath,
+        ...clobbered,
+      });
+
+      expect(
+        (recovered.parsed as { channels?: { telegram?: unknown } }).channels?.telegram,
+      ).toEqual(recoverableTelegramConfig.channels.telegram);
+      const observe = await readLastObserveEvent(auditPath);
+      expect(observe?.restoredFromBackup).toBe(true);
+      expect(observe?.restoredBackupPath).toBe(`${configPath}.bak`);
+    });
+  });
+
+  it("falls back to .bak when .last-good is corrupt JSON5 (async)", async () => {
+    await withSuiteHome(async (home) => {
+      const { deps, configPath, auditPath } = makeDeps(home);
+      const promoted = await makeSnapshot(configPath, recoverableTelegramConfig);
+      await expect(
+        promoteConfigSnapshotToLastKnownGood({ deps, snapshot: promoted, logger: deps.logger }),
+      ).resolves.toBe(true);
+      // Tamper the .last-good file with invalid JSON5.
+      await fsp.writeFile(
+        resolveLastKnownGoodConfigPath(configPath),
+        "{ gateway: { mode: ",
+        "utf-8",
+      );
+      await fsp.writeFile(
+        `${configPath}.bak`,
+        `${JSON.stringify(recoverableTelegramConfig, null, 2)}\n`,
+        "utf-8",
+      );
+      const clobbered = await writeConfigRaw(configPath, {
+        meta: { lastTouchedVersion: "2026.5.28" },
+      });
+
+      const recovered = await recoverSuspiciousConfigRead({
+        deps,
+        configPath,
+        ...clobbered,
+      });
+
+      expect(
+        (recovered.parsed as { channels?: { telegram?: unknown } }).channels?.telegram,
+      ).toEqual(recoverableTelegramConfig.channels.telegram);
+      const observe = await readLastObserveEvent(auditPath);
+      expect(observe?.restoredBackupPath).toBe(`${configPath}.bak`);
+    });
+  });
+
+  it("does not restore from .last-good when lastPromotedGood hash is missing", async () => {
+    await withSuiteHome(async (home) => {
+      const { deps, configPath, auditPath } = makeDeps(home);
+      // Write .last-good directly without going through promotion — no
+      // lastPromotedGood record is created.
+      await fsp.mkdir(path.dirname(configPath), { recursive: true });
+      await fsp.writeFile(
+        resolveLastKnownGoodConfigPath(configPath),
+        `${JSON.stringify(recoverableTelegramConfig, null, 2)}\n`,
+        "utf-8",
+      );
+      await fsp.writeFile(
+        `${configPath}.bak`,
+        `${JSON.stringify(recoverableTelegramConfig, null, 2)}\n`,
+        "utf-8",
+      );
+      const clobbered = await writeConfigRaw(configPath, {
+        meta: { lastTouchedVersion: "2026.5.28" },
+      });
+
+      const recovered = await recoverSuspiciousConfigRead({
+        deps,
+        configPath,
+        ...clobbered,
+      });
+
+      expect(
+        (recovered.parsed as { channels?: { telegram?: unknown } }).channels?.telegram,
+      ).toEqual(recoverableTelegramConfig.channels.telegram);
+      const observe = await readLastObserveEvent(auditPath);
+      // No integrity record → must fall back to .bak.
+      expect(observe?.restoredBackupPath).toBe(`${configPath}.bak`);
+    });
+  });
+
+  it("mirrors async selection in the sync path (last-good preferred, .bak fallback)", async () => {
+    await withSuiteHome(async (home) => {
+      const { deps, configPath } = makeDeps(home);
+      const promoted = await makeSnapshot(configPath, recoverableTelegramConfig);
+      await expect(
+        promoteConfigSnapshotToLastKnownGood({ deps, snapshot: promoted, logger: deps.logger }),
+      ).resolves.toBe(true);
+      // Tamper .last-good so the sync path must fall back to .bak.
+      await fsp.writeFile(
+        resolveLastKnownGoodConfigPath(configPath),
+        "{ gateway: { mode: ",
+        "utf-8",
+      );
+      await fsp.writeFile(
+        `${configPath}.bak`,
+        `${JSON.stringify(recoverableTelegramConfig, null, 2)}\n`,
+        "utf-8",
+      );
+      const clobbered = await writeConfigRaw(configPath, {
+        meta: { lastTouchedVersion: "2026.5.28" },
+      });
+
+      const recovered = maybeRecoverSuspiciousConfigReadSync({
+        deps,
+        configPath,
+        raw: clobbered.raw,
+        parsed: clobbered.parsed,
+      });
+
+      expect(
+        (recovered.parsed as { channels?: { telegram?: unknown } }).channels?.telegram,
+      ).toEqual(recoverableTelegramConfig.channels.telegram);
+      await expect(fsp.readFile(configPath, "utf-8")).resolves.toContain('"mode": "local"');
+    });
+  });
 });
