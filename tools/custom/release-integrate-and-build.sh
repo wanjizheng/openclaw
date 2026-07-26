@@ -1088,7 +1088,7 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   log "artifacts synced"
 
   step "migrate and validate live configuration"
-  openclaw doctor --fix --non-interactive \
+  OPENCLAW_SERVICE_REPAIR_POLICY=external openclaw doctor --fix --non-interactive \
     || die "openclaw doctor --fix --non-interactive failed before gateway restart"
   openclaw config validate --json \
     | jq -e '.valid == true' >/dev/null \
