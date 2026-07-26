@@ -23,8 +23,8 @@ export type HybridCrHandlerDeps = {
   isHybridPlaying: (callSid: string) => boolean;
   /** Abort any in-flight LLM response for a callId. */
   abortInFlightResponse?: (callId: string) => void;
-  /** Speak the call's stored initial message via the manager (greeting). */
-  speakInitialMessage?: (callId: string) => Promise<void>;
+  /** Speak the call's stored initial message via its provider call ID. */
+  speakInitialMessage?: (providerCallId: string) => Promise<void>;
 };
 
 export class HybridCrHandler {
@@ -55,7 +55,17 @@ export class HybridCrHandler {
 
     ws.on("message", (data: Buffer | string | ArrayBuffer | Buffer[]) => {
       try {
-        const msg = JSON.parse(data.toString());
+        let raw: string;
+        if (typeof data === "string") {
+          raw = data;
+        } else if (Array.isArray(data)) {
+          raw = Buffer.concat(data).toString();
+        } else if (Buffer.isBuffer(data)) {
+          raw = data.toString();
+        } else {
+          raw = Buffer.from(new Uint8Array(data)).toString();
+        }
+        const msg = JSON.parse(raw);
         const summary = JSON.stringify(msg).slice(0, 300);
         console.log(`[voice-call][cr] Received: ${summary}`);
 
@@ -97,15 +107,16 @@ export class HybridCrHandler {
               this.deps.speakInitialMessage
             ) {
               const cid = call.callId;
+              const providerCallId = sid;
               const direction = call.direction;
               setTimeout(() => {
-                this.deps.speakInitialMessage!(cid)
+                this.deps.speakInitialMessage!(providerCallId)
                   .then(() => {
                     console.log(
                       `[voice-call][cr] Greeting playback initiated for ${cid} (${direction})`,
                     );
                   })
-                  .catch((err) => {
+                  .catch((err: unknown) => {
                     console.warn(`[voice-call][cr] Failed to speak greeting:`, err);
                   });
               }, 300);
@@ -149,7 +160,9 @@ export class HybridCrHandler {
       if (callSid) {
         this.connections.delete(callSid);
       }
-      if (!callId || !callSid) return;
+      if (!callId || !callSid) {
+        return;
+      }
 
       // Suppress call.ended when CR disconnects due to hybrid <Play> injection.
       if (this.deps.isHybridPlaying(callSid)) {
@@ -160,9 +173,13 @@ export class HybridCrHandler {
       }
 
       const call = this.deps.manager.getCall(callId);
-      if (!call) return;
+      if (!call) {
+        return;
+      }
       const terminalStates = new Set(["ended", "failed", "no-answer", "busy", "canceled"]);
-      if (terminalStates.has(call.state)) return;
+      if (terminalStates.has(call.state)) {
+        return;
+      }
 
       console.log(`[voice-call][cr] Synthesizing call.ended for ${callId}`);
       const ended: NormalizedEvent = {

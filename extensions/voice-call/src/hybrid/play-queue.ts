@@ -96,22 +96,29 @@ export class HybridPlayQueue {
    */
   async triggerFirst(callSid: string): Promise<void> {
     const q = this.queues.get(callSid);
-    if (!q || q.drained >= q.urls.length) return;
+    if (!q || q.drained >= q.urls.length) {
+      return;
+    }
     const url = q.urls[q.drained];
-    q.drained++;
 
     const redirectUrl = this.api.getPlayNextUrl(callSid, q.callId);
-    if (!redirectUrl) return;
+    if (!redirectUrl) {
+      this.clear(callSid);
+      throw new Error(`No hybrid play-next URL available for ${callSid}`);
+    }
 
     const twiml = buildPlayThenRedirectTwiml(url, redirectUrl);
     console.log(`[voice-call][hybrid] Playing first sentence via Call Update for ${callSid}`);
     try {
       await this.api.updateCallTwiml(callSid, twiml);
+      q.drained++;
     } catch (err) {
+      this.clear(callSid);
       console.error(
         `[voice-call][hybrid] Call Update for first play failed for ${callSid}:`,
         err instanceof Error ? err.message : err,
       );
+      throw err;
     }
   }
 
@@ -121,7 +128,9 @@ export class HybridPlayQueue {
    */
   async abort(callSid: string): Promise<void> {
     const q = this.queues.get(callSid);
-    if (!q) return;
+    if (!q) {
+      return;
+    }
 
     console.log(
       `[voice-call][hybrid] User interrupted playback for ${callSid}, aborting play queue`,
@@ -178,7 +187,9 @@ export class HybridPlayQueue {
       const url = q.urls[q.drained];
       q.drained++;
       const redirectUrl = this.api.getPlayNextUrl(callSid, callId ?? q.callId);
-      if (!redirectUrl) return cr ? buildResumeRelayTwiml(cr) : HYBRID_HANGUP_TWIML;
+      if (!redirectUrl) {
+        return cr ? buildResumeRelayTwiml(cr) : HYBRID_HANGUP_TWIML;
+      }
       return buildPlayThenRedirectTwiml(url, redirectUrl);
     }
 
@@ -202,7 +213,9 @@ export class HybridPlayQueue {
 
     // Queue not yet marked done — LLM still generating.  Pause then redirect.
     const redirectUrl = this.api.getPlayNextUrl(callSid, callId ?? q?.callId);
-    if (!redirectUrl) return cr ? buildResumeRelayTwiml(cr) : HYBRID_HANGUP_TWIML;
+    if (!redirectUrl) {
+      return cr ? buildResumeRelayTwiml(cr) : HYBRID_HANGUP_TWIML;
+    }
     return buildPauseThenRedirectTwiml(redirectUrl, 1);
   }
 }

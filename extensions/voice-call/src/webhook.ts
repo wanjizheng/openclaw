@@ -2,6 +2,7 @@
 import http from "node:http";
 import { URL } from "node:url";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
+import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
 import {
   asDateTimestampMs,
   resolveExpiresAtMsFromDurationMs,
@@ -12,8 +13,10 @@ import {
   normalizeOptionalString,
   normalizeStringEntries,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import {
   createWebhookInFlightLimiter,
+  normalizeWebhookPath,
   WEBHOOK_BODY_READ_DEFAULTS,
 } from "openclaw/plugin-sdk/webhook-ingress";
 import {
@@ -25,6 +28,7 @@ import { isAllowlistedCaller, normalizePhoneNumber } from "./allowlist.js";
 import {
   normalizeVoiceCallConfig,
   resolveVoiceCallEffectiveConfig,
+  resolveVoiceCallNumberRouteKeyForCall,
   type VoiceCallConfig,
 } from "./config.js";
 import type { CoreAgentDeps, CoreConfig } from "./core-bridge.js";
@@ -33,10 +37,11 @@ import { HybridCrHandler } from "./hybrid/cr-handler.js";
 import type { CallManager } from "./manager.js";
 import type { MediaStreamConfig } from "./media-stream.js";
 import { MediaStreamHandler } from "./media-stream.js";
-import { normalizePath } from "./path-utils.js";
 import type { VoiceCallProvider } from "./providers/base.js";
 import { isProviderStatusTerminal } from "./providers/shared/call-status.js";
 import type { TwilioProvider } from "./providers/twilio.js";
+import { normalizeProxyIp } from "./proxy-ip.js";
+import { resolveCallAgentId } from "./resolve-call-agent-id.js";
 import type { CallRecord, NormalizedEvent, WebhookContext } from "./types.js";
 import type { WebhookResponsePayload } from "./webhook.types.js";
 import type { RealtimeCallHandler } from "./webhook/realtime-handler.js";
@@ -47,9 +52,6 @@ const WEBHOOK_BODY_TIMEOUT_MS = WEBHOOK_BODY_READ_DEFAULTS.preAuth.timeoutMs;
 const MISSING_REMOTE_ADDRESS_IN_FLIGHT_KEY = "__voice_call_no_remote__";
 const STREAM_DISCONNECT_HANGUP_GRACE_MS = 2000;
 const TRANSCRIPT_LOG_MAX_CHARS = 200;
-
-type RealtimeTranscriptionRuntime = typeof import("./realtime-transcription.runtime.js");
-type ResponseGeneratorModule = typeof import("./response-generator.js");
 type Logger = {
   info: (message: string) => void;
   warn: (message: string) => void;
@@ -57,18 +59,13 @@ type Logger = {
   debug?: (message: string) => void;
 };
 
-let realtimeTranscriptionRuntimePromise: Promise<RealtimeTranscriptionRuntime> | undefined;
-let responseGeneratorModulePromise: Promise<ResponseGeneratorModule> | undefined;
+const loadRealtimeTranscriptionRuntime = createLazyRuntimeModule(
+  () => import("./realtime-transcription.runtime.js"),
+);
 
-function loadRealtimeTranscriptionRuntime(): Promise<RealtimeTranscriptionRuntime> {
-  realtimeTranscriptionRuntimePromise ??= import("./realtime-transcription.runtime.js");
-  return realtimeTranscriptionRuntimePromise;
-}
-
-function loadResponseGeneratorModule(): Promise<ResponseGeneratorModule> {
-  responseGeneratorModulePromise ??= import("./response-generator.js");
-  return responseGeneratorModulePromise;
-}
+const loadResponseGeneratorModule = createLazyRuntimeModule(
+  () => import("./response-generator.js"),
+);
 
 type WebhookHeaderGateResult =
   | { ok: true }
@@ -85,7 +82,7 @@ function sanitizeTranscriptForLog(value: string): string {
   if (sanitized.length <= TRANSCRIPT_LOG_MAX_CHARS) {
     return sanitized;
   }
-  return `${sanitized.slice(0, TRANSCRIPT_LOG_MAX_CHARS)}...`;
+  return `${truncateUtf16Safe(sanitized, TRANSCRIPT_LOG_MAX_CHARS)}...`;
 }
 
 function appendRecentTalkEventMetadata(call: CallRecord, event: TalkEvent): void {
@@ -112,24 +109,6 @@ function appendRecentTalkEventMetadata(call: CallRecord, event: TalkEvent): void
 
 function buildRequestUrl(requestUrl: string | undefined): URL {
   return new URL(requestUrl ?? "/", "http://localhost");
-}
-
-function normalizeProxyIp(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
-  if (!trimmed) {
-    return undefined;
-  }
-  const unwrapped =
-    trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
-  const normalized = unwrapped.toLowerCase();
-  const mappedIpv4Prefix = "::ffff:";
-  if (normalized.startsWith(mappedIpv4Prefix)) {
-    const mappedIpv4 = normalized.slice(mappedIpv4Prefix.length);
-    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(mappedIpv4)) {
-      return mappedIpv4;
-    }
-  }
-  return normalized;
 }
 
 function resolveForwardedClientIp(
@@ -432,16 +411,7 @@ export class VoiceCallWebhookServer {
           transcript,
           isFinal: true,
         };
-        this.manager.processEvent(event);
-
-        // Auto-respond in conversation mode (inbound always, outbound if mode is conversation)
-        const callMode = call.metadata?.mode as string | undefined;
-        const shouldRespond = call.direction === "inbound" || callMode === "conversation";
-        if (shouldRespond) {
-          this.handleInboundResponse(call.callId, transcript).catch((err: unknown) => {
-            console.warn(`[voice-call] Failed to auto-respond:`, err);
-          });
-        }
+        this.processEventWithAutoResponse(event);
       },
       onSpeechStart: (providerCallId) => {
         if (this.provider.name !== "twilio") {
@@ -454,7 +424,7 @@ export class VoiceCallWebhookServer {
         const twilio = this.provider as TwilioProvider;
         // Hybrid mode: abort the play queue + switch back to CR.
         if (twilio.isHybridMode && twilio.hasActiveHybridQueue(providerCallId)) {
-          twilio.abortHybridPlay(providerCallId).catch((err) => {
+          twilio.abortHybridPlay(providerCallId).catch((err: unknown) => {
             console.warn(
               `[voice-call][hybrid] abortHybridPlay failed:`,
               err instanceof Error ? err.message : err,
@@ -585,11 +555,12 @@ export class VoiceCallWebhookServer {
             // bare `/voice/stream`). Sibling prefixes that happen to share
             // a leading segment (e.g. `/voice/stream-other`) are still
             // rejected because the slash-delimited boundary is required.
-            const normalizedStreamPath = normalizePath(streamPath);
+            const normalizedStreamPath = normalizeWebhookPath(streamPath);
+            const normalizedRequestPath = path === null ? null : normalizeWebhookPath(path);
             const pathMatches =
               normalizedStreamPath === "/" ||
-              path === normalizedStreamPath ||
-              path.startsWith(`${normalizedStreamPath}/`);
+              normalizedRequestPath === normalizedStreamPath ||
+              normalizedRequestPath?.startsWith(`${normalizedStreamPath}/`) === true;
             if (pathMatches) {
               this.mediaStreamHandler.handleUpgrade(request, socket, head);
             } else {
@@ -692,31 +663,16 @@ export class VoiceCallWebhookServer {
         isHybridPlaying: (callSid) =>
           this.provider.name === "twilio" &&
           (this.provider as TwilioProvider).hasActiveHybridQueue(callSid),
-        speakInitialMessage: (callId) => this.manager.speakInitialMessage(callId).then(() => {}),
+        speakInitialMessage: (providerCallId) =>
+          this.manager.speakInitialMessage(providerCallId).then(() => {}),
         // Phase 1: no LLM-abort callback yet; barge-in is driven by onSpeechStart
         // on the fork stream (which calls TwilioProvider.abortHybridPlay).
       });
     }
     return this.crHandler;
   }
-
-  private normalizeWebhookPathForMatch(pathname: string): string {
-    const trimmed = pathname.trim();
-    if (!trimmed) {
-      return "/";
-    }
-    const prefixed = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
-    if (prefixed === "/") {
-      return prefixed;
-    }
-    return prefixed.endsWith("/") ? prefixed.slice(0, -1) : prefixed;
-  }
-
   private isWebhookPathMatch(requestPath: string, configuredPath: string): boolean {
-    return (
-      this.normalizeWebhookPathForMatch(requestPath) ===
-      this.normalizeWebhookPathForMatch(configuredPath)
-    );
+    return normalizeWebhookPath(requestPath) === normalizeWebhookPath(configuredPath);
   }
 
   /**
@@ -987,8 +943,8 @@ export class VoiceCallWebhookServer {
       if (!pattern) {
         return false;
       }
-      const normalizedPattern = this.normalizeWebhookPathForMatch(pattern);
-      const normalizedPathname = this.normalizeWebhookPathForMatch(pathname);
+      const normalizedPattern = normalizeWebhookPath(pattern);
+      const normalizedPathname = normalizeWebhookPath(pathname);
       if (normalizedPattern === "/") {
         return true;
       }
@@ -1046,11 +1002,28 @@ export class VoiceCallWebhookServer {
   private processParsedEvents(events: NormalizedEvent[]): void {
     for (const event of events) {
       try {
-        this.manager.processEvent(event);
+        this.processEventWithAutoResponse(event);
       } catch (err) {
         console.error(`[voice-call] Error processing event ${event.type}:`, err);
       }
     }
+  }
+
+  private processEventWithAutoResponse(event: NormalizedEvent): void {
+    const result = this.manager.processEvent(event);
+    if (result.kind !== "final-speech" || result.waiterResolved) {
+      return;
+    }
+    const callMode = result.call.metadata?.mode as string | undefined;
+    if (result.call.direction !== "inbound" && callMode !== "conversation") {
+      return;
+    }
+
+    // Both media-stream and carrier-webhook transcripts share this handoff.
+    // The manager result excludes replays and turn-token mismatches.
+    void this.handleInboundResponse(result.call.callId, result.transcript).catch((err: unknown) => {
+      console.warn(`[voice-call] Failed to auto-respond:`, err);
+    });
   }
 
   private writeWebhookResponse(res: http.ServerResponse, payload: WebhookResponsePayload): void {
@@ -1081,18 +1054,6 @@ export class VoiceCallWebhookServer {
   private async handleInboundResponse(callId: string, userMessage: string): Promise<void> {
     console.log(`[voice-call] Auto-responding to inbound call ${callId}: "${userMessage}"`);
 
-    // Custom-fork (Phase 8 hybrid mode): markers used by
-    // openclaw-auto-update's `verify_custom_integrity`. The greeting
-    // start timestamp and the in-flight abort-controller map were
-    // dropped during the v2026.5.28 semantic re-port (5/14); the
-    // variables are preserved here purely as integrity-check fingerprints
-    // so auto-update on other machines can confirm the custom path
-    // survived the port.
-    const greetingPlayStart = Date.now();
-    const inFlightAbortControllers = new Map<string, AbortController>();
-    void greetingPlayStart;
-    void inFlightAbortControllers;
-
     // Get call context for conversation history
     const call = this.manager.getCall(callId);
     if (!call) {
@@ -1111,9 +1072,37 @@ export class VoiceCallWebhookServer {
 
     try {
       const { generateVoiceResponse } = await loadResponseGeneratorModule();
-      const numberRouteKey =
-        typeof call.metadata?.numberRouteKey === "string" ? call.metadata.numberRouteKey : call.to;
+      const numberRouteKey = resolveVoiceCallNumberRouteKeyForCall(call);
       const effectiveConfig = resolveVoiceCallEffectiveConfig(this.config, numberRouteKey).config;
+
+      const speakGeneratedText = async (
+        text: string,
+        logPrefix: "Early AI response" | "AI response",
+      ): Promise<boolean> => {
+        // Custom fork: end hybrid calls only after the goodbye audio drains.
+        // Apply this to early block replies as well as the final result so the
+        // v2026.7 early-delivery path cannot bypass [END_CALL] handling.
+        const explicitMatch = /\[END_CALL\]/i.exec(text);
+        const goodbyePattern =
+          /(拜拜|拜啦|掰掰|白白|再见|bye[\s.!,~～。]*|goodbye|see\s*you|先这样|没事了|挂了|挂啦|挂了吧|mua)/i;
+        const lastUserText = (call.transcript[call.transcript.length - 1]?.text ?? "").trim();
+        const endCallByMarker = explicitMatch !== null;
+        const endCallByPattern = goodbyePattern.test(lastUserText) && goodbyePattern.test(text);
+        const shouldEndCall = endCallByMarker || endCallByPattern;
+        const spokenText = explicitMatch ? text.replace(/\[END_CALL\]/gi, "").trim() : text;
+        const endCallReason = endCallByMarker
+          ? "[END_CALL]"
+          : `goodbye pattern (user="${lastUserText.slice(-12)}")`;
+        console.log(
+          `[voice-call] ${logPrefix}: "${spokenText}"${shouldEndCall ? ` [end by ${endCallReason}]` : ""}`,
+        );
+        const speakResult = await this.manager.speak(
+          callId,
+          spokenText,
+          shouldEndCall ? { endCall: true } : { listenAfterPlayback: true },
+        );
+        return speakResult.success;
+      };
 
       const result = await generateVoiceResponse({
         voiceConfig: effectiveConfig,
@@ -1122,8 +1111,10 @@ export class VoiceCallWebhookServer {
         callId,
         sessionKey: call.sessionKey,
         from: call.from,
+        agentId: resolveCallAgentId(call, effectiveConfig),
         transcript: call.transcript,
         userMessage,
+        onEarlyText: (text) => speakGeneratedText(text, "Early AI response"),
       });
 
       if (result.error) {
@@ -1131,42 +1122,8 @@ export class VoiceCallWebhookServer {
         return;
       }
 
-      if (result.text) {
-        // Custom-fork: detect [END_CALL] marker that the system prompt asks
-        // the agent to emit on end-of-call. Strip it from the spoken text and
-        // End-of-call detection. Two triggers:
-        //  (1) [END_CALL] explicit marker in the response (LLM may emit this
-        //      when the system prompt asks it to).
-        //  (2) Goodbye phrase detection: 中文 拜拜 / 拜啦 / 拜啦拜啦 / mua ～
-        //      / bye / 再见 / 白白 / 掰掰 / 没了 / 先这样; 英文 bye / goodbye /
-        //      see you. We only treat a response as goodbye if the user
-        //      JUST spoke a goodbye phrase in the previous turn (i.e., the
-        //      call transcript's last user message matches the goodbye list)
-        //      — this avoids false positives during normal conversation.
-        // End-of-call is QUEUE-DRIVEN: pass `endCall: true` to manager.speak,
-        // which forwards it to provider.playTts, which marks the play queue
-        // with `endCall: true`.  After the audio finishes, the
-        // playAction=1 redirect returns HYBRID_HANGUP_TWIML and Twilio
-        // hangs up.  No setTimeout, no race with audio playback.
-        const explicitMatch = /\[END_CALL\]/i.exec(result.text);
-        const goodbyePattern =
-          /(拜拜|拜啦|掰掰|白白|再见|bye[\s.!,~～。]*|goodbye|see\s*you|先这样|没事了|挂了|挂啦|挂了吧|mua)/i;
-        const lastUserText = (call.transcript[call.transcript.length - 1]?.text ?? "").trim();
-        const userSaidGoodbye = goodbyePattern.test(lastUserText);
-        const botSaidGoodbye = goodbyePattern.test(result.text);
-        const endCallByMarker = explicitMatch !== null;
-        const endCallByPattern = userSaidGoodbye && botSaidGoodbye;
-        const shouldEndCall = endCallByMarker || endCallByPattern;
-        const spokenText = explicitMatch
-          ? result.text.replace(/\[END_CALL\]/gi, "").trim()
-          : result.text;
-        const endCallReason = endCallByMarker
-          ? "[END_CALL]"
-          : `goodbye pattern (user="${lastUserText.slice(-12)}")`;
-        console.log(
-          `[voice-call] AI response: "${spokenText}"${shouldEndCall ? ` [end by ${endCallReason}]` : ""}`,
-        );
-        await this.manager.speak(callId, spokenText, { endCall: shouldEndCall });
+      if (result.text && !result.deliveredEarly) {
+        await speakGeneratedText(result.text, "AI response");
       }
     } catch (err) {
       console.error(`[voice-call] Auto-response error:`, err);

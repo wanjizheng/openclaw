@@ -64,10 +64,14 @@ export function parseContactsFile(content: string): ParsedContact[] {
 
     // Find the ## heading line
     const headingLine = lines.find((l) => l.startsWith("## "));
-    if (!headingLine) continue;
+    if (!headingLine) {
+      continue;
+    }
 
     const name = headingLine.slice(3).trim();
-    if (!name) continue;
+    if (!name) {
+      continue;
+    }
 
     let phone = "";
     let email: string | undefined;
@@ -81,7 +85,9 @@ export function parseContactsFile(content: string): ParsedContact[] {
       const line = lines[i]!;
 
       // Horizontal rule separating contacts — skip
-      if (/^-{3,}$/.test(line.trim())) continue;
+      if (/^-{3,}$/.test(line.trim())) {
+        continue;
+      }
 
       if (!pastMeta) {
         if (line.startsWith("- ")) {
@@ -100,7 +106,9 @@ export function parseContactsFile(content: string): ParsedContact[] {
         }
 
         // First non-bullet, non-blank line after metadata → free-text info
-        if (line.trim() === "") continue;
+        if (line.trim() === "") {
+          continue;
+        }
         pastMeta = true;
       }
 
@@ -166,9 +174,13 @@ export function findContactByPhone(
   from: string | undefined,
   contacts: ParsedContact[],
 ): ParsedContact | undefined {
-  if (!from) return undefined;
+  if (!from) {
+    return undefined;
+  }
   const normalizedFrom = normalizePhoneNumber(from);
-  if (!normalizedFrom) return undefined;
+  if (!normalizedFrom) {
+    return undefined;
+  }
   return contacts.find((c) => normalizePhoneNumber(c.phone) === normalizedFrom);
 }
 

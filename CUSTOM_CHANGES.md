@@ -100,7 +100,7 @@ Discord report, no `(无通话记录)` phantom).
 
 ### Upgrade: v2026.5.7 → v2026.5.12 (cherry-pick with conflict resolution)
 
-**Base tag**: v2026.5.12  
+**Base tag**: v2026.5.12
 **Method**: cherry-pick of custom-main commit onto v2026.5.12; one conflict in
 `response-generator.ts` resolved by merging upstream `resolveVoiceAgentToolsAllow`
 with our `resolveVoiceAgentId` + contact loading block.
@@ -119,7 +119,7 @@ with our `resolveVoiceAgentId` + contact loading block.
 
 ### Upgrade: v2026.4.26 → v2026.5.7 (manual re-port)
 
-**Base tag**: v2026.5.7  
+**Base tag**: v2026.5.7
 **Method**: manual semantic re-port (not cherry-pick; minor version drift 4.x→5.x)
 
 - Created branch `upgrade/v2026.5.7` from `v2026.5.7` tag

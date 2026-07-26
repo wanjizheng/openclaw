@@ -40,15 +40,15 @@ export function buildOnCallEndedHandler(params: {
       return;
     }
 
-    void deletePerCallSessionFile({ api, call }).catch((err) =>
+    void deletePerCallSessionFile({ api, call }).catch((err: unknown) =>
       api.logger.warn(`[voice-call] session cleanup failed: ${formatErr(err)}`),
     );
     if (config.streaming?.hybridMode) {
-      void deleteCallAudioFiles(call.callId).catch((err) =>
+      void deleteCallAudioFiles(call.callId).catch((err: unknown) =>
         api.logger.warn(`[voice-call][hybrid] audio cleanup failed: ${formatErr(err)}`),
       );
     }
-    void runPostCallReport({ api, config, call }).catch((err) =>
+    void runPostCallReport({ api, config, call }).catch((err: unknown) =>
       api.logger.warn(`[voice-call] post-call report failed: ${formatErr(err)}`),
     );
   };

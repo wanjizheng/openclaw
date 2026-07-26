@@ -18,13 +18,13 @@ cat >> CUSTOM_CHANGES.md << LOG
 
 ### $TITLE
 - What changed:
-  - 
+  -
 - Why:
-  - 
+  -
 - Files:
-  - 
+  -
 - User-visible behavior:
-  - 
+  -
 LOG
 
 echo "[ok] template appended to CUSTOM_CHANGES.md"

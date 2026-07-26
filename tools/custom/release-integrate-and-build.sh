@@ -401,7 +401,6 @@ verify_strict_typecheck() {
     return 0
   fi
   local baseline_branch="${OPENCLAW_TYPECHECK_BASELINE_BRANCH:-custom-main}"
-  local filter_args=(--filter "@openclaw/voice-call" --filter "@openclaw/voice-call-plugin")
   local ts_err_file; ts_err_file="$(mktemp)"
   local typecheck_state_dir="${WORKSPACE_STATE_DIR:-$ROOT_DIR/tools/custom/.update}"
   local baseline_err_file="$typecheck_state_dir/_strict-typecheck-baseline.txt"
@@ -409,7 +408,7 @@ verify_strict_typecheck() {
 
   log "running strict typecheck (voice-call package)"
   local typecheck_rc
-  if pnpm tsgo "${filter_args[@]}" >"$ts_err_file" 2>&1 </dev/null; then
+  if pnpm tsgo:extensions >"$ts_err_file" 2>&1 </dev/null; then
     typecheck_rc=0
   else
     typecheck_rc=$?
@@ -915,7 +914,7 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
   step "pnpm ui:build"
   "${UI_BUILD_CMD[@]}" 2>&1 | tail -5
   log "build complete ($(elapsed))"
-  
+
   # ── Normalize version string for stable releases ──
   # Git tag v2026.3.1 may point to package.json with version 2026.3.1-beta.1
   # because OpenClaw promotes beta to stable via npm dist-tag without updating git tags.

@@ -28,19 +28,29 @@ export function configPathKey(path: ConfigPath): string {
 
 /** Segment-by-segment equality. */
 export function configPathEquals(a: ConfigPath, b: ConfigPath): boolean {
-  if (a === b) return true;
-  if (a.length !== b.length) return false;
+  if (a === b) {
+    return true;
+  }
+  if (a.length !== b.length) {
+    return false;
+  }
   for (let i = 0; i < a.length; i += 1) {
-    if (a[i] !== b[i]) return false;
+    if (a[i] !== b[i]) {
+      return false;
+    }
   }
   return true;
 }
 
 /** True when `path` starts with `prefix` (or is equal). */
 export function configPathHasPrefix(path: ConfigPath, prefix: ConfigPath): boolean {
-  if (prefix.length > path.length) return false;
+  if (prefix.length > path.length) {
+    return false;
+  }
   for (let i = 0; i < prefix.length; i += 1) {
-    if (path[i] !== prefix[i]) return false;
+    if (path[i] !== prefix[i]) {
+      return false;
+    }
   }
   return true;
 }
@@ -557,6 +567,7 @@ function normalizeAgentModelRefsAtPathForWrite(config: unknown, path: string[]):
   for (const key of AGENT_MODEL_CONFIG_KEYS) {
     next = normalizeModelConfigPathForWrite(next, [...path, key]);
   }
+  next = normalizeModelStringPathForWrite(next, [...path, "utilityModel"]);
   next = normalizeModelStringPathForWrite(next, [...path, "heartbeat", "model"]);
   next = normalizeModelConfigPathForWrite(next, [...path, "subagents", "model"]);
   next = normalizeModelStringPathForWrite(next, [...path, "compaction", "model"]);
@@ -930,7 +941,7 @@ function mergeMissingExplicitValues(
   return { changed, value: changed ? next : currentValue };
 }
 
-export function injectExplicitlySetPaths(params: {
+function injectExplicitlySetPaths(params: {
   valueSource: unknown;
   persistedCandidate: unknown;
   explicitSetPaths?: readonly (readonly string[])[];

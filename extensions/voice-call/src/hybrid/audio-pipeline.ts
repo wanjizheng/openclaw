@@ -23,7 +23,9 @@ import type { CoreConfig } from "../core-bridge.js";
 /** Resolve the directory where hybrid mode writes generated mp3 files. */
 export function resolveVoiceMessagesDir(): string {
   const fromEnv = process.env.VOICE_MESSAGES_DIR?.trim();
-  if (fromEnv) return fromEnv;
+  if (fromEnv) {
+    return fromEnv;
+  }
   return path.join(os.homedir(), ".openclaw", "workspace", "voice_messages");
 }
 
@@ -34,13 +36,19 @@ export function resolveVoiceMessagesDir(): string {
  */
 export function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined {
   const envBase = process.env.VOICE_CALL_AUDIO_BASE_URL?.trim();
-  if (envBase) return envBase.replace(/\/+$/, "");
+  if (envBase) {
+    return envBase.replace(/\/+$/, "");
+  }
 
   const legacyEnvBase = process.env.AUDIO_BASE_URL?.trim();
-  if (legacyEnvBase) return legacyEnvBase.replace(/\/+$/, "");
+  if (legacyEnvBase) {
+    return legacyEnvBase.replace(/\/+$/, "");
+  }
 
   const publicUrl = config.publicUrl?.trim();
-  if (!publicUrl) return undefined;
+  if (!publicUrl) {
+    return undefined;
+  }
 
   try {
     const origin = new URL(publicUrl).origin;
@@ -56,7 +64,9 @@ export function localPathToPublicUrl(
   config: VoiceCallConfig,
 ): string | undefined {
   const baseUrl = resolveAudioBaseUrl(config);
-  if (!baseUrl) return undefined;
+  if (!baseUrl) {
+    return undefined;
+  }
   const fileName = path.basename(localPath);
   return `${baseUrl}/${encodeURIComponent(fileName)}`;
 }
@@ -126,7 +136,9 @@ export async function generateHybridAudioFile(params: {
     const destPath = path.join(outputDir, fileName);
 
     const sagOk = await synthesizeWithSag(params.text, destPath);
-    if (sagOk) return destPath;
+    if (sagOk) {
+      return destPath;
+    }
 
     // Fallback: plugin-sdk textToSpeech (best effort)
     try {
@@ -173,7 +185,9 @@ export async function generateHybridAudioUrl(params: {
   callId?: string;
 }): Promise<string | undefined> {
   const localPath = await generateHybridAudioFile(params);
-  if (!localPath) return undefined;
+  if (!localPath) {
+    return undefined;
+  }
   return localPathToPublicUrl(localPath, params.voiceConfig);
 }
 
@@ -207,7 +221,9 @@ export async function deleteCallAudioFiles(
   await Promise.all(
     extraUrls.map(async (urlOrPath) => {
       const fileName = decodeURIComponent(urlOrPath.split("/").pop() ?? "");
-      if (!fileName) return;
+      if (!fileName) {
+        return;
+      }
       const fp = path.join(dir, fileName);
       deleted.push(fileName);
       await fsp.unlink(fp).catch(() => {});

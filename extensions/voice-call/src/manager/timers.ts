@@ -1,19 +1,10 @@
-import { TerminalStates, type CallId } from "../types.js";
+import { TerminalStates, type CallId, type CallRecord } from "../types.js";
 import type { CallManagerContext } from "./context.js";
 import { persistCallRecord } from "./store.js";
 import {
   resolveVoiceCallSecondsTimerDelayMs,
   resolveVoiceCallTimerDelayMs,
 } from "./timer-delays.js";
-
-// Custom-fork (Phase 8 hybrid mode): marker used by openclaw-auto-update's
-// `verify_custom_integrity` to confirm this fork's voice-call custom code
-// is present. The set itself was dropped during the v2026.5.28 semantic
-// re-port (the 5/1 → 5/12 port kept the marker as a Set; the 5/14 → 5/28
-// re-port re-implemented the dedup without it). The const is preserved
-// here purely as the integrity-check fingerprint so auto-update on other
-// machines can confirm the custom path survived the port.
-const firedCallEndIds = new Set<string>();
 
 type TimerContext = Pick<
   CallManagerContext,
@@ -68,6 +59,28 @@ export function startMaxDurationTimer(params: {
   }, maxDurationMs);
 
   params.ctx.maxDurationTimers.set(params.callId, timer);
+}
+
+/** Backfill max-duration enforcement from the first live conversation signal. */
+export function ensureMaxDurationTimerForLiveCall(params: {
+  ctx: MaxDurationTimerContext;
+  call: CallRecord;
+  liveAt: number;
+  onTimeout: (callId: CallId) => Promise<void>;
+}): void {
+  if (params.call.answeredAt) {
+    return;
+  }
+
+  // Realtime streams can prove the call is live before an answered callback;
+  // use that first live signal so stale cleanup can skip it without losing
+  // maxDurationSeconds enforcement.
+  params.call.answeredAt = params.liveAt;
+  startMaxDurationTimer({
+    ctx: params.ctx,
+    callId: params.call.callId,
+    onTimeout: params.onTimeout,
+  });
 }
 
 export function clearTranscriptWaiter(ctx: TranscriptWaiterContext, callId: CallId): void {

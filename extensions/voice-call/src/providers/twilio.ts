@@ -32,6 +32,7 @@ import {
   normalizeProviderStatus,
 } from "./shared/call-status.js";
 import { guardedJsonApiRequest } from "./shared/guarded-json-api.js";
+import { resolveTwilioApiBaseUrl, type TwilioRegion } from "./twilio-region.js";
 import type { TwilioProviderOptions } from "./twilio.types.js";
 import { TwilioApiError, twilioApiRequest } from "./twilio/api.js";
 import { decideTwimlResponse, readTwimlRequestView } from "./twilio/twiml-policy.js";
@@ -73,6 +74,7 @@ type StreamSendResult = {
 type TwilioProviderConfig = {
   accountSid?: string;
   authToken?: string;
+  region?: TwilioRegion;
 };
 
 export class TwilioProvider implements VoiceCallProvider {
@@ -162,7 +164,10 @@ export class TwilioProvider implements VoiceCallProvider {
 
     this.accountSid = config.accountSid;
     this.authToken = config.authToken;
-    this.baseUrl = `https://api.twilio.com/2010-04-01/Accounts/${this.accountSid}`;
+    this.baseUrl = resolveTwilioApiBaseUrl({
+      accountSid: this.accountSid,
+      region: config.region,
+    });
     this.options = options;
 
     if (options.publicUrl) {
@@ -186,7 +191,9 @@ export class TwilioProvider implements VoiceCallProvider {
 
   /** Lazily-constructed hybrid play queue (null when hybrid disabled). */
   getHybridQueue(): HybridPlayQueue | null {
-    if (!this.isHybridMode) return null;
+    if (!this.isHybridMode) {
+      return null;
+    }
     if (!this.hybridQueue) {
       const api: CallUpdateApi = {
         updateCallTwiml: (sid, twiml) => this.updateCallTwiml(sid, twiml),
@@ -216,7 +223,9 @@ export class TwilioProvider implements VoiceCallProvider {
   /** Handle the playAction redirect callback. */
   handlePlayNextAction(callSid: string, callId?: string): string {
     const q = this.getHybridQueue();
-    if (!q) return TwilioProvider.PAUSE_TWIML;
+    if (!q) {
+      return TwilioProvider.PAUSE_TWIML;
+    }
     return q.handlePlayNextAction(callSid, callId);
   }
 
@@ -227,16 +236,22 @@ export class TwilioProvider implements VoiceCallProvider {
 
   /** Build the public redirect URL for hybrid play-next chaining. */
   private getPlayNextUrl(_callSid: string, callId?: string): string | null {
-    if (!this.currentPublicUrl) return null;
+    if (!this.currentPublicUrl) {
+      return null;
+    }
     const url = new URL(this.currentPublicUrl);
-    if (callId) url.searchParams.set("callId", callId);
+    if (callId) {
+      url.searchParams.set("callId", callId);
+    }
     url.searchParams.set("playAction", "1");
     return url.toString();
   }
 
   /** Get the WebSocket URL for ConversationRelay (hybrid mode). */
   private getConversationRelayWsUrl(): string | null {
-    if (!this.currentPublicUrl) return null;
+    if (!this.currentPublicUrl) {
+      return null;
+    }
     const url = new URL(this.currentPublicUrl);
     const wsOrigin = url.origin.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://");
     const crPath = (this.options.crPath ?? "/voice/cr").startsWith("/")
@@ -248,7 +263,9 @@ export class TwilioProvider implements VoiceCallProvider {
   /** Resolve current ConversationRelay options for hybrid TwiML/resume. */
   getConversationRelayOptions(): ConversationRelayOptions | null {
     const wsUrl = this.getConversationRelayWsUrl();
-    if (!wsUrl) return null;
+    if (!wsUrl) {
+      return null;
+    }
     return { wsUrl };
   }
 
@@ -262,6 +279,7 @@ export class TwilioProvider implements VoiceCallProvider {
 
   registerCallStream(callSid: string, streamSid: string): void {
     this.callStreamMap.set(callSid, streamSid);
+    this.activeStreamCalls.add(callSid);
   }
 
   hasRegisteredStream(callSid: string): boolean {
@@ -524,7 +542,6 @@ export class TwilioProvider implements VoiceCallProvider {
         const streamUrl = this.getStreamUrlForCall(view.callSid);
         const cr = this.getConversationRelayOptions();
         if (streamUrl && cr) {
-          this.activeStreamCalls.add(view.callSid);
           const initialAudioUrl = view.callIdFromQuery
             ? this.hybridInitialAudio.get(view.callIdFromQuery)
             : undefined;
@@ -552,10 +569,6 @@ export class TwilioProvider implements VoiceCallProvider {
     if (decision.consumeStoredTwimlCallId) {
       this.deleteStoredTwiml(decision.consumeStoredTwimlCallId);
     }
-    if (decision.activateStreamCallSid) {
-      this.activeStreamCalls.add(decision.activateStreamCallSid);
-    }
-
     switch (decision.kind) {
       case "stored":
         return storedTwiml ?? TwilioProvider.EMPTY_TWIML;
@@ -975,7 +988,7 @@ export class TwilioProvider implements VoiceCallProvider {
           Authorization: `Basic ${Buffer.from(`${this.accountSid}:${this.authToken}`).toString("base64")}`,
         },
         allowNotFound: true,
-        allowedHostnames: ["api.twilio.com"],
+        allowedHostnames: [new URL(this.baseUrl).hostname],
         auditContext: "twilio-get-call-status",
         errorPrefix: "Twilio get call status error",
       });

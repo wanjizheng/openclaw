@@ -1,8 +1,10 @@
 // Voice Call plugin module implements outbound behavior.
 import crypto from "node:crypto";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import {
   resolveVoiceCallEffectiveConfig,
+  resolveVoiceCallNumberRouteKeyForCall,
   resolveVoiceCallSessionKey,
   type CallMode,
 } from "../config.js";
@@ -22,7 +24,11 @@ import { getCallByProviderCallId } from "./lookup.js";
 import { addTranscriptEntry, transitionState } from "./state.js";
 import { persistCallRecord } from "./store.js";
 import { resolveVoiceCallSecondsTimerDelayMs } from "./timer-delays.js";
-import { clearTranscriptWaiter, waitForFinalTranscript } from "./timers.js";
+import {
+  clearTranscriptWaiter,
+  ensureMaxDurationTimerForLiveCall,
+  waitForFinalTranscript,
+} from "./timers.js";
 import {
   generateDtmfRedirectTwiml,
   generateHybridNotifyTwiml,
@@ -35,6 +41,7 @@ type InitiateContext = Pick<
   | "providerCallIdMap"
   | "provider"
   | "config"
+  | "coreSession"
   | "storePath"
   | "webhookUrl"
   | "streamSessionIssuer"
@@ -42,7 +49,13 @@ type InitiateContext = Pick<
 
 type SpeakContext = Pick<
   CallManagerContext,
-  "activeCalls" | "providerCallIdMap" | "provider" | "config" | "storePath"
+  | "activeCalls"
+  | "providerCallIdMap"
+  | "provider"
+  | "config"
+  | "storePath"
+  | "transcriptWaiters"
+  | "maxDurationTimers"
 >;
 
 type ConversationContext = Pick<
@@ -137,6 +150,7 @@ export async function initiateCall(
   const mode = opts.mode ?? ctx.config.outbound.defaultMode;
   const dtmfSequence = opts.dtmfSequence;
   const requesterSessionKey = opts.requesterSessionKey?.trim();
+  const agentId = normalizeAgentId(opts.agentId ?? ctx.config.agentId);
   if (dtmfSequence) {
     const validationError = validateDtmfDigits(dtmfSequence);
     if (validationError) {
@@ -181,11 +195,13 @@ export async function initiateCall(
     from,
     to,
     sessionKey: resolveVoiceCallSessionKey({
-      config: ctx.config,
+      config: { ...ctx.config, agentId },
       callId,
       phone: to,
       explicitSessionKey: sessionKey,
+      coreSession: ctx.coreSession,
     }),
+    agentId,
     startedAt: Date.now(),
     transcript: [],
     processedEventIds: [],
@@ -275,11 +291,16 @@ export async function initiateCall(
   }
 }
 
+export type SpeakOptions = {
+  listenAfterPlayback?: boolean;
+  endCall?: boolean;
+};
+
 export async function speak(
   ctx: SpeakContext,
   callId: CallId,
   text: string,
-  options?: { endCall?: boolean },
+  options?: SpeakOptions,
 ): Promise<{ success: boolean; error?: string }> {
   const connected = requireConnectedCall(ctx, callId);
   if (!connected.ok) {
@@ -288,14 +309,22 @@ export async function speak(
   const { call, providerCallId, provider } = connected;
 
   try {
+    ensureMaxDurationTimerForLiveCall({
+      ctx,
+      call,
+      liveAt: Date.now(),
+      onTimeout: async (id) => {
+        await endCall(ctx, id, { reason: "timeout" });
+      },
+    });
     transitionState(call, "speaking");
     persistCallRecord(ctx.storePath, call);
 
-    const numberRouteKey =
-      typeof call.metadata?.numberRouteKey === "string" ? call.metadata.numberRouteKey : call.to;
+    const numberRouteKey = resolveVoiceCallNumberRouteKeyForCall(call);
     const voice = resolvePreferredTtsVoice(
       resolveVoiceCallEffectiveConfig(ctx.config, numberRouteKey).config,
     );
+    const playbackOptions = options?.listenAfterPlayback ? { listenAfterPlayback: true } : {};
 
     // Hybrid mode: pre-generate the mp3 file and pass its public URL.
     // Twilio plays it via Call Update <Play> instead of streaming over WS.
@@ -326,6 +355,7 @@ export async function speak(
       providerCallId,
       text,
       voice,
+      ...playbackOptions,
       audioUrl,
       endCall: options?.endCall,
     });
