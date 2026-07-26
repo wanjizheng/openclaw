@@ -19,6 +19,10 @@ import {
   applyUnknownConfigKeyStep,
 } from "./doctor/shared/config-flow-steps.js";
 import { applyDoctorConfigMutation } from "./doctor/shared/config-mutation-state.js";
+import {
+  collectMissingDefaultAccountBindingWarnings,
+  collectMissingExplicitDefaultAccountWarnings,
+} from "./doctor/shared/default-account-warnings.js";
 import { normalizeCompatibilityConfigValues } from "./doctor/shared/legacy-config-core-migrate.js";
 
 function hasLegacyInternalHookHandlers(raw: unknown): boolean {
@@ -285,6 +289,16 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
     }
   }
 
+  const missingDefaultAccountBindingWarnings =
+    collectMissingDefaultAccountBindingWarnings(candidate);
+  if (missingDefaultAccountBindingWarnings.length > 0) {
+    note(missingDefaultAccountBindingWarnings.join("\n"), "Doctor warnings");
+  }
+  const missingExplicitDefaultWarnings = collectMissingExplicitDefaultAccountWarnings(candidate);
+  if (missingExplicitDefaultWarnings.length > 0) {
+    note(missingExplicitDefaultWarnings.join("\n"), "Doctor warnings");
+  }
+
   const { repairHooksTokenReuseGatewayAuth } =
     await import("./doctor/shared/hooks-token-reuse-repair.js");
   const hooksTokenReuseRepair = await repairHooksTokenReuseGatewayAuth(candidate, process.env);
@@ -355,6 +369,24 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
     note(unknownStep.warnings.join("\n"), "Doctor warnings");
   }
 
+  // When the trusted, named migration steps actually changed the candidate,
+  // record exactly which paths they made destructive. The downstream writer
+  // uses this as the white-list of authorized destructive changes: any
+  // further shrink by an untrusted repair (stale-cleanup, hooks-token
+  // repair, channel-doctor, etc.) cannot ride this list and will be rejected
+  // by the writer, even when the size-drop opt-in is set. The diff is
+  // computed BEFORE the untrusted siblings get a chance to shrink the
+  // candidate, so they cannot leak into the authorized set.
+  // `unknownStep.removedPaths` is part of the round-5 contract but several
+  // doctor-flow tests still mock `stripUnknownConfigKeys` to return only
+  // `{ config, removed }`. Treat missing as "no typed paths known" so the
+  // legacy/typed path wiring stays robust while the test mocks catch up.
+  const trustedMigrationRemovedPaths: Array<readonly (string | number)[]> = [
+    ...legacyStep.removedPaths,
+    ...(unknownStep.removedPaths ?? []),
+  ];
+  const trustedMigrationChanged = trustedMigrationRemovedPaths.length > 0;
+
   const finalized = await finalizeDoctorConfigFlow({
     cfg,
     candidate,
@@ -363,8 +395,15 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
     fixHints,
     confirm: params.confirm,
     note,
+    // Set the size-drop opt-in only when trusted, named migration steps in
+    // this flow actually changed the candidate. Generic `shouldWriteConfig`
+    // is no longer enough — auto-update's `doctor --fix` non-interactive
+    // pass also trips that flag and would otherwise silently shrink the
+    // user's config #80077.
+    allowConfigSizeDropOnWrite: trustedMigrationChanged,
   });
   cfg = finalized.cfg;
+  const allowConfigSizeDropOnWrite = finalized.allowConfigSizeDropOnWrite;
 
   noteOpencodeProviderOverrides(cfg);
   noteImplicitFallbackClobberWarnings(cfg);
@@ -375,6 +414,10 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
     shouldWriteConfig: finalized.shouldWriteConfig,
     sourceConfigValid: snapshot.valid,
     preservedLegacyRootKeys: ["defaultModel"],
+    ...(allowConfigSizeDropOnWrite ? { allowConfigSizeDropOnWrite } : {}),
+    ...(allowConfigSizeDropOnWrite && trustedMigrationRemovedPaths.length > 0
+      ? { authorizedDestructivePaths: trustedMigrationRemovedPaths }
+      : {}),
     ...(sourceLastTouchedVersion ? { sourceLastTouchedVersion } : {}),
     ...(legacyMigrationPartiallyValid ? { skipPluginValidationOnWrite: true } : {}),
   };

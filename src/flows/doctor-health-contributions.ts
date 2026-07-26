@@ -28,6 +28,23 @@ type DoctorConfigResult = {
   sourceConfigValid?: boolean;
   sourceLastTouchedVersion?: string;
   skipPluginValidationOnWrite?: boolean;
+  /**
+   * Explicit opt-in for the 50% size-drop guard. Only a named, auditable
+   * migration step may set this true — generic `shouldWriteConfig` is no
+   * longer enough because auto-update's `doctor --fix` non-interactive pass
+   * also trips that flag, which previously let unattended update flows
+   * silently shrink the user's config and force a `.bak` → main auto-restore
+   * on next startup (#80077 regression vector).
+   */
+  allowConfigSizeDropOnWrite?: boolean;
+  /**
+   * Typed `ConfigPath` segments that the trusted, named migration steps
+   * actually made destructive (any size shrink, not just removals) in this
+   * flow. The writer uses this as the white-list of authorized destructive
+   * changes: any other shrink by an untrusted repair cannot ride this list
+   * and will be rejected, even when the size-drop opt-in is set.
+   */
+  authorizedDestructivePaths?: ReadonlyArray<readonly (string | number)[]>;
   preservedLegacyRootKeys?: readonly string[];
 };
 
@@ -1292,7 +1309,24 @@ async function runWriteConfigHealth(ctx: DoctorHealthFlowContext): Promise<void>
       nextConfig: ctx.cfg,
       afterWrite: { mode: "auto" },
       writeOptions: {
-        allowConfigSizeDrop: ctx.configResult.shouldWriteConfig === true || updateDoctorRun,
+        // Only a named, auditable migration step may bypass the 50% size-drop
+        // guard. Generic `shouldWriteConfig` is no longer sufficient because
+        // auto-update's `doctor --fix` non-interactive pass also trips that
+        // flag, which previously let unattended update flows silently shrink
+        // the user's config and force a `.bak` → main auto-restore on next
+        // startup (#80077 regression vector).
+        allowConfigSizeDrop: ctx.configResult.allowConfigSizeDropOnWrite === true,
+        // Bound the size-drop opt-in to the exact paths the trusted migration
+        // itself made destructive. The writer walks the on-disk snapshot
+        // against the projected payload and rejects any commit whose diff
+        // shrinks a path NOT in this list. Without this, any later repair
+        // that further shrinks the config could ride the transaction-level
+        // opt-in and bypass the guard. Writer-managed unset paths
+        // (`plugins.installs`) are auto-unioned in the writer.
+        ...(ctx.configResult.authorizedDestructivePaths &&
+        ctx.configResult.authorizedDestructivePaths.length > 0
+          ? { authorizedDestructivePaths: ctx.configResult.authorizedDestructivePaths }
+          : {}),
         skipPluginValidation:
           ctx.configResult.skipPluginValidationOnWrite === true || updateDoctorRun,
         preservedLegacyRootKeys: ctx.configResult.preservedLegacyRootKeys,

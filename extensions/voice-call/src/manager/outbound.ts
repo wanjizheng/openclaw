@@ -8,6 +8,7 @@ import {
   resolveVoiceCallSessionKey,
   type CallMode,
 } from "../config.js";
+import { generateHybridAudioUrl } from "../hybrid/audio-pipeline.js";
 import { resolvePreferredTtsVoice } from "../tts-provider-voice.js";
 import {
   type EndReason,
@@ -28,7 +29,11 @@ import {
   ensureMaxDurationTimerForLiveCall,
   waitForFinalTranscript,
 } from "./timers.js";
-import { generateDtmfRedirectTwiml, generateNotifyTwiml } from "./twiml.js";
+import {
+  generateDtmfRedirectTwiml,
+  generateHybridNotifyTwiml,
+  generateNotifyTwiml,
+} from "./twiml.js";
 
 type InitiateContext = Pick<
   CallManagerContext,
@@ -216,8 +221,23 @@ export async function initiateCall(
     let preConnectTwiml: string | undefined;
     if (mode === "notify" && initialMessage) {
       const pollyVoice = mapVoiceToPolly(resolvePreferredTtsVoice(ctx.config));
-      inlineTwiml = generateNotifyTwiml(initialMessage, pollyVoice);
-      console.log(`[voice-call] Using inline TwiML for notify mode (voice: ${pollyVoice})`);
+      // Fork custom: hybrid mode keeps the call alive (Pause 30s) instead of
+      // auto-hanging-up, so the hybrid Call Update <Play> path has time to
+      // inject the ElevenLabs-generated mp3 mid-call. Without this, Twilio
+      // completes the call as soon as <Say> finishes and
+      // `client.calls(sid).update({twiml:<Play>})` fails with
+      // "400 Call is not in-progress. Cannot redirect." — the
+      // `[voice-call][hybrid] Call Update for first play failed` error in
+      // the gateway log.
+      if (ctx.config.streaming?.hybridMode) {
+        inlineTwiml = generateHybridNotifyTwiml(initialMessage, pollyVoice);
+        console.log(
+          `[voice-call] Using hybrid inline TwiML for notify mode (voice: ${pollyVoice}, pause=30s for Call Update)`,
+        );
+      } else {
+        inlineTwiml = generateNotifyTwiml(initialMessage, pollyVoice);
+        console.log(`[voice-call] Using inline TwiML for notify mode (voice: ${pollyVoice})`);
+      }
     } else if (dtmfSequence) {
       preConnectTwiml = generateDtmfRedirectTwiml(dtmfSequence, ctx.webhookUrl);
       console.log(
@@ -273,6 +293,7 @@ export async function initiateCall(
 
 export type SpeakOptions = {
   listenAfterPlayback?: boolean;
+  endCall?: boolean;
 };
 
 export async function speak(
@@ -304,12 +325,39 @@ export async function speak(
       resolveVoiceCallEffectiveConfig(ctx.config, numberRouteKey).config,
     );
     const playbackOptions = options?.listenAfterPlayback ? { listenAfterPlayback: true } : {};
+
+    // Hybrid mode: pre-generate the mp3 file and pass its public URL.
+    // Twilio plays it via Call Update <Play> instead of streaming over WS.
+    let audioUrl: string | undefined;
+    if (ctx.config.streaming?.hybridMode) {
+      try {
+        audioUrl = await generateHybridAudioUrl({
+          text,
+          voiceConfig: ctx.config,
+          coreConfig: { messages: { tts: ctx.config.tts } } as never,
+          callId,
+        });
+      } catch (err) {
+        console.warn(
+          `[voice-call][hybrid] generateHybridAudioUrl failed:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+      if (!audioUrl) {
+        console.warn(
+          `[voice-call][hybrid] No audio URL produced for ${callId}; provider will fall back if possible`,
+        );
+      }
+    }
+
     await provider.playTts({
       callId,
       providerCallId,
       text,
       voice,
       ...playbackOptions,
+      audioUrl,
+      endCall: options?.endCall,
     });
 
     addTranscriptEntry(call, "bot", text);

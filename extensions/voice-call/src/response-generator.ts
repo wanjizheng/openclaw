@@ -11,7 +11,9 @@ import {
   normalizeStringEntries,
 } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { resolveVoiceCallSessionKey, type VoiceCallConfig } from "./config.js";
+import { findContactByPhone, loadContactsFileAsync, type ParsedContact } from "./contact-file.js";
 import type { CoreAgentDeps, CoreConfig } from "./core-bridge.js";
+import { stripLlmReasoningTags } from "./llm-tag-cleanup.js";
 import { resolveCallAgentId } from "./resolve-call-agent-id.js";
 import { resolveVoiceResponseModel } from "./response-model.js";
 
@@ -188,7 +190,13 @@ function extractSpokenTextFromPayloads(payloads: VoiceResponsePayload[]): string
       continue;
     }
 
-    const structured = tryParseSpokenJson(rawText);
+    // Custom fork: never pass model reasoning tags through to telephony TTS.
+    const strippedText = stripLlmReasoningTags(rawText, { isFinal: true }).trim();
+    if (!strippedText) {
+      continue;
+    }
+
+    const structured = tryParseSpokenJson(strippedText);
     if (structured !== null) {
       if (structured.length > 0) {
         spokenSegments.push(structured);
@@ -196,7 +204,7 @@ function extractSpokenTextFromPayloads(payloads: VoiceResponsePayload[]): string
       continue;
     }
 
-    const plain = sanitizePlainSpokenText(rawText);
+    const plain = sanitizePlainSpokenText(strippedText);
     if (plain) {
       spokenSegments.push(plain);
     }
@@ -262,6 +270,15 @@ export async function generateVoiceResponse(
     coreSession: coreConfig.session,
   });
   const toolsAllow = resolveVoiceAgentToolsAllow(cfg, agentId);
+
+  // Custom fork: enrich the voice prompt from CONTACT_LIST.md when the
+  // caller is known. Contact-file failures must never block a call.
+  let contact: ParsedContact | undefined;
+  try {
+    contact = findContactByPhone(from, await loadContactsFileAsync());
+  } catch {
+    contact = undefined;
+  }
 
   // Resolve paths
   const storePath = agentRuntime.session.resolveStorePath(cfg.session?.store, { agentId });
@@ -331,17 +348,22 @@ export async function generateVoiceResponse(
         const identity = agentRuntime.resolveAgentIdentity(cfg, agentId);
         const agentName = identity?.name?.trim() || "assistant";
 
-        // Build system prompt with conversation history
+        // Build system prompt with conversation history and optional contact
+        // context while retaining the v2026.7 embedded-agent lifecycle.
+        const callerLabel = contact?.name ? `${contact.name} (${from})` : from;
         const basePrompt =
           voiceConfig.responseSystemPrompt ??
-          `You are ${agentName}, a helpful voice assistant on a phone call. Keep responses brief and conversational (1-2 sentences max). Be natural and friendly. The caller's phone number is ${from}. You have access to tools - use them when helpful.`;
+          `You are ${agentName}, a helpful voice assistant on a phone call. Keep responses brief and conversational (1-2 sentences max). Be natural and friendly. The caller is ${callerLabel}. You have access to tools - use them when helpful.`;
 
         let extraSystemPrompt = basePrompt;
+        if (contact?.info) {
+          extraSystemPrompt = `${extraSystemPrompt}\n\nCaller info:\n${contact.info}`;
+        }
         if (transcript.length > 0) {
           const history = transcript
             .map((entry) => `${entry.speaker === "bot" ? "You" : "Caller"}: ${entry.text}`)
             .join("\n");
-          extraSystemPrompt = `${basePrompt}\n\nConversation so far:\n${history}`;
+          extraSystemPrompt = `${extraSystemPrompt}\n\nConversation so far:\n${history}`;
         }
         extraSystemPrompt = `${extraSystemPrompt}\n\n${VOICE_SPOKEN_OUTPUT_CONTRACT}`;
 
