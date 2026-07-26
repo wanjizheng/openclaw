@@ -74,6 +74,32 @@ describe("doctor config flow steps", () => {
     expect(result.state.pendingChanges).toBe(true);
   });
 
+  it("records paths the legacy migration removed (#P1 round-4)", () => {
+    // The migration's removedPaths is the white-list the writer uses to
+    // reject any further untrusted removal in the same transaction.
+    migrateLegacyConfigMock.mockReturnValueOnce({
+      config: { agents: { defaults: { heartbeat: { enabled: true } } } },
+      changes: ["Moved heartbeat → agents.defaults.heartbeat."],
+    });
+
+    const result = createLegacyStepResult({
+      exists: true,
+      parsed: { heartbeat: { enabled: true } },
+      legacyIssues: [{ path: "heartbeat", message: "migrate" }],
+      path: "/tmp/config.json",
+      valid: true,
+      issues: [],
+      raw: "{}",
+      resolved: {},
+      sourceConfig: {},
+      config: {},
+      runtimeConfig: {},
+      warnings: [],
+    } satisfies DoctorConfigPreflightResult["snapshot"]);
+
+    expect(result.removedPaths).toContainEqual(["heartbeat"]);
+  });
+
   it("keeps pending repair state for legacy issues even when the snapshot is already normalized", () => {
     const result = createLegacyStepResult({
       exists: true,

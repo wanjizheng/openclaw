@@ -23,6 +23,7 @@ import {
   runBoundedTasks,
   shouldUseLegacyPeerDepsForShrinkwrap,
   shrinkwrapPackageDirsForChangedPaths,
+  sortShrinkwrapPackages,
 } from "../../scripts/generate-npm-shrinkwrap.mjs";
 
 describe("generate-npm-shrinkwrap", () => {
@@ -290,6 +291,76 @@ describe("generate-npm-shrinkwrap", () => {
     });
   });
 
+  it("restores nested shrinkwrap resolutions when npm hoists an incompatible fork", () => {
+    const generated = {
+      packages: {
+        "": {},
+        "node_modules/parent": {
+          version: "1.0.0",
+          dependencies: {
+            forked: "^2.0.0",
+          },
+        },
+        "node_modules/forked": {
+          version: "1.0.0",
+        },
+        "node_modules/legacy/node_modules/parent": {
+          version: "1.0.0",
+          dependencies: {
+            forked: "^1.0.0",
+          },
+        },
+      },
+    };
+    const current = {
+      packages: {
+        "": {},
+        "node_modules/parent": generated.packages["node_modules/parent"],
+        "node_modules/forked": {
+          version: "2.0.0",
+        },
+        "node_modules/legacy/node_modules/parent":
+          generated.packages["node_modules/legacy/node_modules/parent"],
+        "node_modules/legacy/node_modules/forked": {
+          version: "1.0.0",
+        },
+      },
+    };
+    const pnpmPackages = new Set(["parent@1.0.0", "forked@1.0.0", "forked@2.0.0"]);
+
+    expect(restoreCurrentPnpmLockedPackages(generated, current, pnpmPackages)).toEqual(current);
+  });
+
+  it("removes generated nested resolutions when the current shrinkwrap climbs to a valid parent", () => {
+    const generated = {
+      packages: {
+        "": {},
+        "node_modules/@azure/msal-common": {
+          version: "16.6.2",
+        },
+        "node_modules/@azure/msal-node": {
+          version: "5.2.2",
+          dependencies: {
+            "@azure/msal-common": "16.6.2",
+          },
+        },
+        "node_modules/@azure/msal-node/node_modules/@azure/msal-common": {
+          version: "15.17.0",
+        },
+      },
+    };
+    const current = {
+      packages: {
+        "": {},
+        "node_modules/@azure/msal-common": generated.packages["node_modules/@azure/msal-common"],
+        "node_modules/@azure/msal-node": generated.packages["node_modules/@azure/msal-node"],
+      },
+    };
+    const pnpmPackages = new Set(["@azure/msal-common@16.6.2", "@azure/msal-node@5.2.2"]);
+
+    expect(restoreCurrentPnpmLockedPackages(generated, current, pnpmPackages)).toEqual(current);
+  });
+
   it("does not restore versions that no longer satisfy the dependency edge", () => {
     const generated = {
       packages: {
@@ -314,6 +385,43 @@ describe("generate-npm-shrinkwrap", () => {
 
     expect(
       restoreCurrentPnpmLockedPackages(generated, current, new Set(["lru-cache@11.5.0"])),
+    ).toEqual(generated);
+  });
+
+  it("keeps optional dependency specs ahead of duplicate dependency specs", () => {
+    const generated = {
+      packages: {
+        "": {},
+        "node_modules/parent": {
+          version: "1.0.0",
+          dependencies: {
+            forked: "^1.0.0",
+          },
+          optionalDependencies: {
+            forked: "^2.0.0",
+          },
+        },
+        "node_modules/forked": {
+          version: "2.0.0",
+        },
+      },
+    };
+    const current = {
+      packages: {
+        "": {},
+        "node_modules/parent": generated.packages["node_modules/parent"],
+        "node_modules/forked": {
+          version: "1.0.0",
+        },
+      },
+    };
+
+    expect(
+      restoreCurrentPnpmLockedPackages(
+        generated,
+        current,
+        new Set(["parent@1.0.0", "forked@1.0.0", "forked@2.0.0"]),
+      ),
     ).toEqual(generated);
   });
 
@@ -419,6 +527,24 @@ describe("generate-npm-shrinkwrap", () => {
         },
       },
     });
+  });
+
+  it("sorts shrinkwrap package keys after restoring current entries", () => {
+    const lockfile = {
+      packages: {
+        "node_modules/zod": { version: "4.4.3" },
+        "node_modules/qrcode/node_modules/yargs": { version: "15.4.1" },
+        "node_modules/qrcode/node_modules/cliui": { version: "6.0.0" },
+        "": {},
+      },
+    };
+
+    expect(Object.keys(sortShrinkwrapPackages(lockfile).packages)).toEqual([
+      "",
+      "node_modules/qrcode/node_modules/cliui",
+      "node_modules/qrcode/node_modules/yargs",
+      "node_modules/zod",
+    ]);
   });
 
   it("uses legacy peer resolution when package extensions mark dependency peers optional", () => {

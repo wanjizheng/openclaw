@@ -505,6 +505,14 @@
           "maxConnections": {
             "type": "integer",
             "minimum": 1
+          },
+          "hybridMode": {
+            "type": "boolean",
+            "description": "Enable hybrid mode: <Start><Stream> for STT + <Connect><ConversationRelay> + Twilio Call Update <Play> for TTS."
+          },
+          "crPath": {
+            "type": "string",
+            "description": "WebSocket path for the ConversationRelay event channel (hybrid mode)."
           }
         }
       },

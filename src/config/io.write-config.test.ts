@@ -25,6 +25,8 @@ import {
   setRuntimeConfigSnapshotRefreshHandler,
   writeConfigFile,
 } from "./io.js";
+import { collectDestructiveChanges, configPathKey } from "./io.write-prepare.js";
+import { replaceConfigFile } from "./mutate.js";
 import { ConfigMutationConflictError } from "./mutation-conflict.js";
 import type { ConfigFileSnapshot, OpenClawConfig } from "./types.openclaw.js";
 
@@ -1338,6 +1340,926 @@ describe("config io write", () => {
           {
             allowConfigSizeDrop: true,
             baseSnapshot: acceptedSnapshot,
+          },
+        ),
+      );
+    });
+  });
+
+  it("rejects writes that remove paths the trusted migration did not authorize", async () => {
+    // Regression: a transaction-level size-drop opt-in must not be carried by
+    // a later repair that removes paths the trusted migration did not
+    // authorize. The path-based authorization enforces the exact removal set
+    // the migration itself produced.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      // The original config is intentionally much larger than the trusted
+      // migration output so the size-drop signal is unambiguous. The trusted
+      // migration removed the legacy `channels.telegram` block; an untrusted
+      // repair that also strips `gateway.mode` must be rejected.
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        gateway: { mode: "local" },
+        channels: {
+          telegram: {
+            enabled: true,
+            allowFrom: Array.from({ length: 4000 }, (_, index) => `telegram:${index}`),
+          },
+        },
+      } satisfies ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        valid: true,
+        runtimeConfig: original,
+        config: original,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } satisfies ConfigFileSnapshot;
+
+      // The trusted migration removed the legacy `channels.telegram` block.
+      // The writer authorizes the path diff the migration produced.
+      const trustedMigrationOutput = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        gateway: { mode: "local" },
+      } as const;
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["channels"]];
+
+      // First write at the authorized set is allowed: matches what the migration produced.
+      const acceptedWrite = await io.writeConfigFile(trustedMigrationOutput, {
+        allowConfigSizeDrop: true,
+        authorizedDestructivePaths,
+        lastTouchedVersionOverride: "2026.4.30",
+        baseSnapshot,
+      });
+      expect(acceptedWrite.persistedConfig.gateway).toEqual({ mode: "local" });
+      const acceptedSnapshot = await io.readConfigFileSnapshot();
+
+      // A second write that drops ADDITIONAL paths must be rejected, even
+      // though `allowConfigSizeDrop: true` is still set. The untrusted
+      // repair tries to also strip `gateway.mode`, which is NOT in the
+      // authorized set.
+      const untrustedRepairOutput = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+      };
+      await expectConfigWriteRejected(
+        io.writeConfigFile(untrustedRepairOutput, {
+          allowConfigSizeDrop: true,
+          authorizedDestructivePaths,
+          lastTouchedVersionOverride: "2026.4.30",
+          baseSnapshot: acceptedSnapshot,
+        }),
+      );
+    });
+  });
+
+  it("emits 'unauthorized-destructive-paths' as the rejection reason", async () => {
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        gateway: { mode: "local" },
+        channels: {
+          telegram: {
+            enabled: true,
+            allowFrom: Array.from({ length: 4000 }, (_, index) => `telegram:${index}`),
+          },
+        },
+      } satisfies ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        valid: true,
+        runtimeConfig: original,
+        config: original,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } satisfies ConfigFileSnapshot;
+
+      const trustedMigrationOutput = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        gateway: { mode: "local" },
+      } as const;
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["channels"]];
+
+      // Seed the trusted migration output, then read the snapshot back.
+      await io.writeConfigFile(trustedMigrationOutput, {
+        allowConfigSizeDrop: true,
+        authorizedDestructivePaths,
+        lastTouchedVersionOverride: "2026.4.30",
+        baseSnapshot,
+      });
+      const acceptedSnapshot = await io.readConfigFileSnapshot();
+
+      await expect(
+        io
+          .writeConfigFile(
+            { meta: { lastTouchedVersion: "2026.4.30" } },
+            {
+              allowConfigSizeDrop: true,
+              authorizedDestructivePaths,
+              lastTouchedVersionOverride: "2026.4.30",
+              baseSnapshot: acceptedSnapshot,
+            },
+          )
+          .catch((err: unknown) => (err as { reasons?: string[] }).reasons),
+      ).resolves.toEqual(
+        expect.arrayContaining([expect.stringMatching(/^unauthorized-destructive-paths:/)]),
+      );
+    });
+  });
+
+  it("rejects writes whose primitive value shrinks without removing a path (round-5 destructive)", async () => {
+    // Round-5 [P1]: the authorized set covers path REMOVALS, but a primitive
+    // can shrink in place (long string → short string, integer → null) without
+    // the path itself disappearing. The destructive-diff model must catch this.
+    //
+    // Setup: write a config that has BOTH a long primitive (`gateway.mode`)
+    // and a long array (`heartbeat.endpoints`). Authorize ONLY the array
+    // removal. The primitive shrink is not authorized and must be rejected.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const longMode = "x".repeat(4000);
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        gateway: { mode: longMode },
+        heartbeat: { endpoints: Array.from({ length: 100 }, (_, i) => `ep-${i}`) },
+      } as Record<string, unknown> as ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        valid: true,
+        runtimeConfig: original,
+        config: original,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } as ConfigFileSnapshot;
+
+      // Trusted migration authorized ONLY the `heartbeat` removal. The
+      // primitive shrink on `gateway.mode` is NOT in the authorized set.
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["heartbeat"]];
+
+      let caught: unknown = undefined;
+      try {
+        await io.writeConfigFile(
+          {
+            meta: { lastTouchedVersion: "2026.4.30" },
+            // gateway.mode shrunk to a short string (destructive), heartbeat
+            // was removed (authorized).
+            gateway: { mode: "local" },
+          },
+          {
+            allowConfigSizeDrop: true,
+            authorizedDestructivePaths,
+            lastTouchedVersionOverride: "2026.4.30",
+            baseSnapshot,
+          },
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect((caught as { code?: string } | undefined)?.code).toBe("CONFIG_WRITE_REJECTED");
+    });
+  });
+
+  it("auto-unions writer-managed plugins.installs into the authorized destructive set (round-5 writer-managed)", async () => {
+    // Round-5 [P1]: the writer's own canonical payload-preparation removes
+    // `plugins.installs` on every commit. Without auto-union, the writer
+    // would self-reject every config write that doesn't enumerate
+    // `plugins.installs` in the authorized set.
+    //
+    // We trigger this by writing a small `heartbeat` block (which is the
+    // sole authorized destructive change) while the on-disk config has a
+    // long `plugins.installs` record. The size drop is unambiguous, the
+    // size-drop opt-in is on, and the only thing the writer needs to also
+    // remove is `plugins.installs` (writer-managed, auto-unioned).
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        heartbeat: { interval: 30 },
+        plugins: {
+          installs: {
+            "telegram@1.0.0": { version: "1.0.0", long: "x".repeat(4000) },
+            "discord@2.0.0": { version: "2.0.0", long: "y".repeat(4000) },
+          },
+        },
+      } as Record<string, unknown> as ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        valid: true,
+        runtimeConfig: original,
+        config: original,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } as ConfigFileSnapshot;
+
+      // Authorize ONLY the heartbeat removal. The writer will also strip
+      // `plugins.installs`; the write must succeed because that path is
+      // writer-managed and auto-unioned.
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["heartbeat"]];
+
+      const result = await io.writeConfigFile(
+        { meta: { lastTouchedVersion: "2026.4.30" } },
+        {
+          allowConfigSizeDrop: true,
+          authorizedDestructivePaths,
+          lastTouchedVersionOverride: "2026.4.30",
+          baseSnapshot,
+        },
+      );
+      expect(result.persistedConfig.meta).toBeDefined();
+    });
+  });
+
+  it("rejects a whole-plugins removal when a sibling plugin entry also exists (round-7 [P1] sibling)", async () => {
+    // Round-7 [P1]: when the on-disk config has BOTH `plugins.installs`
+    // (writer-managed) and `plugins.entries` (owner-managed), the writer's
+    // own unset-paths transform must NOT promote its destructive
+    // authorization to the entire `plugins` subtree. If the next config
+    // accidentally removes the entire `plugins` object, the writer must
+    // still reject the write because the parent `plugins` removal is not
+    // covered by the writer-managed `["plugins", "installs"]` child.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        heartbeat: { interval: 30 },
+        plugins: {
+          installs: {
+            "telegram@1.0.0": { version: "1.0.0", long: "x".repeat(4000) },
+          },
+          entries: {
+            telegram: { enabled: true },
+          },
+        },
+      } as Record<string, unknown> as ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        runtimeConfig: original,
+        config: original,
+        valid: true,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } as ConfigFileSnapshot;
+
+      // Authorize ONLY an unrelated path. The whole `plugins` object
+      // removal is NOT in the writer-managed set (which is
+      // `["plugins","installs"]` only because `entries` is a sibling).
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["heartbeat"]];
+
+      await expectConfigWriteRejected(
+        io.writeConfigFile(
+          { meta: { lastTouchedVersion: "2026.4.30" } },
+          {
+            allowConfigSizeDrop: true,
+            authorizedDestructivePaths,
+            lastTouchedVersionOverride: "2026.4.30",
+            baseSnapshot,
+          },
+        ),
+      );
+    });
+  });
+
+  it("accepts the installs-only empty-parent prune (round-7 [P1] prune)", async () => {
+    // Round-7 [P1]: when `plugins.installs` is the ONLY child of
+    // `plugins`, the writer's unset transform prunes the empty parent —
+    // the destructive diff is `["plugins"]`, which directional coverage
+    // must approve under the writer-managed authorization computed
+    // dynamically from the snapshot.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        heartbeat: { interval: 30 },
+        plugins: {
+          installs: {
+            "telegram@1.0.0": { version: "1.0.0", long: "x".repeat(4000) },
+          },
+        },
+      } as Record<string, unknown> as ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        runtimeConfig: original,
+        config: original,
+        valid: true,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } as ConfigFileSnapshot;
+
+      // Authorize ONLY the heartbeat removal. The writer also prunes
+      // the empty `plugins` parent after removing `plugins.installs`;
+      // the dynamic writer-managed authorization must cover that.
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["heartbeat"]];
+
+      const result = await io.writeConfigFile(
+        { meta: { lastTouchedVersion: "2026.4.30" } },
+        {
+          allowConfigSizeDrop: true,
+          authorizedDestructivePaths,
+          lastTouchedVersionOverride: "2026.4.30",
+          baseSnapshot,
+        },
+      );
+      expect(result.persistedConfig.meta).toBeDefined();
+      const persistedPlugins = (result.persistedConfig as { plugins?: unknown }).plugins;
+      expect(persistedPlugins).toBeUndefined();
+    });
+  });
+
+  it("rejects destructive paths under a top-level key whose literal name is dotted (round-5 collision)", async () => {
+    // Round-5 [P2]: a top-level key literally named `"agents.list"` (with a
+    // dot inside its name) must NOT cover the nested path `agents.list`
+    // (an array of agents). The old dotted-string implementation would
+    // have falsely authorized the nested removal.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        // Top-level key whose name is literally "agents.list" (no nesting).
+        "agents.list": { some: "long string that shrinks on write" },
+        // Nested array at `agents.list` (the real agents list).
+        agents: {
+          list: [
+            { id: "alpha", params: { model: "x" } },
+            { id: "beta", params: { model: "y" } },
+          ],
+        },
+      } as Record<string, unknown> as ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        valid: true,
+        runtimeConfig: original,
+        config: original,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } as ConfigFileSnapshot;
+
+      // Authorize ONLY the top-level dotted key (literal `"agents.list"`).
+      // The destructive removal of the nested `agents.list` array must NOT
+      // be covered.
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["agents.list"]];
+
+      await expectConfigWriteRejected(
+        io.writeConfigFile(
+          {
+            meta: { lastTouchedVersion: "2026.4.30" },
+            // Truncate the nested agents.list to one element. The literal
+            // top-level "agents.list" key is preserved (not a path removal).
+            agents: { list: [{ id: "alpha", params: { model: "x" } }] },
+          },
+          {
+            allowConfigSizeDrop: true,
+            authorizedDestructivePaths,
+            lastTouchedVersionOverride: "2026.4.30",
+            baseSnapshot,
+          },
+        ),
+      );
+    });
+  });
+
+  it("does not flag growth or additions as destructive (round-6 [P1-1])", () => {
+    // Round-6 [P1-1]: the destructive-delta model must compare serialized
+    // costs. New keys, longer strings, larger arrays, and equal-size
+    // replacements are NOT destructive changes. The earlier round-5
+    // implementation flagged every shape change as destructive, which
+    // would have caused real doctor writes to be rejected whenever the
+    // wizard metadata or plugin auto-enable block added/updated fields.
+    const destructive = new Set<string>();
+    const collect = (before: unknown, target: unknown) => {
+      destructive.clear();
+      collectDestructiveChanges(before, target, [], destructive);
+    };
+
+    // Missing → added key: never destructive.
+    collect({}, { a: 1 });
+    expect(destructive).toEqual(new Set());
+
+    // Short → longer value: never destructive.
+    collect({ a: "a" }, { a: "a much longer value" });
+    expect(destructive).toEqual(new Set());
+
+    // Equal-size primitive replacement: 4 chars → 4 chars, not destructive.
+    // (`true` and `false` have different serialized sizes 4 and 5, so this
+    // test stays on equal-length strings to keep the size comparison honest.)
+    collect({ name: "abcd" }, { name: "wxyz" });
+    expect(destructive).toEqual(new Set());
+
+    // Small array → larger array: never destructive.
+    collect({ list: [1] }, { list: [1, 2, 3, 4, 5] });
+    expect(destructive).toEqual(new Set());
+
+    // Nested missing → added: never destructive.
+    collect({ agent: {} }, { agent: { defaults: { heartbeat: { enabled: true } } } });
+    expect(destructive).toEqual(new Set());
+  });
+
+  it("flags Unicode shrink as destructive when target.length is larger but UTF-8 bytes are smaller (round-8 [P1] Unicode byte-shrink)", () => {
+    // Round-8 [P1]: the destructive-delta walker must use the same byte
+    // model as the writer's 50% size-drop guard. The walker previously
+    // compared `.length` (UTF-16 code units), while the writer's 50% guard
+    // used `Buffer.byteLength(raw, "utf-8")`. The mismatch created a real
+    // bypass: a long Unicode string whose UTF-8 byte cost is large could
+    // be replaced by a longer-but-fewer-bytes ASCII string and the
+    // destructive-diff would record the change as growth (non-destructive).
+    //
+    // Concrete numbers: `"中".repeat(1000)` is 1000 UTF-16 code units but
+    // 3000 UTF-8 bytes (each character is 3 bytes). `"a".repeat(1498)` is
+    // 1498 UTF-16 code units AND 1498 UTF-8 bytes. The UTF-16 comparison
+    // records growth (1000 → 1498, +50%). The UTF-8 comparison records
+    // shrink (3000 → 1498, roughly -50%). The writer's byte guard would
+    // catch the absolute file-level shrink, but the destructive-delta
+    // walker is the per-subtree check that records WHICH path shrunk —
+    // without it the walker would silently emit nothing and the
+    // unauthorized path would slip past the destructive-delta gate.
+    const destructive = new Set<string>();
+    destructive.clear();
+    collectDestructiveChanges(
+      { prompt: "中".repeat(1000) },
+      { prompt: "a".repeat(1498) },
+      [],
+      destructive,
+    );
+    expect(destructive).toEqual(new Set([configPathKey(["prompt"])]));
+  });
+
+  it("rejects a write that rides a trusted migration while shrinking a Unicode string (round-8 [P1] ride-along)", async () => {
+    // Round-8 [P1] ride-along: an attacker-style write that combines a
+    // legitimate trusted migration (the `channels` block legitimately
+    // removed) with a hidden Unicode-string shrink on a sibling field.
+    // The `channels` removal is authorized; the Unicode shrink is not.
+    // The destructive-delta walker must flag the shrunken path as
+    // destructive so the writer can reject the write before persisting.
+    //
+    // The ride-along field is `meta.lastTouchedVersion` (a freeform
+    // version string the schema accepts verbatim). The original is
+    // 1000 "中" characters (UTF-16 length 1000, UTF-8 byte length
+    // 3000). The target is 1498 "a" characters (UTF-16 length 1498,
+    // UTF-8 byte length 1498). The naive `.length` walker would have
+    // called this growth (1000 → 1498, +50%) and silently passed the
+    // write; the UTF-8 byte walker correctly sees a real shrink
+    // (3000 → 1498, roughly -50%) and reports it as destructive.
+    //
+    // Why a real end-to-end test: covering `collectDestructiveChanges` in
+    // isolation only proves the walker emits the right path. The writer
+    // then has to (1) recognize that the emitted path is unauthorized,
+    // (2) include it in the rejection's `unauthorized-destructive-paths`
+    // reason, and (3) leave the on-disk file untouched. The full path
+    // only fires here.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "中".repeat(1000) },
+        channels: {
+          telegram: {
+            enabled: true,
+            allowFrom: Array.from({ length: 4000 }, (_, index) => `telegram:${index}`),
+          },
+        },
+      } as Record<string, unknown> as ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        runtimeConfig: original,
+        config: original,
+        valid: true,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } as ConfigFileSnapshot;
+
+      // Authorize ONLY the trusted migration path. The ride-along
+      // `meta.lastTouchedVersion` shrink is deliberately NOT authorized.
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["channels"]];
+
+      let caught: unknown = undefined;
+      try {
+        await io.writeConfigFile(
+          {
+            meta: { lastTouchedVersion: "a".repeat(1498) },
+          },
+          {
+            allowConfigSizeDrop: true,
+            authorizedDestructivePaths,
+            lastTouchedVersionOverride: "a".repeat(1498),
+            baseSnapshot,
+          },
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect((caught as { code?: string } | undefined)?.code).toBe("CONFIG_WRITE_REJECTED");
+      const reasons = (caught as { reasons?: string[] } | undefined)?.reasons ?? [];
+      expect(reasons.some((r) => r.startsWith("unauthorized-destructive-paths:"))).toBe(true);
+      expect(reasons.some((r) => r.includes(configPathKey(["meta", "lastTouchedVersion"])))).toBe(
+        true,
+      );
+
+      // The on-disk file must be untouched. The trusted migration
+      // block, the Chinese string, and everything else must remain
+      // byte-for-byte identical to the original snapshot.
+      const afterRaw = await fs.readFile(configPath, "utf-8");
+      expect(afterRaw).toBe(originalRaw);
+    });
+  });
+
+  it("rejects parent destruction even when a leaf is authorized (round-6 [P1-2])", async () => {
+    // Round-6 [P1-2]: authorization is DIRECTIONAL. An authorized leaf
+    // (e.g. `["channels", "telegram"]`) must NOT cover destruction of its
+    // parent (`["channels"]`). The earlier round-5 implementation used a
+    // symmetric `configPathOverlaps` check that would have accepted this.
+    //
+    // We authorize the leaf `["channels", "telegram"]` and write a payload
+    // that drops the entire `channels` object. The destructive diff emits
+    // `["channels"]` (the parent removal); under directional coverage, the
+    // authorized leaf does NOT cover the parent, so the write is rejected.
+    //
+    // We deliberately use a `channels` path (not `plugins.installs`) because
+    // the writer auto-unions the parent of every writer-managed path —
+    // `["plugins"]` would be covered by that auto-union and the rejection
+    // would never fire.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        channels: {
+          telegram: {
+            enabled: true,
+            allowFrom: Array.from({ length: 4000 }, (_, index) => `telegram:${index}`),
+          },
+        },
+      } as Record<string, unknown> as ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        valid: true,
+        runtimeConfig: original,
+        config: original,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } as ConfigFileSnapshot;
+
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [
+        ["channels", "telegram"],
+      ];
+
+      let caught: unknown = undefined;
+      try {
+        await io.writeConfigFile(
+          { meta: { lastTouchedVersion: "2026.4.30" } },
+          {
+            allowConfigSizeDrop: true,
+            authorizedDestructivePaths,
+            lastTouchedVersionOverride: "2026.4.30",
+            baseSnapshot,
+          },
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect((caught as { code?: string } | undefined)?.code).toBe("CONFIG_WRITE_REJECTED");
+      // The destructively emitted path is `["channels"]` (the parent),
+      // which is what must remain unauthorized. The reason string
+      // joins JSON-stringified paths, so look for the encoded form.
+      const reasons = (caught as { reasons?: string[] } | undefined)?.reasons ?? [];
+      expect(reasons.some((r) => r.includes(configPathKey(["channels"])))).toBe(true);
+    });
+  });
+
+  it("supports the full doctor write chain with a real legacy migration (round-6 [P1-3] / round-7 strict)", async () => {
+    // Round-6 [P1-3] / round-7 strict: the complete doctor write path —
+    // a real trusted legacy migration → applyLegacyCompatibilityStep →
+    // applyWizardMetadata → real replaceConfigFile — must succeed
+    // end-to-end. The earlier round-5 implementation would have rejected
+    // the write because the wizard metadata + plugin auto-enable blocks
+    // added/updated fields that the destructive-delta model mistakenly
+    // classified as destructive.
+    //
+    // The previous version of this test asserted `authorizedDestructivePaths`
+    // was *optionally* present and never exercised the size-drop opt-in,
+    // which meant the contract was only proven when doctor happened to
+    // produce an empty `removedPaths` (the inverse of the trust boundary).
+    //
+    // This version uses a fixture that DEFINITELY produces a trusted
+    // destructive migration: `session.parentForkMaxTokens` is a core-level
+    // legacy key that the runtime migration removes entirely (no
+    // replacement). The diff therefore records
+    // `["session","parentForkMaxTokens"]` in `removedPaths`, and the
+    // trust contract requires the writer to accept that removal AND any
+    // non-destructive growth (wizard metadata added by the wizard owner)
+    // without rejecting either.
+    //
+    // The test exercises the real `applyLegacyCompatibilityStep` (the
+    // trusted migration owner) directly, then applies `applyWizardMetadata`
+    // (the real wizard owner path) before calling the real
+    // `replaceConfigFile` with the recovered `authorizedDestructivePaths`
+    // and `allowConfigSizeDrop` flags. The chain fails closed otherwise:
+    // any untrusted shrink in this transaction would be rejected.
+    await withSuiteHome(async (home) => {
+      const configDir = path.join(home, ".openclaw");
+      const configPath = path.join(configDir, "openclaw.json");
+      await fs.mkdir(configDir, { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        session: {
+          parentForkMaxTokens: 4096,
+        },
+      } as Record<string, unknown> as ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+
+      // Run the real `applyLegacyCompatibilityStep` against the on-disk
+      // config. The `session.parentForkMaxTokens` legacy key triggers
+      // the runtime migration that removes it. The diff is destructive
+      // (a legacy key is removed), so the returned `removedPaths` MUST
+      // be non-empty.
+      const { applyLegacyCompatibilityStep } =
+        await import("../commands/doctor/shared/config-flow-steps.js");
+      const { findLegacyConfigIssues } = await import("../config/legacy.js");
+      const parsedForMigration = structuredClone(original) as Record<string, unknown>;
+      const legacyIssues = findLegacyConfigIssues(parsedForMigration);
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: parsedForMigration,
+        sourceConfig: original,
+        resolved: original,
+        runtimeConfig: original,
+        config: original,
+        valid: true,
+        issues: [],
+        warnings: [],
+        legacyIssues,
+      } as ConfigFileSnapshot;
+      const legacyStep = applyLegacyCompatibilityStep({
+        snapshot: baseSnapshot,
+        state: {
+          cfg: original,
+          candidate: original,
+          pendingChanges: false,
+          fixHints: [],
+        },
+        shouldRepair: true,
+        doctorFixCommand: "openclaw doctor --fix",
+      });
+
+      // The trusted migration must have produced a destructive diff. A
+      // missing `removedPaths` entry here would mean the legacy
+      // migration silently no-oped and the test is no longer exercising
+      // the chain it's meant to guard.
+      expect(legacyStep.removedPaths.length).toBeGreaterThan(0);
+      expect(legacyStep.removedPaths).toContainEqual(["session", "parentForkMaxTokens"]);
+      // applyLegacyCompatibilityStep returns the migrated candidate in
+      // `state.cfg` when the rule applies. We assert that the legacy
+      // key is gone from the migrated config (the migration actually
+      // fired) before handing it to the writer.
+      const migratedCandidate = legacyStep.state.cfg as Record<string, unknown>;
+      expect(
+        (migratedCandidate.session as Record<string, unknown> | undefined)?.parentForkMaxTokens,
+      ).toBeUndefined();
+
+      // The size-drop opt-in is granted only when the trusted migration
+      // actually changed the candidate (per the round-5 contract). The
+      // chain we're proving must assume this opt-in is set, otherwise
+      // the writer is allowed to refuse the write outright.
+      const authorizedDestructivePaths = legacyStep.removedPaths;
+
+      // Apply wizard metadata (the real wizard-owner path) before the
+      // real `replaceConfigFile`. This adds a `wizard` block to the
+      // candidate; the writer must accept that growth (round-6 [P1-1])
+      // AND the destructive legacy migration listed above.
+      const { applyWizardMetadata } = await import("../commands/onboard-helpers.js");
+      const nextConfig = applyWizardMetadata(
+        migratedCandidate as Parameters<typeof applyWizardMetadata>[0],
+        { command: "openclaw doctor --fix", mode: "local" },
+      );
+
+      const writeOptions = {
+        allowConfigSizeDrop: true,
+        authorizedDestructivePaths,
+      };
+
+      const writeResult = await replaceConfigFile({
+        nextConfig: nextConfig as OpenClawConfig,
+        writeOptions: {
+          ...writeOptions,
+          ownedConfigPathForWrite: configPath,
+        },
+      });
+      expect(writeResult.snapshot).toBeDefined();
+      expect(writeResult.nextConfig).toBeDefined();
+      expect(typeof writeResult.persistedHash).toBe("string");
+
+      // The returned `nextConfig` is the persisted config. The
+      // round-7 contract requires the trusted migration to have
+      // removed `session.parentForkMaxTokens` and the wizard block
+      // to be present in the same write.
+      const persistedNext = writeResult.nextConfig as Record<string, unknown>;
+      const persistedNextSession = persistedNext.session as Record<string, unknown> | undefined;
+      expect(persistedNextSession?.parentForkMaxTokens).toBeUndefined();
+      expect((persistedNext.wizard as Record<string, unknown>).lastRunCommand).toBe(
+        "openclaw doctor --fix",
+      );
+
+      // Verify the on-disk file matches the persisted config. This
+      // proves the chain is faithful to the round-7 contract:
+      // doctor-mandated destructive changes AND wizard-owner growth
+      // land together in the same write.
+      const persisted = JSON.parse(await fs.readFile(configPath, "utf-8")) as Record<
+        string,
+        unknown
+      >;
+      const persistedSession = persisted.session as Record<string, unknown> | undefined;
+      expect(persistedSession?.parentForkMaxTokens).toBeUndefined();
+      expect((persisted.wizard as Record<string, unknown>).lastRunCommand).toBe(
+        "openclaw doctor --fix",
+      );
+    });
+  });
+
+  it("rejects trusted removal combined with an untrusted primitive shrink (round-6 [P1-4])", async () => {
+    // Round-6 [P1-4]: when a trusted migration authorizes a removal
+    // (e.g. legacy `channels.telegram` block), any untrusted shrink in
+    // the same write must still be rejected. The earlier round-5
+    // implementation only checked the destructive paths after writing,
+    // so a permissive `allowConfigSizeDrop` flag was enough; here we
+    // also pass the authoritative `authorizedDestructivePaths` and
+    // confirm the untrusted primitive shrink on `gateway.mode` is
+    // surfaced as a rejection.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "2026.4.30" },
+        gateway: { mode: "x".repeat(4000) },
+        channels: {
+          telegram: {
+            enabled: true,
+            allowFrom: Array.from({ length: 4000 }, (_, index) => `telegram:${index}`),
+          },
+        },
+      } as Record<string, unknown> as ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        valid: true,
+        runtimeConfig: original,
+        config: original,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } as ConfigFileSnapshot;
+
+      // Trusted migration authorized ONLY the `channels` removal. The
+      // unrelated long string in `gateway.mode` shrinks in the new
+      // payload but is NOT in the authorized set.
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["channels"]];
+
+      await expectConfigWriteRejected(
+        io.writeConfigFile(
+          {
+            meta: { lastTouchedVersion: "2026.4.30" },
+            gateway: { mode: "local" },
+          },
+          {
+            allowConfigSizeDrop: true,
+            authorizedDestructivePaths,
+            lastTouchedVersionOverride: "2026.4.30",
+            baseSnapshot,
           },
         ),
       );

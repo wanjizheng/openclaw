@@ -13,6 +13,93 @@ const OPEN_DM_POLICY_ALLOW_FROM_RE =
 
 const MANAGED_CONFIG_UNSET_PATHS = [["plugins", "installs"]] as const;
 
+/**
+ * Typed identity for a config location. Segments are object keys (string) or
+ * array indices (number). We compare segment-by-segment — never join to a
+ * dotted string — so two structurally distinct paths cannot collide (e.g. a
+ * top-level key `"agents.list"` cannot match a nested `agents.list`).
+ */
+export type ConfigPath = readonly (string | number)[];
+
+/** Stable string key for a `ConfigPath`, suitable for `Set` / `Map` lookup. */
+export function configPathKey(path: ConfigPath): string {
+  return JSON.stringify(path);
+}
+
+/** Segment-by-segment equality. */
+export function configPathEquals(a: ConfigPath, b: ConfigPath): boolean {
+  if (a === b) {
+    return true;
+  }
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** True when `path` starts with `prefix` (or is equal). */
+export function configPathHasPrefix(path: ConfigPath, prefix: ConfigPath): boolean {
+  if (prefix.length > path.length) {
+    return false;
+  }
+  for (let i = 0; i < prefix.length; i += 1) {
+    if (path[i] !== prefix[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Approximate byte cost of a serialized config value, measured in UTF-8
+ * bytes. Used to detect destructive size changes (e.g. a long string
+ * replaced by a short string) that path-removal tracking would miss.
+ *
+ * The destructive walker (`collectDestructiveChanges`) compares this cost
+ * between the before- and target-trees to decide whether a subtree has
+ * shrunk. The model is intentionally aligned with the writer's 50%
+ * size-drop guard, which also counts UTF-8 bytes via
+ * `Buffer.byteLength(raw, "utf-8")`. Both checks must use the same
+ * byte model so an unauthorized UTF-8 byte shrink (e.g. a long Unicode
+ * prompt replaced by a shorter ASCII string) cannot ride past the
+ * destructive-delta walker on a `.length`-based comparison — `.length`
+ * is a JavaScript UTF-16 code-unit count, which under-counts multi-byte
+ * characters and lets a real byte shrink look like growth.
+ *
+ * The walker uses `JSON.stringify(value)` as its serialization form,
+ * counted as UTF-8 bytes. The writer's pretty-printer emits 2-space
+ * indented JSON with newlines and `{}`/`[]` braces, so the absolute
+ * byte counts here are not byte-precise against the on-disk file. Both
+ * before and target use the same model, so the comparison is monotonic
+ * and directionally correct: a real UTF-8 byte shrink in the writer's
+ * output is also a shrink here, and a real growth is also a growth.
+ *
+ * The cost is intended as a monotonic shrink detector, not a wire-format
+ * check. The 50% file-level guard still uses pretty-printed bytes for
+ * the absolute threshold; this helper is the per-subtree comparison
+ * that powers the destructive-delta walker.
+ */
+export function approxSerializedSize(value: unknown): number {
+  if (value === undefined) {
+    return 0;
+  }
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    return 0;
+  }
+  if (serialized === undefined) {
+    return 0;
+  }
+  return Buffer.byteLength(serialized, "utf-8");
+}
+
 type ManifestModelIdNormalizationProvider = {
   aliases?: Record<string, string>;
   stripPrefixes?: string[];
@@ -1133,6 +1220,50 @@ export function resolveManagedUnsetPathsForWrite(
   return next;
 }
 
+/**
+ * Compute the writer-managed destructive paths for the current snapshot.
+ *
+ * Writer-managed unset paths (paths the writer itself removes from the
+ * output every commit — today this is just `plugins.installs`, the
+ * install-state record that the plugin manager maintains) are
+ * auto-authorized for destructive writes because their removal is not
+ * driven by untrusted repairs — it is part of the writer's canonical
+ * payload-preparation contract.
+ *
+ * The authorization is computed DYNAMICALLY from the snapshot rather
+ * than statically promoted to the parent. Statically promoting
+ * `["plugins", "installs"]` to `["plugins"]` would let the writer-managed
+ * authorization cover any unrelated destructive change inside the
+ * `plugins` subtree (e.g. `plugins.entries`, `plugins.allow`,
+ * `plugins.deny`) or the entire `plugins` object.
+ *
+ * Instead, we run the writer's own unset-paths transform on the snapshot
+ * and diff the result against the snapshot to recover the EXACT paths the
+ * writer would destructively remove. With directional coverage (an
+ * authorized ancestor covers a destructive descendant), this yields:
+ *
+ *   - When `installs` has a sibling: the diff emits
+ *     `["plugins", "installs"]`. The child is authorized, the parent
+ *     is not, so unrelated `plugins.entries`/etc. are still rejected.
+ *   - When `installs` is the only child of `plugins`: the unset
+ *     transform prunes the empty parent, the diff emits
+ *     `["plugins"]`, and the empty-parent prune is authorized.
+ */
+export function resolveWriterManagedConfigPathsForWrite(snapshot: unknown): ConfigPath[] {
+  if (!isRecord(snapshot)) {
+    return [];
+  }
+  const managedUnset = resolveManagedUnsetPathsForWrite(undefined);
+  const managedOnlyOutput = applyUnsetPathsForWrite(snapshot as OpenClawConfig, managedUnset);
+  const destructive = new Set<string>();
+  collectDestructiveChanges(snapshot, managedOnlyOutput, [], destructive);
+  const out: ConfigPath[] = [];
+  for (const key of destructive) {
+    out.push(JSON.parse(key) as ConfigPath);
+  }
+  return out;
+}
+
 export function collectChangedPaths(
   base: unknown,
   target: unknown,
@@ -1167,6 +1298,89 @@ export function collectChangedPaths(
   }
   if (!isDeepStrictEqual(base, target)) {
     output.add(path);
+  }
+}
+
+/**
+ * Collect every path whose serialized size shrinks from `before` to `target`.
+ *
+ * Emits a path when ANY of these is true:
+ *   - the leaf value shrank (long primitive → shorter primitive, longer
+ *     container → smaller container) and is not deeply equal
+ *   - a value was removed (target undefined/null while before was defined)
+ *   - a value's shape was replaced (record → primitive, primitive → record,
+ *     etc.) with smaller serialized cost
+ *   - a child was removed from a record or array (the child path is emitted,
+ *     not the parent)
+ *
+ * Explicitly does NOT emit:
+ *   - missing → added (growth, never destructive)
+ *   - short → longer (growth, never destructive)
+ *   - equal-size replacement (no shrink)
+ *   - aggregate parent markers when only some children are missing
+ *     (children are emitted individually)
+ *
+ * The output uses `ConfigPath` so two structurally distinct paths (a key
+ * containing a dot vs. a nested segment) cannot collide.
+ *
+ * Used by doctor to authorize destructive size changes: the migration step
+ * records every path whose cost shrinks, and the writer verifies no other
+ * paths shrink beyond the authorized set.
+ */
+export function collectDestructiveChanges(
+  before: unknown,
+  target: unknown,
+  path: ConfigPath,
+  output: Set<string>,
+): void {
+  // Pure removal (target gone, before had something). Emit the leaf path and
+  // stop descending — every child of `before` is implicitly gone.
+  if (before !== undefined && before !== null && (target === undefined || target === null)) {
+    output.add(configPathKey(path));
+    return;
+  }
+  // Missing → added: not destructive. Growth from undefined to a value.
+  if (target !== undefined && target !== null && (before === undefined || before === null)) {
+    return;
+  }
+  // Equal value: no shrink.
+  if (isDeepStrictEqual(before, target)) {
+    return;
+  }
+
+  const beforeSize = approxSerializedSize(before);
+  const targetSize = approxSerializedSize(target);
+
+  // Same shape (both arrays): recurse into each index. Missing trailing
+  // indices are recorded individually as removed children, not as an
+  // aggregate parent marker.
+  if (Array.isArray(before) && Array.isArray(target)) {
+    const max = Math.max(before.length, target.length);
+    for (let index = 0; index < max; index += 1) {
+      const childBefore = index < before.length ? before[index] : undefined;
+      const childTarget = index < target.length ? target[index] : undefined;
+      collectDestructiveChanges(childBefore, childTarget, [...path, index], output);
+    }
+    return;
+  }
+  // Same shape (both records): recurse into each key. Missing keys are
+  // recorded individually as removed children, not as an aggregate parent
+  // marker.
+  if (isRecord(before) && isRecord(target)) {
+    const keys = new Set([...Object.keys(before), ...Object.keys(target)]);
+    for (const key of keys) {
+      const childBefore = Object.hasOwn(before, key) ? before[key] : undefined;
+      const childTarget = Object.hasOwn(target, key) ? target[key] : undefined;
+      collectDestructiveChanges(childBefore, childTarget, [...path, key], output);
+    }
+    return;
+  }
+  // Shape change OR primitive change with a real shrink. Growth
+  // (targetSize >= beforeSize) is not destructive; we ignore the change
+  // because additions/lengthening are normal doctor/wizard updates and
+  // must not be rejected by the destructive-delta check.
+  if (targetSize < beforeSize) {
+    output.add(configPathKey(path));
   }
 }
 

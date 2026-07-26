@@ -10,7 +10,27 @@ export async function finalizeDoctorConfigFlow(params: {
   fixHints: string[];
   confirm: (p: { message: string; initialValue: boolean }) => Promise<boolean>;
   note: (message: string, title?: string) => void;
-}): Promise<{ cfg: OpenClawConfig; shouldWriteConfig: boolean }> {
+  /**
+   * Explicit opt-in for the 50% size-drop guard. Owner: a named migration
+   * step that knows it must remove legacy keys. Generic `shouldWriteConfig`
+   * is no longer enough — auto-update's `doctor --fix` non-interactive pass
+   * also trips that flag, which previously let unattended update flows
+   * silently shrink the user's config and force a `.bak` → main auto-restore
+   * on next startup (#80077 regression vector).
+   *
+   * The opt-in is independent of `shouldRepair`: it is validated against the
+   * FINAL write decision, including the interactive `confirm` path, so a
+   * user-confirmed legacy migration in plain `openclaw doctor` still gets
+   * the size-drop override when the upstream migration step set it.
+   */
+  allowConfigSizeDropOnWrite?: boolean;
+}): Promise<{
+  cfg: OpenClawConfig;
+  shouldWriteConfig: boolean;
+  allowConfigSizeDropOnWrite: boolean;
+}> {
+  const requestedSizeDropOptIn = params.allowConfigSizeDropOnWrite === true;
+
   if (!params.shouldRepair && params.pendingChanges) {
     const shouldApply = await params.confirm({
       message: "Apply recommended config repairs now?",
@@ -20,6 +40,7 @@ export async function finalizeDoctorConfigFlow(params: {
       return {
         cfg: params.candidate,
         shouldWriteConfig: true,
+        allowConfigSizeDropOnWrite: requestedSizeDropOptIn,
       };
     }
     if (params.fixHints.length > 0) {
@@ -28,6 +49,7 @@ export async function finalizeDoctorConfigFlow(params: {
     return {
       cfg: params.cfg,
       shouldWriteConfig: false,
+      allowConfigSizeDropOnWrite: false,
     };
   }
 
@@ -35,11 +57,13 @@ export async function finalizeDoctorConfigFlow(params: {
     return {
       cfg: params.cfg,
       shouldWriteConfig: true,
+      allowConfigSizeDropOnWrite: requestedSizeDropOptIn,
     };
   }
 
   return {
     cfg: params.cfg,
     shouldWriteConfig: false,
+    allowConfigSizeDropOnWrite: false,
   };
 }

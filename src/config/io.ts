@@ -80,15 +80,20 @@ import {
 import { resolveConfigObserveSuspiciousReasons } from "./io.observe-suspicious.js";
 import { retainGeneratedOwnerDisplaySecret } from "./io.owner-display-secret.js";
 import {
+  applyUnsetPathsForWrite,
   collectChangedPaths,
+  collectDestructiveChanges,
+  configPathHasPrefix,
+  configPathKey,
+  type ConfigPath,
   createMergePatch,
   formatConfigValidationFailure,
-  applyUnsetPathsForWrite,
   preserveIncludeOwnedConfigForWrite,
-  restoreEnvRefsFromMap,
-  resolvePersistCandidateForWrite,
   resolveManagedUnsetPathsForWrite,
+  resolvePersistCandidateForWrite,
+  resolveWriterManagedConfigPathsForWrite,
   resolveWriteEnvSnapshotForPath,
+  restoreEnvRefsFromMap,
 } from "./io.write-prepare.js";
 import {
   asResolvedSourceConfig,
@@ -237,6 +242,28 @@ export type ConfigWriteOptions = {
    * guards active. Used by repair flows that remove stale or legacy config.
    */
   allowConfigSizeDrop?: boolean;
+  /**
+   * Paths that the current transaction is explicitly authorized to make
+   * destructive — meaning their serialized size shrinks. The writer walks
+   * `snapshot.parsed` vs. the projected payload (after
+   * `resolvePersistCandidateForWrite`) and rejects any commit whose diff
+   * shrinks a path NOT in this list. This prevents a transaction-level
+   * size-drop opt-in from being "carried" by further untrusted repairs
+   * that shrink the config beyond what the trusted migration produced.
+   *
+   * Paths are typed `ConfigPath` (segments are object keys or array
+   * indices) and compared segment-by-segment — never joined to a dotted
+   * string — so structurally distinct paths cannot collide. Writer-managed
+   * unset paths (e.g. `plugins.installs`) are auto-unioned into the
+   * authorized set; callers do not need to enumerate them.
+   *
+   * When `undefined`, the size-drop opt-in keeps the legacy "any removal
+   * is allowed" semantics, so intentional flows (e.g. onboard --reset)
+   * can still rewrite the file without enumerating every changed path.
+   * The strict check is what the doctor flow uses to prevent untrusted
+   * repairs from riding the size-drop opt-in.
+   */
+  authorizedDestructivePaths?: readonly ConfigPath[];
   /**
    * Suppress human-readable output logs (overwrite/anomaly messages).
    * Useful when the caller wants machine-readable output only (--json mode).
@@ -542,14 +569,98 @@ function resolveConfigWriteSuspiciousReasons(params: {
 
 function resolveConfigWriteBlockingReasons(
   suspicious: string[],
-  options: Pick<ConfigWriteOptions, "allowConfigSizeDrop"> = {},
+  payload: {
+    nextBytes: number | null;
+    unauthorizedDestructivePaths: readonly string[];
+  },
+  options: Pick<ConfigWriteOptions, "allowConfigSizeDrop" | "authorizedDestructivePaths"> = {},
 ): string[] {
-  return suspicious.filter(
+  const blocked = suspicious.filter(
     (reason) =>
       reason === "unreadable-config-before-write" ||
       (reason.startsWith("size-drop:") && options.allowConfigSizeDrop !== true) ||
       reason === "gateway-mode-removed",
   );
+  // Strict path-based authorization only fires when `authorizedDestructivePaths`
+  // is explicitly set. Callers that opt in to `allowConfigSizeDrop` without
+  // the path list keep the legacy "any removal is allowed" semantics, so
+  // intentional flows (e.g. onboard --reset) can still rewrite the file
+  // without enumerating every removed path. The strict check is what the
+  // doctor flow uses to prevent untrusted repairs from riding the size-drop
+  // opt-in.
+  if (
+    options.allowConfigSizeDrop === true &&
+    options.authorizedDestructivePaths !== undefined &&
+    payload.unauthorizedDestructivePaths.length > 0
+  ) {
+    blocked.push(
+      `unauthorized-destructive-paths:${payload.unauthorizedDestructivePaths.length}:${payload.unauthorizedDestructivePaths.slice(0, 5).join(",")}`,
+    );
+  }
+  return blocked;
+}
+
+/**
+ * Compute the destructive diff between the on-disk config and the projected
+ * payload, and return any path whose serialized size shrinks that is NOT
+ * in the effective authorized set.
+ *
+ * The diff snaps onto the writer's own canonical payload-preparation step
+ * (`outputConfig` after `resolvePersistCandidateForWrite` + env-restore +
+ * tilde-restore + unset-paths) so env-var/`$include`/version-stamp
+ * differences cannot poison the comparison. Writer-managed unset paths
+ * (`plugins.installs`) are auto-authorized because their removal is part of
+ * the writer's canonical contract, not an untrusted repair.
+ *
+ * Comparison uses `ConfigPath` segments so a top-level key `"agents.list"`
+ * cannot collide with the nested path `agents.list`. Authorization coverage
+ * is DIRECTIONAL: an authorized ancestor path covers any destructive
+ * descendant, but an authorized descendant path does NOT cover the
+ * destruction of its ancestor. Concretely:
+ *   - authorized `["channels"]` covers destructive `["channels", "telegram"]`
+ *   - authorized `["channels", "telegram"]` does NOT cover destructive
+ *     `["channels"]` (replacing/removing the parent must be re-authorized
+ *     explicitly)
+ */
+function collectUnauthorizedDestructivePaths(params: {
+  snapshotParsed: unknown;
+  outputConfig: unknown;
+  authorizedDestructivePaths: readonly ConfigPath[] | undefined;
+  writerManagedPaths: readonly ConfigPath[];
+}): string[] {
+  if (params.authorizedDestructivePaths === undefined) {
+    // Strict check is opt-in. When the caller has not enumerated authorized
+    // paths, we treat every shrink as unauthorized only if a future caller
+    // also passes `authorizedDestructivePaths`; the legacy size-drop opt-in
+    // semantics still apply.
+    return [];
+  }
+  const destructive = new Set<string>();
+  collectDestructiveChanges(params.snapshotParsed, params.outputConfig, [], destructive);
+  if (destructive.size === 0) {
+    return [];
+  }
+  const effectiveAuthorized: ConfigPath[] = [
+    ...params.authorizedDestructivePaths,
+    ...params.writerManagedPaths,
+  ];
+  const authorizedKeys = effectiveAuthorized.map(configPathKey);
+  const unauthorized: string[] = [];
+  for (const pathKey of destructive) {
+    const segments = JSON.parse(pathKey) as ConfigPath;
+    // Directional: an authorized ancestor may cover a destructive descendant,
+    // but an authorized descendant must never cover destruction of its
+    // ancestor. This prevents a single authorized leaf from accidentally
+    // authorizing the deletion of its parent object.
+    const covered = authorizedKeys.some((authKey) => {
+      const authSegments = JSON.parse(authKey) as ConfigPath;
+      return configPathHasPrefix(segments, authSegments);
+    });
+    if (!covered) {
+      unauthorized.push(pathKey);
+    }
+  }
+  return unauthorized;
 }
 
 async function readConfigHealthState(deps: Required<ConfigIoDeps>): Promise<ConfigHealthState> {
@@ -2627,7 +2738,21 @@ export function createConfigIO(
         }),
       });
     };
-    const blockingReasons = resolveConfigWriteBlockingReasons(suspiciousReasons, options);
+    const blockingReasons = resolveConfigWriteBlockingReasons(
+      suspiciousReasons,
+      {
+        nextBytes,
+        unauthorizedDestructivePaths: snapshot.exists
+          ? collectUnauthorizedDestructivePaths({
+              snapshotParsed: snapshot.parsed,
+              outputConfig,
+              authorizedDestructivePaths: options.authorizedDestructivePaths,
+              writerManagedPaths: resolveWriterManagedConfigPathsForWrite(snapshot.parsed),
+            })
+          : [],
+      },
+      options,
+    );
     if (blockingReasons.length > 0 && options.allowDestructiveWrite !== true) {
       const rejectedPath = `${configPath}.rejected.${formatConfigArtifactTimestamp(new Date().toISOString())}`;
       await deps.fs.promises
@@ -2968,6 +3093,7 @@ export async function writeConfigFile(
     afterWrite: options.afterWrite,
     allowDestructiveWrite: options.allowDestructiveWrite,
     allowConfigSizeDrop: options.allowConfigSizeDrop,
+    authorizedDestructivePaths: options.authorizedDestructivePaths,
     skipRuntimeSnapshotRefresh: options.skipRuntimeSnapshotRefresh,
     skipOutputLogs: options.skipOutputLogs,
     skipPluginValidation: options.skipPluginValidation,
