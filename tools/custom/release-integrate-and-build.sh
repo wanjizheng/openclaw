@@ -1047,6 +1047,25 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   [[ "$(jq -r '.version // empty' "$DEPLOY_TARGET/package.json")" == "${LATEST_TAG#v}" ]] \
     || die "official npm install version does not match ${LATEST_TAG#v}"
 
+  # The v7 monolithic tarball carries the compiled Discord extension manifest
+  # but npm does not install that nested manifest's dependency closure. Install
+  # it while the official (non-workspace) root package.json is still in place;
+  # Discord voice auto-join otherwise fails at runtime on @discordjs/voice.
+  DISCORD_MANIFEST="$DEPLOY_TARGET/dist/extensions/discord/package.json"
+  if [[ -f "$DISCORD_MANIFEST" ]]; then
+    mapfile -t DISCORD_RUNTIME_DEPS < <(
+      jq -r '.dependencies // {} | to_entries[] | "\(.key)@\(.value)"' "$DISCORD_MANIFEST"
+    )
+    if (( ${#DISCORD_RUNTIME_DEPS[@]} > 0 )); then
+      npm install \
+        --prefix "$DEPLOY_TARGET" \
+        --no-save \
+        --package-lock=false \
+        "${DISCORD_RUNTIME_DEPS[@]}" \
+        || die "failed to install bundled Discord runtime dependencies"
+    fi
+  fi
+
   # ── Sync built artifacts ──
   log "syncing dist/, openclaw.mjs, package.json, skills/"
   rsync -a --delete dist/ "$DEPLOY_TARGET/dist/"
@@ -1074,6 +1093,8 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   # ── Refresh gateway service unit/env ──
   step "gateway install --force"
   openclaw gateway install --force
+  step "node install --force"
+  openclaw node install --force
 
   # ── Normalize systemd unit metadata (strip version from Description only) ──
   UNIT_FILE="$HOME/.config/systemd/user/$SERVICE_NAME"
@@ -1093,9 +1114,13 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   step "restart $SERVICE_NAME"
   systemctl --user restart "$SERVICE_NAME" \
     || die "failed to restart $SERVICE_NAME"
+  systemctl --user reset-failed openclaw-node.service
+  systemctl --user restart openclaw-node.service \
+    || die "failed to restart openclaw-node.service"
   gateway_ready="false"
   GATEWAY_STATUS_FILE="$(mktemp)"
   GATEWAY_HEALTH_FILE="$(mktemp)"
+  NODE_STATUS_FILE="$(mktemp)"
   for (( gateway_attempt=1; gateway_attempt<=20; gateway_attempt++ )); do
     if timeout 10s openclaw gateway status --json >"$GATEWAY_STATUS_FILE" 2>/dev/null \
       && jq -e \
@@ -1104,17 +1129,19 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
          and .service.configAudit.ok == true' \
         "$GATEWAY_STATUS_FILE" >/dev/null \
       && timeout 10s openclaw health --json >"$GATEWAY_HEALTH_FILE" 2>/dev/null \
-      && jq -e '.ok == true' "$GATEWAY_HEALTH_FILE" >/dev/null; then
+      && jq -e '.ok == true' "$GATEWAY_HEALTH_FILE" >/dev/null \
+      && timeout 10s openclaw node status --json >"$NODE_STATUS_FILE" 2>/dev/null \
+      && jq -e '.service.runtime.status == "running"' "$NODE_STATUS_FILE" >/dev/null; then
       gateway_ready="true"
       break
     fi
     sleep 3
   done
-  rm -f "$GATEWAY_STATUS_FILE" "$GATEWAY_HEALTH_FILE"
+  rm -f "$GATEWAY_STATUS_FILE" "$GATEWAY_HEALTH_FILE" "$NODE_STATUS_FILE"
   [[ "$gateway_ready" == "true" ]] \
     || { journalctl --user -u "$SERVICE_NAME" -n 80 --no-pager >&2 || true
          die "$SERVICE_NAME failed RPC/config/health verification after restart"; }
-  log "gateway restarted and passed RPC/config/health verification"
+  log "gateway and node restarted; RPC/config/health verification passed"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
