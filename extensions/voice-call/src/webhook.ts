@@ -33,6 +33,7 @@ import {
 } from "./config.js";
 import type { CoreAgentDeps, CoreConfig } from "./core-bridge.js";
 import { getHeader } from "./http-headers.js";
+import { HybridCrHandler } from "./hybrid/cr-handler.js";
 import type { CallManager } from "./manager.js";
 import type { MediaStreamConfig } from "./media-stream.js";
 import { MediaStreamHandler } from "./media-stream.js";
@@ -209,6 +210,9 @@ export class VoiceCallWebhookServer {
   private realtimeHandler: RealtimeCallHandler | null = null;
   private replayResponses = new Map<string, CachedWebhookResponse>();
   private replayResponseCacheCalls = 0;
+
+  /** Hybrid mode CR (ConversationRelay) WebSocket handler. */
+  private crHandler: HybridCrHandler | null = null;
 
   constructor(
     config: VoiceCallConfig,
@@ -417,7 +421,18 @@ export class VoiceCallWebhookServer {
         if (this.shouldSuppressBargeInForInitialMessage(call)) {
           return;
         }
-        (this.provider as TwilioProvider).clearTtsQueue(providerCallId);
+        const twilio = this.provider as TwilioProvider;
+        // Hybrid mode: abort the play queue + switch back to CR.
+        if (twilio.isHybridMode && twilio.hasActiveHybridQueue(providerCallId)) {
+          twilio.abortHybridPlay(providerCallId).catch((err: unknown) => {
+            console.warn(
+              `[voice-call][hybrid] abortHybridPlay failed:`,
+              err instanceof Error ? err.message : err,
+            );
+          });
+          return;
+        }
+        twilio.clearTtsQueue(providerCallId);
       },
       onPartialTranscript: (callId, partial) => {
         const safePartial = sanitizeTranscriptForLog(partial);
@@ -513,15 +528,44 @@ export class VoiceCallWebhookServer {
       });
 
       // Handle WebSocket upgrades for realtime voice and media streams.
-      if (this.realtimeHandler || this.mediaStreamHandler) {
+      const hybridUpgradeNeeded =
+        this.config.streaming.hybridMode && this.provider.name === "twilio";
+      if (this.realtimeHandler || this.mediaStreamHandler || hybridUpgradeNeeded) {
         this.server.on("upgrade", (request, socket, head) => {
           if (this.realtimeHandler && this.isRealtimeWebSocketUpgrade(request)) {
             this.realtimeHandler.handleWebSocketUpgrade(request, socket, head);
             return;
           }
           const path = this.getUpgradePathname(request);
-          if (path === streamPath && this.mediaStreamHandler) {
-            this.mediaStreamHandler?.handleUpgrade(request, socket, head);
+          // Hybrid mode: dispatch CR WebSocket upgrades.
+          if (
+            this.config.streaming.hybridMode &&
+            this.provider.name === "twilio" &&
+            path === this.config.streaming.crPath
+          ) {
+            this.ensureCrHandler().handleUpgrade(request, socket, head);
+            return;
+          }
+          if (this.mediaStreamHandler) {
+            // Match the realtime handler's strict path-boundary rule so the
+            // trailing `/{token}` that Twilio appends to its TwiML <Stream>
+            // url still routes here. Without this, an exact equality check
+            // against the configured streamPath would reject every media
+            // stream connection (path is `/voice/stream/<token>`, not the
+            // bare `/voice/stream`). Sibling prefixes that happen to share
+            // a leading segment (e.g. `/voice/stream-other`) are still
+            // rejected because the slash-delimited boundary is required.
+            const normalizedStreamPath = normalizeWebhookPath(streamPath);
+            const normalizedRequestPath = path === null ? null : normalizeWebhookPath(path);
+            const pathMatches =
+              normalizedStreamPath === "/" ||
+              normalizedRequestPath === normalizedStreamPath ||
+              normalizedRequestPath?.startsWith(`${normalizedStreamPath}/`) === true;
+            if (pathMatches) {
+              this.mediaStreamHandler.handleUpgrade(request, socket, head);
+            } else {
+              socket.destroy();
+            }
           } else {
             socket.destroy();
           }
@@ -608,6 +652,25 @@ export class VoiceCallWebhookServer {
     }
   }
 
+  /**
+   * Lazily construct the hybrid CR handler.  Only valid when the provider is
+   * Twilio and `streaming.hybridMode` is enabled.
+   */
+  private ensureCrHandler(): HybridCrHandler {
+    if (!this.crHandler) {
+      this.crHandler = new HybridCrHandler({
+        manager: this.manager,
+        isHybridPlaying: (callSid) =>
+          this.provider.name === "twilio" &&
+          (this.provider as TwilioProvider).hasActiveHybridQueue(callSid),
+        speakInitialMessage: (providerCallId) =>
+          this.manager.speakInitialMessage(providerCallId).then(() => {}),
+        // Phase 1: no LLM-abort callback yet; barge-in is driven by onSpeechStart
+        // on the fork stream (which calls TwilioProvider.abortHybridPlay).
+      });
+    }
+    return this.crHandler;
+  }
   private isWebhookPathMatch(requestPath: string, configuredPath: string): boolean {
     return normalizeWebhookPath(requestPath) === normalizeWebhookPath(configuredPath);
   }
@@ -705,7 +768,12 @@ export class VoiceCallWebhookServer {
       }
 
       const isReplay = Boolean(verification.isReplay);
-      if (isReplay) {
+      // playAction=1 callbacks are internal hybrid play-next redirects and may
+      // legitimately repeat (same URL+body across multiple <Play> sentences).
+      // Twilio will not redeliver real call events to this URL, so the replay
+      // check would mis-classify the 2nd+ play callback as a duplicate.
+      const isHybridPlayNext = ctx.query?.playAction === "1";
+      if (isReplay && !isHybridPlayNext) {
         console.warn("[voice-call] Replay detected; skipping event side effects");
         if (this.provider.name === "twilio") {
           return buildTwilioReplayTwiML();
@@ -1007,6 +1075,35 @@ export class VoiceCallWebhookServer {
       const numberRouteKey = resolveVoiceCallNumberRouteKeyForCall(call);
       const effectiveConfig = resolveVoiceCallEffectiveConfig(this.config, numberRouteKey).config;
 
+      const speakGeneratedText = async (
+        text: string,
+        logPrefix: "Early AI response" | "AI response",
+      ): Promise<boolean> => {
+        // Custom fork: end hybrid calls only after the goodbye audio drains.
+        // Apply this to early block replies as well as the final result so the
+        // v2026.7 early-delivery path cannot bypass [END_CALL] handling.
+        const explicitMatch = /\[END_CALL\]/i.exec(text);
+        const goodbyePattern =
+          /(拜拜|拜啦|掰掰|白白|再见|bye[\s.!,~～。]*|goodbye|see\s*you|先这样|没事了|挂了|挂啦|挂了吧|mua)/i;
+        const lastUserText = (call.transcript[call.transcript.length - 1]?.text ?? "").trim();
+        const endCallByMarker = explicitMatch !== null;
+        const endCallByPattern = goodbyePattern.test(lastUserText) && goodbyePattern.test(text);
+        const shouldEndCall = endCallByMarker || endCallByPattern;
+        const spokenText = explicitMatch ? text.replace(/\[END_CALL\]/gi, "").trim() : text;
+        const endCallReason = endCallByMarker
+          ? "[END_CALL]"
+          : `goodbye pattern (user="${lastUserText.slice(-12)}")`;
+        console.log(
+          `[voice-call] ${logPrefix}: "${spokenText}"${shouldEndCall ? ` [end by ${endCallReason}]` : ""}`,
+        );
+        const speakResult = await this.manager.speak(
+          callId,
+          spokenText,
+          shouldEndCall ? { endCall: true } : { listenAfterPlayback: true },
+        );
+        return speakResult.success;
+      };
+
       const result = await generateVoiceResponse({
         voiceConfig: effectiveConfig,
         coreConfig: this.coreConfig,
@@ -1017,11 +1114,7 @@ export class VoiceCallWebhookServer {
         agentId: resolveCallAgentId(call, effectiveConfig),
         transcript: call.transcript,
         userMessage,
-        onEarlyText: async (text) => {
-          console.log(`[voice-call] Early AI response: "${text}"`);
-          const speakResult = await this.manager.speak(callId, text, { listenAfterPlayback: true });
-          return speakResult.success;
-        },
+        onEarlyText: (text) => speakGeneratedText(text, "Early AI response"),
       });
 
       if (result.error) {
@@ -1030,8 +1123,7 @@ export class VoiceCallWebhookServer {
       }
 
       if (result.text && !result.deliveredEarly) {
-        console.log(`[voice-call] AI response: "${result.text}"`);
-        await this.manager.speak(callId, result.text, { listenAfterPlayback: true });
+        await speakGeneratedText(result.text, "AI response");
       }
     } catch (err) {
       console.error(`[voice-call] Auto-response error:`, err);

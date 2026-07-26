@@ -1,5 +1,9 @@
 // Discord plugin module implements sdk runtime behavior.
 import { createRequire } from "node:module";
+import { installUdpDiscoveryGuard } from "./udp-discovery-guard.js";
+
+// Install guard before loadDiscordVoiceSdk() can surface the upstream UDP discovery race.
+installUdpDiscoveryGuard();
 
 type DiscordVoiceSdk = typeof import("@discordjs/voice");
 

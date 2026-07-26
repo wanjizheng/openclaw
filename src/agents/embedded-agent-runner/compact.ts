@@ -156,6 +156,7 @@ import {
   runBeforeCompactionHooks,
   runPostCompactionSideEffects,
 } from "./compaction-hooks.js";
+import { resolveAdaptiveAutoCompactionKeepRecentTokens } from "./compaction-retention.js";
 import { resolveEmbeddedCompactionTarget } from "./compaction-runtime-context.js";
 import {
   compactWithSafetyTimeout,
@@ -1493,10 +1494,8 @@ async function compactEmbeddedAgentSessionDirectOnce(
           });
           const { messageCountOriginal } = beforeHookMetrics;
           const diagEnabled = log.isEnabled("debug");
-          const preMetrics = diagEnabled
-            ? summarizeCompactionMessages(session.messages)
-            : undefined;
-          if (diagEnabled && preMetrics) {
+          const preMetrics = summarizeCompactionMessages(session.messages);
+          if (diagEnabled) {
             log.debug(
               `[compaction-diag] start runId=${runId} sessionKey=${params.sessionKey ?? params.sessionId} ` +
                 `diagId=${diagId} trigger=${trigger} provider=${provider}/${modelId} ` +
@@ -1534,6 +1533,25 @@ async function compactEmbeddedAgentSessionDirectOnce(
           } catch {
             // If token estimation throws on a malformed message, fall back to 0 so
             // the sanity check below becomes a no-op instead of crashing compaction.
+          }
+          const currentCompactionSettings = settingsManager.getCompactionSettings();
+          const adaptiveKeepRecentTokens = resolveAdaptiveAutoCompactionKeepRecentTokens({
+            trigger,
+            contextTokenBudget,
+            reserveTokens: currentCompactionSettings.reserveTokens,
+            observedTokenCount,
+            historyTokenEstimate: preMetrics.estTokens,
+            currentKeepRecentTokens: currentCompactionSettings.keepRecentTokens,
+          });
+          if (adaptiveKeepRecentTokens !== undefined) {
+            settingsManager.applyOverrides({
+              compaction: { keepRecentTokens: adaptiveKeepRecentTokens },
+            });
+            log.info(
+              `[compaction] reducing keepRecentTokens from ${currentCompactionSettings.keepRecentTokens} ` +
+                `to ${adaptiveKeepRecentTokens} to recover full-prompt overflow ` +
+                `(sessionKey=${params.sessionKey ?? params.sessionId})`,
+            );
           }
           const activeSession = session;
           const result = await compactWithSafetyTimeout(
@@ -1652,7 +1670,7 @@ async function compactEmbeddedAgentSessionDirectOnce(
           const postMetrics = diagEnabled
             ? summarizeCompactionMessages(session.messages)
             : undefined;
-          if (diagEnabled && preMetrics && postMetrics) {
+          if (diagEnabled && postMetrics) {
             log.debug(
               `[compaction-diag] end runId=${runId} sessionKey=${params.sessionKey ?? params.sessionId} ` +
                 `diagId=${diagId} trigger=${trigger} provider=${provider}/${modelId} ` +

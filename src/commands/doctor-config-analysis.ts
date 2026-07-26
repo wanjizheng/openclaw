@@ -79,22 +79,30 @@ const STRIP_PROTECTED_KEYS: Record<string, Set<string>> = {
  *
  * Doctor skips this while an update is in progress so partially written upgrade state is not
  * stripped before its migration can finish.
+ *
+ * Returns both `removed` (dotted strings, for human display) and
+ * `removedPaths` (typed `ConfigPath` segments, for writer authorization).
+ * The dotted-string form is kept for backward compatibility with callers
+ * that join the list directly into UI; the typed form is what the writer
+ * uses to authorize destructive size changes without path collisions.
  */
 export function stripUnknownConfigKeys(config: OpenClawConfig): {
   config: OpenClawConfig;
   removed: string[];
+  removedPaths: Array<readonly (string | number)[]>;
 } {
   if (isUpdateInProgress()) {
-    return { config, removed: [] };
+    return { config, removed: [], removedPaths: [] };
   }
 
   const parsed = OpenClawSchema.safeParse(config);
   if (parsed.success) {
-    return { config, removed: [] };
+    return { config, removed: [], removedPaths: [] };
   }
 
   const next = structuredClone(config);
   const removed: string[] = [];
+  const removedPaths: Array<readonly (string | number)[]> = [];
   for (const issue of parsed.error.issues) {
     if (!isUnrecognizedKeysIssue(issue)) {
       continue;
@@ -121,11 +129,13 @@ export function stripUnknownConfigKeys(config: OpenClawConfig): {
         continue;
       }
       delete record[key];
-      removed.push(formatConfigPath([...issuePath, key]));
+      const fullPath: Array<string | number> = [...issuePath, key];
+      removed.push(formatConfigPath(fullPath));
+      removedPaths.push(fullPath);
     }
   }
 
-  return { config: next, removed };
+  return { config: next, removed, removedPaths };
 }
 
 /** Warns when legacy OpenCode provider overrides shadow the built-in catalog. */

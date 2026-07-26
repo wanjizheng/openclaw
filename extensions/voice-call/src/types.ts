@@ -266,6 +266,21 @@ export type PlayTtsInput = {
   locale?: string;
   /** Keep collecting speech after playback when the provider owns the listening XML. */
   listenAfterPlayback?: boolean;
+  /**
+   * Optional pre-generated public audio URL (mp3).  When set, hybrid-mode
+   * providers will inject this URL via a Twilio Call Update `<Play>` instead
+   * of streaming audio over the media WebSocket.  Ignored by non-hybrid
+   * providers.
+   */
+  audioUrl?: string;
+  /**
+   * Custom-fork: when true, the play queue's `handlePlayNextAction` will
+   * return `HYBRID_HANGUP_TWIML` (a `<Hangup/>` TwiML) after this turn's
+   * audio finishes playing.  Use this instead of a hard-coded setTimeout
+   * to end the call — the queue-driven path is race-free with respect to
+   * audio playback.  Only honored in hybrid mode.
+   */
+  endCall?: boolean;
 };
 
 export type SendDtmfInput = {

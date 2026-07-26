@@ -3412,4 +3412,119 @@ describe("control UI credential redaction (issue #72283)", () => {
       "plain result",
     );
   });
+
+  it("records visible reply targets without terminal send evidence", async () => {
+    const { ctx } = createTestContext();
+    const toolCallId = "tool-message-reply-target";
+
+    await handleToolExecutionStart(
+      ctx as never,
+      {
+        type: "tool_execution_start",
+        toolName: "message",
+        toolCallId,
+        args: {
+          action: "reply",
+          provider: "telegram",
+          target: "chat-reply",
+          message: "visible reply",
+        },
+      } as never,
+    );
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "message",
+        toolCallId,
+        isError: false,
+        result: { ok: true },
+      } as never,
+    );
+
+    expect(ctx.state.messagingToolSentTexts).toEqual([]);
+    expect(ctx.state.messagingToolSentMediaUrls).toEqual([]);
+    expect(ctx.state.messagingToolSentTargets).toEqual([
+      expect.objectContaining({
+        tool: "message",
+        provider: "telegram",
+        to: "chat-reply",
+      }),
+    ]);
+  });
+
+  it.each([
+    { name: "dry-run", result: { ok: true, dryRun: true } },
+    { name: "suppressed", result: { ok: true, status: "suppressed" } },
+  ])("does not record target evidence for $name reply results", async ({ result }) => {
+    const { ctx } = createTestContext();
+    const toolCallId = `tool-message-reply-${result.status ?? "dry-run"}`;
+
+    await handleToolExecutionStart(
+      ctx as never,
+      {
+        type: "tool_execution_start",
+        toolName: "message",
+        toolCallId,
+        args: {
+          action: "reply",
+          provider: "telegram",
+          target: "chat-reply",
+          message: "visible reply",
+        },
+      } as never,
+    );
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "message",
+        toolCallId,
+        isError: false,
+        result,
+      } as never,
+    );
+
+    expect(ctx.state.messagingToolSentTexts).toEqual([]);
+    expect(ctx.state.messagingToolSentMediaUrls).toEqual([]);
+    expect(ctx.state.messagingToolSentTargets).toEqual([]);
+  });
+
+  it("records conversation creation target evidence", async () => {
+    const { ctx } = createTestContext();
+    const toolCallId = "tool-message-thread-create-target";
+
+    await handleToolExecutionStart(
+      ctx as never,
+      {
+        type: "tool_execution_start",
+        toolName: "message",
+        toolCallId,
+        args: {
+          action: "thread-create",
+          provider: "telegram",
+          target: "chat-thread",
+          message: "new thread",
+        },
+      } as never,
+    );
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "message",
+        toolCallId,
+        isError: false,
+        result: { ok: true, thread: { id: "thread-1" } },
+      } as never,
+    );
+
+    expect(ctx.state.messagingToolSentTargets).toEqual([
+      expect.objectContaining({
+        tool: "message",
+        provider: "telegram",
+        to: "chat-thread",
+      }),
+    ]);
+  });
 });

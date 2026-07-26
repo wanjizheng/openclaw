@@ -732,6 +732,12 @@ export function prepareCompaction(
       }
     }
   }
+  // A compaction entry that summarizes no messages only appends an empty
+  // summary while retaining the entire prior branch. Treat that as a no-op so
+  // callers do not report success or trip the "already compacted" retry guard.
+  if (messagesToSummarize.length === 0 && turnPrefixMessages.length === 0) {
+    return ok(undefined);
+  }
   const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
   if (cutPoint.isSplitTurn) {
     for (const msg of turnPrefixMessages) {

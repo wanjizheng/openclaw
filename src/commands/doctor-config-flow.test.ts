@@ -1426,9 +1426,11 @@ vi.mock("./doctor-config-analysis.js", () => {
     stripUnknownConfigKeys: vi.fn((config: Record<string, unknown>) => {
       const next = structuredClone(config);
       const removed: string[] = [];
+      const removedPaths: Array<readonly (string | number)[]> = [];
       if ("bridge" in next) {
         delete next.bridge;
         removed.push("bridge");
+        removedPaths.push(["bridge"]);
       }
       const gatewayAuth = resolveConfigPathTarget(next, ["gateway", "auth"]);
       if (
@@ -1439,8 +1441,9 @@ vi.mock("./doctor-config-analysis.js", () => {
       ) {
         delete (gatewayAuth as Record<string, unknown>).extra;
         removed.push("gateway.auth.extra");
+        removedPaths.push(["gateway", "auth", "extra"]);
       }
-      return { config: next, removed };
+      return { config: next, removed, removedPaths };
     }),
   };
 });

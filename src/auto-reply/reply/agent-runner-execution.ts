@@ -1276,8 +1276,24 @@ function resolveContextWindowForCompactionHint(params: {
   return agentCap ?? contextWindow;
 }
 
-function buildContextOverflowResetHint(contextWindowTokens: number | undefined): string {
+function buildContextOverflowResetHint(
+  contextWindowTokens: number | undefined,
+  cfg: FollowupRun["run"]["config"],
+): string {
   const reserveFloor = computeContextAwareReserveTokensFloor(contextWindowTokens);
+  const configuredReserveFloor = cfg.agents?.defaults?.compaction?.reserveTokensFloor;
+  if (
+    typeof configuredReserveFloor === "number" &&
+    Number.isFinite(configuredReserveFloor) &&
+    configuredReserveFloor >= reserveFloor
+  ) {
+    return (
+      `\n\nYour \`agents.defaults.compaction.reserveTokensFloor\` is already ` +
+      `${Math.floor(configuredReserveFloor)}. Do not increase it further: that would reduce the ` +
+      "usable prompt budget. If this persists, use a model with a larger context window or reduce " +
+      "the system/tool prompt."
+    );
+  }
   return (
     "\n\nTo prevent this, increase your compaction buffer by setting " +
     `\`agents.defaults.compaction.reserveTokensFloor\` to ${reserveFloor} or higher in your config.`
@@ -1499,7 +1515,9 @@ export function buildContextOverflowRecoveryText(params: {
         activeSessionEntry: params.activeSessionEntry,
       })
     : undefined;
-  return prefix + (heartbeatBleedHint ?? buildContextOverflowResetHint(primaryContextWindow));
+  return (
+    prefix + (heartbeatBleedHint ?? buildContextOverflowResetHint(primaryContextWindow, params.cfg))
+  );
 }
 
 function buildRestartLifecycleReplyText(): string {

@@ -709,6 +709,88 @@ describe("VoiceCallWebhookServer realtime WebSocket routing", () => {
   });
 });
 
+describe("VoiceCallWebhookServer media stream WebSocket routing", () => {
+  function createMediaStreamRoutingServer(streamPath: string): {
+    server: VoiceCallWebhookServer;
+    handleUpgrade: ReturnType<
+      typeof vi.fn<(req: IncomingMessage, socket: import("node:net").Socket, head: Buffer) => void>
+    >;
+  } {
+    const { manager } = createManager([]);
+    const server = new VoiceCallWebhookServer(
+      createConfig({
+        streaming: {
+          ...createConfig().streaming,
+          enabled: true,
+          streamPath,
+          providers: {
+            openai: { apiKey: "sk-test" }, // pragma: allowlist secret
+          },
+        },
+      }),
+      manager,
+      provider,
+    );
+    const handleUpgrade = vi.fn((_req: IncomingMessage, socket: import("node:net").Socket) => {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+    });
+    // Replace the media stream handler's handleUpgrade with a spy so we can
+    // observe whether the dispatcher routed to it. We do this post-start()
+    // because MediaStreamHandler is constructed inside start().
+    const originalStart = server.start.bind(server);
+    (server as unknown as { start: typeof server.start }).start = (async () => {
+      const url = await originalStart();
+      const mediaHandler = server.getMediaStreamHandler();
+      if (!mediaHandler) {
+        throw new Error("expected media stream handler");
+      }
+      mediaHandler.handleUpgrade = handleUpgrade as unknown as typeof mediaHandler.handleUpgrade;
+      return url;
+    }) as typeof server.start;
+    return { server, handleUpgrade };
+  }
+
+  it("routes trailing-token paths to the media stream handler", async () => {
+    const { server, handleUpgrade } = createMediaStreamRoutingServer("/voice/stream");
+
+    try {
+      const baseUrl = await server.start();
+      const result = await requestWebSocketUpgrade(server, baseUrl, "/voice/stream/abc123");
+      expect(result).toMatchObject({ kind: "response", statusCode: 401 });
+      expect(handleUpgrade).toHaveBeenCalledTimes(1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("rejects sibling paths that share a prefix with the media stream", async () => {
+    const { server, handleUpgrade } = createMediaStreamRoutingServer("/voice/stream");
+
+    try {
+      const baseUrl = await server.start();
+      const result = await requestWebSocketUpgrade(server, baseUrl, "/voice/stream-other/abc");
+      expect(result).toMatchObject({ kind: "error", code: "ECONNRESET" });
+      expect(handleUpgrade).not.toHaveBeenCalled();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("treats trailing slashes on the configured streamPath as a normalized boundary", async () => {
+    const { server, handleUpgrade } = createMediaStreamRoutingServer("/voice/stream/");
+
+    try {
+      const baseUrl = await server.start();
+      const result = await requestWebSocketUpgrade(server, baseUrl, "/voice/stream/token");
+      expect(result).toMatchObject({ kind: "response", statusCode: 401 });
+      expect(handleUpgrade).toHaveBeenCalledTimes(1);
+    } finally {
+      await server.stop();
+    }
+  });
+});
+
 describe("VoiceCallWebhookServer stale call reaper", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -1737,6 +1819,65 @@ describe("VoiceCallWebhookServer classic response routing", () => {
     expect(speak.mock.calls).toEqual([
       [call.callId, "Spoken before compaction. Final detail.", { listenAfterPlayback: true }],
     ]);
+  });
+
+  it("strips the explicit end-call marker and drains the final reply before hanging up", async () => {
+    const call = createCall(Date.now());
+    const speak = vi.fn(async () => ({ success: true }));
+    const manager = {
+      getCall: (callId: string) => (callId === call.callId ? call : undefined),
+      speak,
+    } as unknown as CallManager;
+    const server = new VoiceCallWebhookServer(
+      createConfig({ agentId: "main" }),
+      manager,
+      provider,
+      {} as never,
+      undefined,
+      {} as never,
+    );
+    mocks.generateVoiceResponse
+      .mockReset()
+      .mockResolvedValue({ text: "再见，祝你今天愉快。[END_CALL]", deliveredEarly: false });
+
+    await (
+      server as unknown as {
+        handleInboundResponse: (callId: string, message: string) => Promise<void>;
+      }
+    ).handleInboundResponse(call.callId, "再见");
+
+    expect(speak).toHaveBeenCalledWith(call.callId, "再见，祝你今天愉快。", {
+      endCall: true,
+    });
+  });
+
+  it("preserves end-call semantics when the block reply is delivered early", async () => {
+    const call = createCall(Date.now());
+    const speak = vi.fn(async () => ({ success: true }));
+    const manager = {
+      getCall: (callId: string) => (callId === call.callId ? call : undefined),
+      speak,
+    } as unknown as CallManager;
+    const server = new VoiceCallWebhookServer(
+      createConfig({ agentId: "main" }),
+      manager,
+      provider,
+      {} as never,
+      undefined,
+      {} as never,
+    );
+    mocks.generateVoiceResponse.mockReset().mockImplementationOnce(async (params) => {
+      await params?.onEarlyText?.("拜拜。[END_CALL]");
+      return { text: "拜拜。[END_CALL]", deliveredEarly: true };
+    });
+
+    await (
+      server as unknown as {
+        handleInboundResponse: (callId: string, message: string) => Promise<void>;
+      }
+    ).handleInboundResponse(call.callId, "拜拜");
+
+    expect(speak.mock.calls).toEqual([[call.callId, "拜拜。", { endCall: true }]]);
   });
 });
 

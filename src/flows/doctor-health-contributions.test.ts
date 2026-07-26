@@ -3233,11 +3233,24 @@ describe("doctor health contributions", () => {
       (entry) => entry.id === "doctor:write-config",
     )!;
 
-    it("allows config size drops when OPENCLAW_UPDATE_IN_PROGRESS=1", async () => {
+    it("blocks config size drops when OPENCLAW_UPDATE_IN_PROGRESS=1 and no opt-in is set", async () => {
       const ctx = buildWriteConfigCtx({
         OPENCLAW_UPDATE_IN_PROGRESS: "1",
         OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE: "1",
       });
+      await writeConfigContribution.run(ctx);
+      expect(mocks.replaceConfigFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          writeOptions: expect.objectContaining({
+            allowConfigSizeDrop: false,
+          }),
+        }),
+      );
+    });
+
+    it("allows config size drops when the named migration step opts in", async () => {
+      const ctx = buildWriteConfigCtx({});
+      ctx.configResult.allowConfigSizeDropOnWrite = true;
       await writeConfigContribution.run(ctx);
       expect(mocks.replaceConfigFile).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -3368,13 +3381,13 @@ describe("doctor health contributions", () => {
       });
     });
 
-    it("allows allowConfigSizeDrop when not in update", async () => {
+    it("blocks config size drops by default even when not in update", async () => {
       const ctx = buildWriteConfigCtx({});
       await writeConfigContribution.run(ctx);
       expect(mocks.replaceConfigFile).toHaveBeenCalledWith(
         expect.objectContaining({
           writeOptions: expect.objectContaining({
-            allowConfigSizeDrop: true,
+            allowConfigSizeDrop: false,
           }),
         }),
       );
