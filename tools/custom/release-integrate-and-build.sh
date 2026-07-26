@@ -989,6 +989,19 @@ log "[ok] custom-main now matches the validated release tree"
 if [[ "$SKIP_DEPLOY" != "true" ]]; then
   step "deploy to $DEPLOY_TARGET"
 
+  command -v npm >/dev/null 2>&1 || die "npm is required to hydrate the release runtime"
+  command -v jq >/dev/null 2>&1 || die "jq is required to verify the deployed gateway"
+  command -v timeout >/dev/null 2>&1 || die "timeout is required to verify the deployed gateway"
+
+  # A source checkout's package.json is not a deployable dependency closure.
+  # Keep the official npm package of the same release as the runtime base, then
+  # overlay only the fork's compiled artifacts. This also makes a standalone
+  # invocation safe when the global install is missing a newly-added runtime
+  # dependency.
+  NPM_DEPLOY_TARGET="$(npm root --global)/openclaw"
+  [[ "$(readlink -m "$DEPLOY_TARGET")" == "$(readlink -m "$NPM_DEPLOY_TARGET")" ]] \
+    || die "deploy target must match npm's global openclaw install: $NPM_DEPLOY_TARGET"
+
   # ── Backup current install ──
   mkdir -p "$BACKUP_DIR"
   STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -1019,14 +1032,44 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
     done
   fi
 
+  # Stop the old gateway before replacing its runtime or running migrations.
+  # Otherwise systemd can start the new runtime while doctor still owns the
+  # startup-migration lease.
+  step "stop $SERVICE_NAME"
+  systemctl --user stop "$SERVICE_NAME" \
+    || die "failed to stop $SERVICE_NAME before deployment"
+
+  step "install official ${LATEST_TAG} runtime dependencies"
+  npm install --global "openclaw@${LATEST_TAG#v}" \
+    || die "failed to install official ${LATEST_TAG} runtime dependency base"
+  [[ -f "$DEPLOY_TARGET/package.json" ]] \
+    || die "official npm install did not create $DEPLOY_TARGET/package.json"
+  [[ "$(jq -r '.version // empty' "$DEPLOY_TARGET/package.json")" == "${LATEST_TAG#v}" ]] \
+    || die "official npm install version does not match ${LATEST_TAG#v}"
+
   # ── Sync built artifacts ──
-  log "syncing dist/, openclaw.mjs, package.json, extensions/, skills/"
+  log "syncing dist/, openclaw.mjs, package.json, skills/"
   rsync -a --delete dist/ "$DEPLOY_TARGET/dist/"
   cp -f openclaw.mjs "$DEPLOY_TARGET/openclaw.mjs"
   cp -f package.json "$DEPLOY_TARGET/package.json"
-  mkdir -p "$DEPLOY_TARGET/extensions" && rsync -a --delete extensions/ "$DEPLOY_TARGET/extensions/"
-  mkdir -p "$DEPLOY_TARGET/skills"     && rsync -a --delete skills/ "$DEPLOY_TARGET/skills/"
+  mkdir -p "$DEPLOY_TARGET/skills" && rsync -a --delete skills/ "$DEPLOY_TARGET/skills/"
+
+  # v2026.7+ packages bundled plugins inside dist/. Copying TypeScript source
+  # to install-root/extensions makes the runtime mis-detect the npm package as
+  # a source checkout and Node refuses to type-strip files under node_modules.
+  if [[ -e "$DEPLOY_TARGET/extensions" ]]; then
+    log "removing legacy source-only install directory: $DEPLOY_TARGET/extensions"
+    find "$DEPLOY_TARGET/extensions" -depth -delete \
+      || die "failed to remove legacy source extensions directory"
+  fi
   log "artifacts synced"
+
+  step "migrate and validate live configuration"
+  openclaw doctor --fix \
+    || die "openclaw doctor --fix failed before gateway restart"
+  openclaw config validate --json \
+    | jq -e '.valid == true' >/dev/null \
+    || die "live configuration is invalid after migration"
 
   # ── Refresh gateway service unit/env ──
   step "gateway install --force"
@@ -1051,16 +1094,27 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   systemctl --user restart "$SERVICE_NAME" \
     || die "failed to restart $SERVICE_NAME"
   gateway_ready="false"
-  for (( gateway_attempt=1; gateway_attempt<=10; gateway_attempt++ )); do
-    if systemctl --user is-active --quiet "$SERVICE_NAME"; then
+  GATEWAY_STATUS_FILE="$(mktemp)"
+  GATEWAY_HEALTH_FILE="$(mktemp)"
+  for (( gateway_attempt=1; gateway_attempt<=20; gateway_attempt++ )); do
+    if timeout 10s openclaw gateway status --json >"$GATEWAY_STATUS_FILE" 2>/dev/null \
+      && jq -e \
+        '.service.runtime.status == "running"
+         and .rpc.ok == true
+         and .service.configAudit.ok == true' \
+        "$GATEWAY_STATUS_FILE" >/dev/null \
+      && timeout 10s openclaw health --json >"$GATEWAY_HEALTH_FILE" 2>/dev/null \
+      && jq -e '.ok == true' "$GATEWAY_HEALTH_FILE" >/dev/null; then
       gateway_ready="true"
       break
     fi
     sleep 3
   done
+  rm -f "$GATEWAY_STATUS_FILE" "$GATEWAY_HEALTH_FILE"
   [[ "$gateway_ready" == "true" ]] \
-    || die "$SERVICE_NAME did not become active after restart; check: journalctl --user -u $SERVICE_NAME -n 40"
-  log "gateway restarted successfully"
+    || { journalctl --user -u "$SERVICE_NAME" -n 80 --no-pager >&2 || true
+         die "$SERVICE_NAME failed RPC/config/health verification after restart"; }
+  log "gateway restarted and passed RPC/config/health verification"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
