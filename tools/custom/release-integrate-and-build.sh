@@ -2,12 +2,12 @@
 # release-integrate-and-build.sh — Full custom release pipeline
 #
 # Workflow (matches user requirement exactly):
-#   1. Save any dirty worktree changes
+#   1. Require a clean worktree (never auto-commit or discard local changes)
 #   2. Fetch upstream + tags
 #   3. Find latest stable release tag (e.g. v2026.2.26)
 #   4. Merge latest stable tag into custom-main (preserve custom-main history)
 #   5. Collect ONLY custom commits (<latest-tag>..custom-main), excluding
-#      upstream/main and deduplicating noisy snapshot/update commits
+#      upstream/main and filtering known legacy snapshot/update commits
 #   6. Create release-custom/<tag> from that tag + cherry-pick custom commits
 #   7. Build (pnpm install + build + ui:build)
 #   8. Deploy built artifacts to global install + refresh gateway service + restart
@@ -52,7 +52,7 @@ else
 fi
 SYNC_CUSTOM_MAIN="false"
 MAX_CUSTOM_COMMITS="300"
-AUTO_SLIM_COMMITS="true"
+AUTO_SLIM_COMMITS="false"
 REUSE_EXISTING="false"
 STRICT_TYPECHECK="true"
 
@@ -72,6 +72,7 @@ while (( $# )); do
     --skip-deploy)       SKIP_DEPLOY="true"; shift ;;
     --sync-custom-main)  SYNC_CUSTOM_MAIN="true"; shift ;;
     --max-custom-commits) MAX_CUSTOM_COMMITS="${2:-300}"; shift 2 ;;
+    --auto-slim-commits) AUTO_SLIM_COMMITS="true"; shift ;;
     --no-auto-slim-commits) AUTO_SLIM_COMMITS="false"; shift ;;
     --conflict-strategy) CONFLICT_STRATEGY="${2:-stop}"; shift 2 ;;
     --reuse-existing)     REUSE_EXISTING="true"; shift ;;
@@ -93,7 +94,11 @@ fi
   || die "--max-custom-commits must be a non-negative integer"
 
 [[ "$AUTO_SLIM_COMMITS" =~ ^(true|false)$ ]] \
-  || die "--no-auto-slim-commits parse failed"
+  || die "auto-slim commit option parse failed"
+
+if [[ "$AUTO_SLIM_COMMITS" == "true" ]]; then
+  log "WARN: --auto-slim-commits deduplicates commits by subject and may omit intentional repeated changes"
+fi
 
 slim_commit_list_by_subject() {
   local -a input_commits=("$@")
@@ -463,23 +468,19 @@ verify_strict_typecheck() {
   local baseline_branch="${OPENCLAW_TYPECHECK_BASELINE_BRANCH:-custom-main}"
   local filter_args=(--filter "@openclaw/voice-call" --filter "@openclaw/voice-call-plugin")
   local ts_err_file; ts_err_file="$(mktemp)"
-  local baseline_err_file="$WORKSPACE_STATE_DIR/_strict-typecheck-baseline.txt"
-  # $WORKSPACE_STATE_DIR may not exist; fall back to .update next to this script.
-  if [[ -z "${WORKSPACE_STATE_DIR:-}" ]]; then
-    WORKSPACE_STATE_DIR="$ROOT_DIR/tools/custom/.update"
-    mkdir -p "$WORKSPACE_STATE_DIR"
-    baseline_err_file="$WORKSPACE_STATE_DIR/_strict-typecheck-baseline.txt"
-  fi
+  local typecheck_state_dir="${WORKSPACE_STATE_DIR:-$ROOT_DIR/tools/custom/.update}"
+  local baseline_err_file="$typecheck_state_dir/_strict-typecheck-baseline.txt"
+  mkdir -p "$typecheck_state_dir"
 
   log "running strict typecheck (voice-call package)"
-  if ! (set +e
-        pnpm tsgo "${filter_args[@]}" >"$ts_err_file" 2>&1
-        rc=$?
-        exit "$rc") </dev/null; then
-    :
+  local typecheck_rc
+  if pnpm tsgo "${filter_args[@]}" >"$ts_err_file" 2>&1 </dev/null; then
+    typecheck_rc=0
+  else
+    typecheck_rc=$?
   fi
 
-  if [[ ! -s "$ts_err_file" ]]; then
+  if (( typecheck_rc == 0 )) && [[ ! -s "$ts_err_file" ]]; then
     rm -f "$ts_err_file"
     log "[ok] strict typecheck passed (no errors emitted)"
     return 0
@@ -496,13 +497,18 @@ verify_strict_typecheck() {
     current_sigs["$sig"]=1
   done <"$ts_err_file"
 
-  if [[ ! -f "$baseline_err_file" ]]; then
-    log "[info] strict typecheck baseline missing; capturing current as baseline"
-    cp "$ts_err_file" "$baseline_err_file"
-    log "[warn] captured ${#current_sigs[@]} typecheck error signature(s) into baseline. Next run will diff against it."
-    log "[hint]  review $baseline_err_file to confirm expected fork typecheck debt; or delete it and re-run for a fresh baseline."
+  if (( typecheck_rc != 0 )) && (( ${#current_sigs[@]} == 0 )); then
+    log "[error] strict typecheck command failed with rc=$typecheck_rc and emitted no recognized TypeScript diagnostics:"
+    tail -50 "$ts_err_file" >&2
     rm -f "$ts_err_file"
-    return 0
+    return 12
+  fi
+
+  if [[ ! -f "$baseline_err_file" ]]; then
+    log "[error] strict typecheck baseline missing: $baseline_err_file"
+    log "[hint]  create and review the baseline explicitly from $baseline_branch; the release branch is never auto-approved as its own baseline"
+    rm -f "$ts_err_file"
+    return 12
   fi
 
   local -A baseline_sigs=()
@@ -526,7 +532,7 @@ verify_strict_typecheck() {
     for sig in "${new_errors[@]}"; do
       log "  + $sig"
     done
-    log "[hint]  these are NEW type errors from the cherry-pick — they don't exist on $baseline_branch."
+    log "[hint]  these errors are absent from the reviewed $baseline_branch baseline."
     log "        The most common cause is a stale cross-file import (see verify_cross_file_symbols)."
     log "        Manually fix or extend baseline: $baseline_err_file"
     rm -f "$ts_err_file"
@@ -542,19 +548,10 @@ SECONDS=0
 ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. Save dirty worktree
+# 1. Require a clean worktree
 # ══════════════════════════════════════════════════════════════════════════════
 if [[ -n "$(git status --porcelain)" ]]; then
-  branch="$(git rev-parse --abbrev-ref HEAD)"
-  [[ "$branch" == "HEAD" ]] && die "dirty worktree on detached HEAD"
-  step "auto-commit dirty changes on $branch"
-  git add -A
-  if ! git diff --cached --quiet; then
-    git commit -m "chore: snapshot WIP before release integrate ($(date -u +%Y%m%d-%H%M%S))" --no-verify
-    if [[ "$PUSH" == "true" ]]; then
-      git push origin "$branch" --force-with-lease 2>/dev/null || true
-    fi
-  fi
+  die "dirty worktree; commit or move local changes before release integration"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -574,6 +571,25 @@ LATEST_TAG="$(git tag -l 'v*' \
 [[ -n "$LATEST_TAG" ]] || die "no stable upstream tag found"
 log "latest stable tag: $LATEST_TAG"
 
+# Refuse to replay a custom commit train across calendar release trains.
+# vYYYY.M.patch -> train YYYY.M. Re-porting across trains requires semantic
+# review because upstream may have moved or deleted fork-touched symbols.
+BASE_TAG="$(git tag --merged custom-main -l 'v*' \
+  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' \
+  | grep -Evi 'alpha|beta|rc|pre' \
+  | sort -V | tail -n 1 || true)"
+[[ -n "$BASE_TAG" ]] || die "cannot determine stable base tag reachable from custom-main"
+LATEST_TRAIN="$(printf '%s' "${LATEST_TAG#v}" | cut -d. -f1,2)"
+BASE_TRAIN="$(printf '%s' "${BASE_TAG#v}" | cut -d. -f1,2)"
+if [[ "$BASE_TRAIN" != "$LATEST_TRAIN" ]]; then
+  if [[ "${OPENCLAW_ALLOW_MAJOR_DRIFT:-false}" != "true" ]]; then
+    die "release-train drift: custom-main base=$BASE_TAG, latest=$LATEST_TAG. Semantic re-port required; set OPENCLAW_ALLOW_MAJOR_DRIFT=true only after manual review"
+  fi
+  log "WARN: release-train drift override accepted: base=$BASE_TAG latest=$LATEST_TAG"
+else
+  log "[ok] release-train check passed: base=$BASE_TAG latest=$LATEST_TAG"
+fi
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. Merge latest stable tag into custom-main
 # ══════════════════════════════════════════════════════════════════════════════
@@ -589,11 +605,11 @@ if [[ "$SYNC_CUSTOM_MAIN" == "true" ]]; then
     fi
 
     if ! git merge "${merge_args[@]}" --quiet; then
-      log "WARN: merge $LATEST_TAG into custom-main failed; fallback to current custom-main (no merge)"
       git merge --abort 2>/dev/null || true
+      die "merge $LATEST_TAG into custom-main failed"
     fi
   fi
-  log "custom-main sync attempt finished"
+  log "custom-main sync finished"
 else
   log "skip latest-tag merge (use --sync-custom-main to enable)"
 fi
@@ -681,8 +697,10 @@ sync_protected_scripts_from_custom_main() {
     tools/custom/update-upstream.sh \
     tools/custom/status.sh; do
     if git ls-tree -r --name-only custom-main -- "$script_path" | grep -q .; then
-      git checkout custom-main -- "$script_path" 2>/dev/null || true
-      git add "$script_path" 2>/dev/null || true
+      git checkout custom-main -- "$script_path" 2>/dev/null \
+        || die "failed to restore protected helper from custom-main: $script_path"
+      git add "$script_path" 2>/dev/null \
+        || die "failed to stage protected helper: $script_path"
       changed=1
     fi
   done
@@ -690,9 +708,8 @@ sync_protected_scripts_from_custom_main() {
   if [[ "$changed" -eq 1 ]] && ! git diff --cached --quiet 2>/dev/null; then
     git -c core.hooksPath=/dev/null commit \
       -m "chore(custom): keep protected helper scripts from custom-main" \
-      --no-verify 2>/dev/null || true
-  else
-    git reset 2>/dev/null || true
+      --no-verify 2>/dev/null \
+      || die "failed to commit protected helper scripts on the release branch"
   fi
 }
 
@@ -766,8 +783,23 @@ if [[ "$REUSE_EXISTING" == "true" ]]; then
   git checkout "$TARGET_BRANCH" --quiet
 else
   step "create $TARGET_BRANCH from $LATEST_TAG"
+  if git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
+    SNAPSHOT_BRANCH="auto-update/snapshot-release-$(date -u +%Y%m%d-%H%M%S)-$$"
+    git branch "$SNAPSHOT_BRANCH" "$TARGET_BRANCH"
+    log "saved existing $TARGET_BRANCH at $SNAPSHOT_BRANCH before regeneration"
+  fi
   git checkout -B "$TARGET_BRANCH" "$LATEST_TAG" --quiet
 fi
+
+discard_cherry_pick_attempt() {
+  if git rev-parse --verify -q CHERRY_PICK_HEAD >/dev/null 2>&1; then
+    git cherry-pick --abort \
+      || die "failed to abort the current cherry-pick"
+  else
+    git restore --source=HEAD --staged --worktree -- . \
+      || die "failed to restore the clean generated release branch"
+  fi
+}
 
 cherry_pick_one() {
   local sha="$1"
@@ -784,7 +816,7 @@ cherry_pick_one() {
   if git cherry-pick -x --no-commit "$sha" 2>/dev/null; then
     if git diff --cached --quiet 2>/dev/null; then
       log "  skip (empty):    $short"
-      git reset --hard HEAD 2>/dev/null
+      discard_cherry_pick_attempt
       return 0
     fi
     HUSKY=0 LEFTHOOK=0 git -c core.hooksPath=/dev/null \
@@ -816,14 +848,15 @@ cherry_pick_one() {
 
   if git diff --cached --quiet 2>/dev/null; then
     log "  skip (empty after resolve): $short"
-    git reset --hard HEAD 2>/dev/null
+    discard_cherry_pick_attempt
     return 0
   fi
 
-  HUSKY=0 LEFTHOOK=0 git -c core.hooksPath=/dev/null \
-    commit -C "$sha" --no-verify 2>/dev/null \
-    || { git reset --hard HEAD 2>/dev/null
-         log "  WARN skip (commit failed): $short"; }
+  if ! HUSKY=0 LEFTHOOK=0 git -c core.hooksPath=/dev/null \
+    commit -C "$sha" --no-verify 2>/dev/null; then
+    discard_cherry_pick_attempt
+    die "failed to commit resolved cherry-pick: $short"
+  fi
 }
 
 for sha in "${CUSTOM_COMMITS[@]}"; do
@@ -929,8 +962,8 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
     rc=$?
     log "[error] strict typecheck gate failed (rc=$rc); the cherry-pick introduced"
     log "        new type errors that don't exist on custom-main. Manually fix the"
-    log "        listed signatures, or extend the baseline (delete the baseline"
-    log "        file at $WORKSPACE_STATE_DIR/_strict-typecheck-baseline.txt and re-run)."
+    log "        listed signatures, or explicitly review and update the baseline at"
+    log "        ${WORKSPACE_STATE_DIR:-$ROOT_DIR/tools/custom/.update}/_strict-typecheck-baseline.txt."
     exit "$rc"
   }
 
@@ -957,6 +990,21 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
   else
     log "version $CURRENT_VERSION already normalized (not beta format)"
   fi
+
+  # Lockfile regeneration and stable-version normalization are source changes,
+  # not build artifacts. Commit only these known files so the following branch
+  # switch cannot fail or silently leave release metadata outside the branch.
+  if ! git diff --quiet -- package.json pnpm-lock.yaml; then
+    git add -- package.json pnpm-lock.yaml
+    git -c core.hooksPath=/dev/null commit \
+      -m "chore(release): normalize ${LATEST_TAG} build metadata" \
+      --no-verify \
+      || die "failed to commit release build metadata"
+  fi
+  if [[ -n "$(git status --porcelain)" ]]; then
+    git status --short >&2
+    die "build left unexpected worktree changes; refusing to deploy or switch branches"
+  fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -971,15 +1019,28 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   BACKUP_FILE="$BACKUP_DIR/openclaw-pre-${LATEST_TAG}-${STAMP}.tar.gz"
   if [[ -d "$DEPLOY_TARGET/dist" ]]; then
     log "backup → $BACKUP_FILE"
+    DEPLOY_NAME="$(basename "$DEPLOY_TARGET")"
+    BACKUP_MEMBERS=()
+    for backup_item in dist openclaw.mjs package.json extensions skills; do
+      [[ -e "$DEPLOY_TARGET/$backup_item" ]] \
+        && BACKUP_MEMBERS+=("$DEPLOY_NAME/$backup_item")
+    done
     tar czf "$BACKUP_FILE" \
       -C "$(dirname "$DEPLOY_TARGET")" \
-      "$(basename "$DEPLOY_TARGET")/dist" \
-      "$(basename "$DEPLOY_TARGET")/openclaw.mjs" \
-      "$(basename "$DEPLOY_TARGET")/package.json" \
-      2>/dev/null || log "WARN: backup tar had warnings (non-fatal)"
-    # Rotate: keep only last N backups
-    ls -1t "$BACKUP_DIR"/openclaw-pre-*.tar.gz 2>/dev/null \
-      | tail -n +$(( MAX_BACKUPS + 1 )) | xargs -r rm -f
+      "${BACKUP_MEMBERS[@]}" \
+      || die "failed to back up current deployment"
+    # Rotate: keep only the newest N backups without whitespace-sensitive
+    # ls/xargs parsing.
+    mapfile -d '' BACKUP_ENTRIES < <(
+      find "$BACKUP_DIR" -maxdepth 1 -type f -name 'openclaw-pre-*.tar.gz' \
+        -printf '%T@ %p\0' | sort -z -nr
+    )
+    for (( backup_index = MAX_BACKUPS; backup_index < ${#BACKUP_ENTRIES[@]}; backup_index++ )); do
+      backup_path="${BACKUP_ENTRIES[$backup_index]#* }"
+      [[ "$(dirname "$backup_path")" == "$BACKUP_DIR" ]] \
+        || die "refusing to prune backup outside $BACKUP_DIR: $backup_path"
+      rm -f -- "$backup_path"
+    done
   fi
 
   # ── Sync built artifacts ──
@@ -1037,6 +1098,10 @@ if git merge-base --is-ancestor "$TARGET_BRANCH" custom-main 2>/dev/null; then
 else
   if ! git merge "$TARGET_BRANCH" --no-edit --no-verify \
     -m "chore: merge $TARGET_BRANCH into custom-main" 2>/dev/null; then
+    if [[ "$CONFLICT_STRATEGY" == "stop" ]]; then
+      git merge --abort 2>/dev/null || true
+      die "merge conflict while integrating $TARGET_BRANCH into custom-main"
+    fi
     log "merge conflict — auto-resolving (prefer release-custom)"
     conflicted="$(git diff --name-only --diff-filter=U 2>/dev/null || true)"
     if [[ -n "$conflicted" ]]; then
@@ -1049,7 +1114,8 @@ else
         fi
       done <<< "$conflicted"
     fi
-    git commit --no-edit --no-verify 2>/dev/null || true
+    git commit --no-edit --no-verify 2>/dev/null \
+      || die "failed to commit resolved merge into custom-main"
   fi
 fi
 
@@ -1059,15 +1125,7 @@ fi
 if [[ "$PUSH" == "true" ]]; then
   step "push branches"
   git push origin custom-main --force-with-lease --quiet
-  git push origin "$TARGET_BRANCH" --force-with-lease --quiet 2>/dev/null || true
-
-  # Clean up stale auto-update/snapshot-* remote branches (leftovers from old script)
-  while IFS= read -r ref; do
-    [[ -n "$ref" ]] || continue
-    local_name="${ref#origin/}"
-    log "cleanup stale remote branch: $local_name"
-    git push origin --delete "$local_name" 2>/dev/null || true
-  done < <(git for-each-ref --format='%(refname:short)' refs/remotes/origin/auto-update/)
+  git push origin "$TARGET_BRANCH" --force-with-lease --quiet
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
