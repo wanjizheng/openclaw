@@ -1051,7 +1051,10 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   # but npm does not install that nested manifest's dependency closure. Install
   # it while the official (non-workspace) root package.json is still in place;
   # Discord voice auto-join otherwise fails at runtime on @discordjs/voice.
-  DISCORD_MANIFEST="$DEPLOY_TARGET/dist/extensions/discord/package.json"
+  # Read the manifest from the validated fork build. The official tarball
+  # materializes bundled-extension files from a postinstall script, and npm
+  # installations that gate lifecycle scripts may not have that path yet.
+  DISCORD_MANIFEST="$ROOT_DIR/dist/extensions/discord/package.json"
   if [[ -f "$DISCORD_MANIFEST" ]]; then
     mapfile -t DISCORD_RUNTIME_DEPS < <(
       jq -r '.dependencies // {} | to_entries[] | "\(.key)@\(.value)"' "$DISCORD_MANIFEST"
