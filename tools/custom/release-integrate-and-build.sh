@@ -1088,8 +1088,8 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   log "artifacts synced"
 
   step "migrate and validate live configuration"
-  openclaw doctor --fix \
-    || die "openclaw doctor --fix failed before gateway restart"
+  openclaw doctor --fix --non-interactive \
+    || die "openclaw doctor --fix --non-interactive failed before gateway restart"
   openclaw config validate --json \
     | jq -e '.valid == true' >/dev/null \
     || die "live configuration is invalid after migration"
