@@ -1063,6 +1063,7 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
       npm install \
         --prefix "$DEPLOY_TARGET" \
         --no-save \
+        --omit=dev \
         --package-lock=false \
         "${DISCORD_RUNTIME_DEPS[@]}" \
         || die "failed to install bundled Discord runtime dependencies"
