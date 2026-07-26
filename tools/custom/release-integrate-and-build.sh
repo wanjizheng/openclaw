@@ -5,16 +5,14 @@
 #   1. Require a clean worktree (never auto-commit or discard local changes)
 #   2. Fetch upstream + tags
 #   3. Find latest stable release tag (e.g. v2026.2.26)
-#   4. Merge latest stable tag into custom-main (preserve custom-main history)
-#   5. Collect ONLY custom commits (<latest-tag>..custom-main), excluding
-#      upstream/main and filtering known legacy snapshot/update commits
-#   6. Create release-custom/<tag> from that tag + cherry-pick custom commits
+#   4. Find the newest stable upstream tag already contained by custom-main
+#   5. Materialize the exact net tree delta (<base-tag>..custom-main) as one
+#      synthetic commit (no subject/history heuristics)
+#   6. Create release-custom/<tag> from the latest tag + cherry-pick that delta
 #   7. Build (pnpm install + build + ui:build)
-#   8. Deploy built artifacts to global install + refresh gateway service + restart
-#   9. Merge release-custom/<tag> back into custom-main
+#   8. Merge the validated release tree back into custom-main
+#   9. Deploy built artifacts to global install + refresh gateway service + restart
 #  10. Push everything & switch to custom-main
-#
-# Speed note: Only your ~11 custom commits get cherry-picked (not hundreds).
 #
 set -euo pipefail
 
@@ -50,9 +48,6 @@ if [[ "${OPENCLAW_ALLOW_PREFER_CUSTOM:-false}" == "true" ]]; then
 else
   CONFLICT_STRATEGY="stop"
 fi
-SYNC_CUSTOM_MAIN="false"
-MAX_CUSTOM_COMMITS="300"
-AUTO_SLIM_COMMITS="false"
 REUSE_EXISTING="false"
 STRICT_TYPECHECK="true"
 
@@ -70,10 +65,6 @@ while (( $# )); do
     --skip-install)      SKIP_INSTALL="true"; shift ;;
     --skip-build)        SKIP_BUILD="true"; shift ;;
     --skip-deploy)       SKIP_DEPLOY="true"; shift ;;
-    --sync-custom-main)  SYNC_CUSTOM_MAIN="true"; shift ;;
-    --max-custom-commits) MAX_CUSTOM_COMMITS="${2:-300}"; shift 2 ;;
-    --auto-slim-commits) AUTO_SLIM_COMMITS="true"; shift ;;
-    --no-auto-slim-commits) AUTO_SLIM_COMMITS="false"; shift ;;
     --conflict-strategy) CONFLICT_STRATEGY="${2:-stop}"; shift 2 ;;
     --reuse-existing)     REUSE_EXISTING="true"; shift ;;
     --no-strict-typecheck) STRICT_TYPECHECK="false"; shift ;;
@@ -85,67 +76,11 @@ done
 [[ "$CONFLICT_STRATEGY" =~ ^(prefer-custom|stop)$ ]] \
   || die "--conflict-strategy must be prefer-custom|stop"
 
-if [[ "$CONFLICT_STRATEGY" == "prefer-custom" ]]; then
-  log "WARN: --conflict-strategy=prefer-custom is unsafe across re-port chains (cross-file symbol drop)."
+if [[ "$CONFLICT_STRATEGY" == "prefer-custom" \
+  && "${OPENCLAW_ALLOW_PREFER_CUSTOM:-false}" != "true" ]]; then
+  log "WARN: --conflict-strategy=prefer-custom is unsafe across release trains (cross-file symbol drop)."
   log "      Maintain it manually and run verify_cross_file_symbols after the build, or set OPENCLAW_ALLOW_PREFER_CUSTOM=true explicitly to suppress this message."
 fi
-
-[[ "$MAX_CUSTOM_COMMITS" =~ ^[0-9]+$ ]] \
-  || die "--max-custom-commits must be a non-negative integer"
-
-[[ "$AUTO_SLIM_COMMITS" =~ ^(true|false)$ ]] \
-  || die "auto-slim commit option parse failed"
-
-if [[ "$AUTO_SLIM_COMMITS" == "true" ]]; then
-  log "WARN: --auto-slim-commits deduplicates commits by subject and may omit intentional repeated changes"
-fi
-
-slim_commit_list_by_subject() {
-  local -a input_commits=("$@")
-  local -A chosen_sha_by_subject=()
-  local -A chosen_score_by_subject=()
-  local -A emitted_subject=()
-
-  commit_change_score() {
-    local commit_sha="$1"
-    git --no-pager show --numstat --format= --no-renames "$commit_sha" \
-      | awk '{
-          add=$1; del=$2;
-          if (add == "-") add=0;
-          if (del == "-") del=0;
-          score += add + del;
-        }
-        END { print score + 0 }'
-  }
-
-  local index sha subject score current_best
-  for (( index=0; index<${#input_commits[@]}; index++ )); do
-    sha="${input_commits[$index]}"
-    subject="$(git --no-pager show -s --format=%s "$sha")"
-
-    case "$subject" in
-      "chore: snapshot WIP before release integrate ("*|"chore(auto-update): snapshot fork changes before release integrate ("*)
-        continue
-        ;;
-    esac
-
-    score="$(commit_change_score "$sha")"
-    current_best="${chosen_score_by_subject[$subject]:--1}"
-    if (( score > current_best )); then
-      chosen_score_by_subject["$subject"]="$score"
-      chosen_sha_by_subject["$subject"]="$sha"
-    fi
-  done
-
-  for sha in "${input_commits[@]}"; do
-    subject="$(git --no-pager show -s --format=%s "$sha")"
-    [[ -n "${chosen_sha_by_subject[$subject]+x}" ]] || continue
-    if [[ "${chosen_sha_by_subject[$subject]}" == "$sha" && -z "${emitted_subject[$subject]+x}" ]]; then
-      printf '%s\n' "$sha"
-      emitted_subject["$subject"]=1
-    fi
-  done
-}
 
 has_gpu_environment() {
   if command -v nvidia-smi >/dev/null 2>&1; then
@@ -545,7 +480,6 @@ verify_strict_typecheck() {
 }
 
 SECONDS=0
-ORIGINAL_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Require a clean worktree
@@ -554,6 +488,33 @@ if [[ -n "$(git status --porcelain)" ]]; then
   die "dirty worktree; commit or move local changes before release integration"
 fi
 
+return_to_custom_main_on_exit() {
+  local exit_code=$?
+  trap - EXIT
+  local current_branch
+  current_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if git rev-parse --verify -q CHERRY_PICK_HEAD >/dev/null 2>&1; then
+    git -c core.hooksPath=/dev/null cherry-pick --abort 2>/dev/null || true
+  fi
+  if git rev-parse --verify -q MERGE_HEAD >/dev/null 2>&1; then
+    git merge --abort 2>/dev/null || true
+  fi
+  if [[ "$current_branch" != "custom-main" ]]; then
+    # The worktree was clean at entry and this script owns all tracked
+    # changes made on release-custom/*, so failed build metadata is safe to
+    # discard before returning the operator to the canonical branch.
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+      git restore --source=HEAD --staged --worktree -- . 2>/dev/null || true
+    fi
+    if ! git checkout custom-main --quiet 2>/dev/null; then
+      log "ERROR: failed to return to custom-main after pipeline exit"
+      exit_code=1
+    fi
+  fi
+  exit "$exit_code"
+}
+trap return_to_custom_main_on_exit EXIT
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. Fetch upstream + tags
 # ══════════════════════════════════════════════════════════════════════════════
@@ -561,181 +522,92 @@ step "fetch upstream + origin"
 git fetch upstream --tags --prune --force --quiet
 git fetch origin --prune --quiet
 
+git show-ref --verify --quiet refs/heads/custom-main \
+  || die "local custom-main is missing; refusing to recreate the canonical custom branch from an upstream tag"
+git checkout custom-main --quiet
+if git show-ref --verify --quiet refs/remotes/origin/custom-main; then
+  if git merge-base --is-ancestor custom-main origin/custom-main; then
+    git merge --ff-only origin/custom-main --quiet \
+      || die "failed to fast-forward custom-main to origin/custom-main"
+    log "[ok] custom-main fast-forwarded to origin/custom-main"
+  elif git merge-base --is-ancestor origin/custom-main custom-main; then
+    log "[ok] local custom-main contains origin/custom-main"
+  else
+    die "custom-main and origin/custom-main have diverged; reconcile them explicitly before release integration"
+  fi
+else
+  log "WARN: origin/custom-main is missing; using the existing local custom-main"
+fi
+
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. Find latest stable tag
+# 3. Find latest stable tag published by upstream
 # ══════════════════════════════════════════════════════════════════════════════
-LATEST_TAG="$(git tag -l 'v*' \
-  | grep -E '^v[0-9]+' \
-  | grep -Evi 'alpha|beta|rc|pre' \
-  | sort -V | tail -n 1 || true)"
-[[ -n "$LATEST_TAG" ]] || die "no stable upstream tag found"
+mapfile -t UPSTREAM_STABLE_TAGS < <(
+  git ls-remote --tags --refs upstream 'refs/tags/v*' \
+    | awk '{print $2}' \
+    | sed 's#^refs/tags/##' \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+    | sort -Vu
+)
+(( ${#UPSTREAM_STABLE_TAGS[@]} > 0 )) || die "no stable upstream tag found"
+LATEST_TAG="${UPSTREAM_STABLE_TAGS[${#UPSTREAM_STABLE_TAGS[@]} - 1]}"
+git rev-parse --verify -q "${LATEST_TAG}^{commit}" >/dev/null \
+  || die "latest upstream tag was not fetched locally: $LATEST_TAG"
 log "latest stable tag: $LATEST_TAG"
 
-# Refuse to replay a custom commit train across calendar release trains.
 # vYYYY.M.patch -> train YYYY.M. Re-porting across trains requires semantic
 # review because upstream may have moved or deleted fork-touched symbols.
-BASE_TAG="$(git tag --merged custom-main -l 'v*' \
-  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' \
-  | grep -Evi 'alpha|beta|rc|pre' \
-  | sort -V | tail -n 1 || true)"
+BASE_TAG=""
+for (( tag_index=${#UPSTREAM_STABLE_TAGS[@]} - 1; tag_index >= 0; tag_index-- )); do
+  upstream_tag="${UPSTREAM_STABLE_TAGS[$tag_index]}"
+  if git merge-base --is-ancestor "${upstream_tag}^{commit}" custom-main 2>/dev/null; then
+    BASE_TAG="$upstream_tag"
+    break
+  fi
+done
 [[ -n "$BASE_TAG" ]] || die "cannot determine stable base tag reachable from custom-main"
+BASE_COMMIT="$(git rev-parse "${BASE_TAG}^{commit}")"
 LATEST_TRAIN="$(printf '%s' "${LATEST_TAG#v}" | cut -d. -f1,2)"
 BASE_TRAIN="$(printf '%s' "${BASE_TAG#v}" | cut -d. -f1,2)"
 if [[ "$BASE_TRAIN" != "$LATEST_TRAIN" ]]; then
-  if [[ "${OPENCLAW_ALLOW_MAJOR_DRIFT:-false}" != "true" ]]; then
-    die "release-train drift: custom-main base=$BASE_TAG, latest=$LATEST_TAG. Semantic re-port required; set OPENCLAW_ALLOW_MAJOR_DRIFT=true only after manual review"
+  log "WARN: release-train drift: custom-main base=$BASE_TAG, latest=$LATEST_TAG"
+  if [[ "$CONFLICT_STRATEGY" == "stop" ]]; then
+    log "      exact custom delta will be replayed; stop mode will abort cleanly on the first semantic conflict"
+  else
+    log "      exact custom delta will be replayed with explicit prefer-custom conflict resolution"
   fi
-  log "WARN: release-train drift override accepted: base=$BASE_TAG latest=$LATEST_TAG"
+  if [[ "$CONFLICT_STRATEGY" == "prefer-custom" && "${OPENCLAW_ALLOW_MAJOR_DRIFT:-false}" != "true" ]]; then
+    die "automatic prefer-custom resolution across release trains requires OPENCLAW_ALLOW_MAJOR_DRIFT=true after manual review"
+  fi
 else
   log "[ok] release-train check passed: base=$BASE_TAG latest=$LATEST_TAG"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. Merge latest stable tag into custom-main
+# 4. Keep custom-main as the immutable source snapshot
 # ══════════════════════════════════════════════════════════════════════════════
-git checkout custom-main --quiet 2>/dev/null \
-  || git checkout -b custom-main "$LATEST_TAG" --quiet
-
-if [[ "$SYNC_CUSTOM_MAIN" == "true" ]]; then
-  step "merge $LATEST_TAG into custom-main"
-  if ! git merge-base --is-ancestor "$LATEST_TAG" custom-main; then
-    merge_args=(--no-edit --no-ff "$LATEST_TAG")
-    if [[ "$CONFLICT_STRATEGY" == "prefer-custom" ]]; then
-      merge_args=(--no-edit --no-ff -X ours "$LATEST_TAG")
-    fi
-
-    if ! git merge "${merge_args[@]}" --quiet; then
-      git merge --abort 2>/dev/null || true
-      die "merge $LATEST_TAG into custom-main failed"
-    fi
-  fi
-  log "custom-main sync finished"
-else
-  log "skip latest-tag merge (use --sync-custom-main to enable)"
-fi
+CUSTOM_SOURCE_HEAD="$(git rev-parse custom-main)"
+CUSTOM_SOURCE_TREE="$(git rev-parse 'custom-main^{tree}')"
+log "custom source: ${CUSTOM_SOURCE_HEAD:0:12} (base $BASE_TAG)"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. Collect custom-only commits
-#    Use first-parent mainline only; exclude commits already reachable from
-#    upstream/main or any upstream/release/* branch (those are upstream
-#    release-engineering commits, not fork changes). Then slim noisy repeated
-#    subjects.
+# 5. Materialize the exact custom-main delta
+#    A synthetic commit with parent BASE_TAG and tree custom-main represents
+#    every net fork change exactly once. This includes changes introduced by
+#    re-port commits, merge-conflict resolutions, deletions, mode changes, and
+#    custom-added paths. It deliberately does not infer intent from subjects.
 # ══════════════════════════════════════════════════════════════════════════════
-step "collecting custom commits"
-UPSTREAM_EXCLUDES=("^upstream/main")
-while IFS= read -r rb; do
-  rb="${rb#"${rb%%[![:space:]]*}"}"
-  [[ -n "$rb" ]] || continue
-  UPSTREAM_EXCLUDES+=("^${rb}")
-done < <(git branch -r --list 'upstream/release/*' 2>/dev/null | sed 's/^[[:space:]]*//')
-log "excluding $((${#UPSTREAM_EXCLUDES[@]} - 1)) upstream release branch(es) from cherry-pick list"
-mapfile -t CUSTOM_COMMITS < <(
-  git --no-pager log --first-parent --reverse --no-merges --pretty=%H "${LATEST_TAG}..custom-main" "${UPSTREAM_EXCLUDES[@]}"
-)
-if (( ${#CUSTOM_COMMITS[@]} == 0 )) || [[ -z "${CUSTOM_COMMITS[0]:-}" ]]; then
-  die "no custom commits found between ${LATEST_TAG} and custom-main"
-fi
-
-RAW_CUSTOM_COMMIT_COUNT="${#CUSTOM_COMMITS[@]}"
-if [[ "$AUTO_SLIM_COMMITS" == "true" ]]; then
-  mapfile -t SLIMMED_COMMITS < <(slim_commit_list_by_subject "${CUSTOM_COMMITS[@]}")
-  if (( ${#SLIMMED_COMMITS[@]} == 0 )); then
-    die "auto-slim removed all commits; run with --no-auto-slim-commits to inspect full set"
-  fi
-  if (( RAW_CUSTOM_COMMIT_COUNT != ${#SLIMMED_COMMITS[@]} )); then
-    log "auto-slim result: ${RAW_CUSTOM_COMMIT_COUNT} -> ${#SLIMMED_COMMITS[@]} commit(s)"
-  fi
-  CUSTOM_COMMITS=("${SLIMMED_COMMITS[@]}")
-fi
-
-if (( ${#CUSTOM_COMMITS[@]} > MAX_CUSTOM_COMMITS )); then
-  die "custom commit set is too large (${#CUSTOM_COMMITS[@]} > ${MAX_CUSTOM_COMMITS}); increase --max-custom-commits or pre-clean custom-main"
-fi
-
-is_legacy_autoupdate_subject() {
-  local subject="$1"
-  [[ "$subject" == "feat(release): add stable integrate/build pipeline for custom releases" ]] \
-    || [[ "$subject" == "fix(auto-update): fallback continue when cherry-pick hooks/lint block" ]] \
-    || [[ "$subject" == "fix(auto-update): tolerate rebase conflicts in integration pipeline" ]] \
-    || [[ "$subject" == "custom: auto-run gateway install after deploy" ]] \
-    || [[ "$subject" == "version change" ]] \
-    || [[ "$subject" == "Revert \"version change\"" ]]
-}
-
-# Upstream re-port commits (`feat(upgrade): re-port <old-tag> custom changes
-# onto <new-tag>`) capture a stale snapshot of the fork vs an OLD upstream
-# base. Re-applying them onto a much newer base via cherry-pick re-creates
-# the very cross-file drift that broke the 2026-07-01 release-custom build
-# (the `feat(upgrade): re-port v2026.5.28 custom changes onto v2026.6.1`
-# commit, cherry-picked onto v2026.6.11, caused timers.ts to lose its
-# upstream `ensureMaxDurationTimerForLiveCall` export while events.ts
-# kept its new caller of that function). Drop these from the cherry-pick
-# list. If the cherry-pick is genuinely needed for a specific file path,
-# it'll be picked up via the per-file diff in the integration script's
-# branch creation step (release branch from <LATEST_TAG>); the re-port
-# itself is NOT needed because the fork's custom-main already reflects
-# the merged state.
-is_upstream_re_port_subject() {
-  local subject="$1"
-  [[ "$subject" =~ ^feat\(upgrade\):[[:space:]]+re-port[[:space:]].+custom[[:space:]]changes[[:space:]]+onto[[:space:]] ]] \
-    && return 0
-  return 1
-}
-
-is_protected_custom_script_path() {
-  local file_path="$1"
-  [[ "$file_path" == "tools/custom/release-integrate-and-build.sh" ]] \
-    || [[ "$file_path" == "tools/custom/update-upstream.sh" ]] \
-    || [[ "$file_path" == "tools/custom/status.sh" ]]
-}
-
-sync_protected_scripts_from_custom_main() {
-  local changed=0
-  local script_path
-  for script_path in \
-    tools/custom/release-integrate-and-build.sh \
-    tools/custom/update-upstream.sh \
-    tools/custom/status.sh; do
-    if git ls-tree -r --name-only custom-main -- "$script_path" | grep -q .; then
-      git checkout custom-main -- "$script_path" 2>/dev/null \
-        || die "failed to restore protected helper from custom-main: $script_path"
-      git add "$script_path" 2>/dev/null \
-        || die "failed to stage protected helper: $script_path"
-      changed=1
-    fi
-  done
-
-  if [[ "$changed" -eq 1 ]] && ! git diff --cached --quiet 2>/dev/null; then
-    git -c core.hooksPath=/dev/null commit \
-      -m "chore(custom): keep protected helper scripts from custom-main" \
-      --no-verify 2>/dev/null \
-      || die "failed to commit protected helper scripts on the release branch"
-  fi
-}
-
-FILTERED_CUSTOM_COMMITS=()
-for sha in "${CUSTOM_COMMITS[@]}"; do
-  subject="$(git --no-pager show -s --format=%s "$sha")"
-  if is_legacy_autoupdate_subject "$subject"; then
-    log "  skip (legacy auto-update commit): $(git --no-pager log --oneline -1 "$sha")"
-    continue
-  fi
-  if is_upstream_re_port_subject "$subject"; then
-    log "  skip (re-port commit; unsafe across major-version drift): $(git --no-pager log --oneline -1 "$sha")"
-    continue
-  fi
-  FILTERED_CUSTOM_COMMITS+=("$sha")
-done
-CUSTOM_COMMITS=("${FILTERED_CUSTOM_COMMITS[@]}")
-
-if (( ${#CUSTOM_COMMITS[@]} == 0 )); then
-  die "all candidate custom commits were filtered out as legacy auto-update / re-port commits"
-fi
-
-log "found ${#CUSTOM_COMMITS[@]} custom commit(s) to cherry-pick:"
-for sha in "${CUSTOM_COMMITS[@]}"; do
-  log "  $(git --no-pager log --oneline -1 "$sha")"
-done
+step "materialize exact custom delta"
+CUSTOM_DELTA_COMMIT="$(
+  printf '%s\n\n%s\n%s\n' \
+    "chore(custom): replay custom-main delta from $BASE_TAG" \
+    "Source custom-main: $CUSTOM_SOURCE_HEAD" \
+    "Base upstream tag: $BASE_TAG" \
+    | git commit-tree "$CUSTOM_SOURCE_TREE" -p "$BASE_COMMIT"
+)"
+CUSTOM_COMMITS=("$CUSTOM_DELTA_COMMIT")
+CUSTOM_DELTA_PATHS="$(git diff-tree --no-commit-id --name-only -r "$CUSTOM_DELTA_COMMIT" | wc -l)"
+log "synthetic delta: ${CUSTOM_DELTA_COMMIT:0:12} ($CUSTOM_DELTA_PATHS changed paths)"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. Create release branch from tag + cherry-pick custom commits
@@ -743,9 +615,8 @@ done
 TARGET_BRANCH="release-custom/${LATEST_TAG}"
 
 # ── --reuse-existing fast-path ────────────────────────────────────────────────
-# Used by the auto-update orchestrator when it has detected that custom-main
-# already contains the integration for $LATEST_TAG (release-custom/<tag> has
-# been merged into custom-main's first-parent). In that case the cherry-pick
+# Used only for an explicit rebuild when custom-main already contains the
+# integration for $LATEST_TAG. In that case the cherry-pick
 # step would be a no-op duplicated work — skip straight to rebuilding the
 # existing release branch (still re-running pnpm install + pnpm build to
 # refresh dist/ before deploy).
@@ -753,17 +624,24 @@ TARGET_BRANCH="release-custom/${LATEST_TAG}"
 # Pre-conditions for skipping:
 #   1. $REUSE_EXISTING = "true" (set by `--reuse-existing`)
 #   2. refs/heads/$TARGET_BRANCH exists locally
-#   3. The branch's first non-merge parent is exactly $LATEST_TAG (i.e. it's
-#      an integration for this tag, not for some older tag the user forgot
-#      to clean up)
-#   4. The branch has at least one commit past $LATEST_TAG (i.e. it isn't an
-#      empty branch pointing right at the tag)
+#   3. The branch descends from $LATEST_TAG and contains no merge commits
+#      after the tag (a generated release branch must be a linear replay).
+#   4. Its tree is byte-for-byte identical to current custom-main. An
+#      ancestor-only check is insufficient: an old release branch is normally
+#      an ancestor of custom-main precisely when it is stale.
+#   5. The branch has at least one commit past $LATEST_TAG.
 if [[ "$REUSE_EXISTING" == "true" ]]; then
   if ! git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
     log "[warn] --reuse-existing requested but refs/heads/$TARGET_BRANCH missing; falling back to full pipeline"
     REUSE_EXISTING="false"
   elif ! git merge-base --is-ancestor "$LATEST_TAG" "$TARGET_BRANCH"; then
     log "[warn] --reuse-existing but $TARGET_BRANCH doesn't descend from $LATEST_TAG; falling back to full pipeline"
+    REUSE_EXISTING="false"
+  elif [[ -n "$(git rev-list --merges "$LATEST_TAG".."$TARGET_BRANCH")" ]]; then
+    log "[warn] --reuse-existing but $TARGET_BRANCH is not a linear release replay; falling back to full pipeline"
+    REUSE_EXISTING="false"
+  elif ! git diff --quiet "$TARGET_BRANCH" custom-main; then
+    log "[warn] --reuse-existing but $TARGET_BRANCH tree differs from current custom-main; falling back to full pipeline"
     REUSE_EXISTING="false"
   else
     # Count commits the branch has past the tag — must be > 0 to be a real
@@ -791,19 +669,37 @@ else
   git checkout -B "$TARGET_BRANCH" "$LATEST_TAG" --quiet
 fi
 
-discard_cherry_pick_attempt() {
-  if git rev-parse --verify -q CHERRY_PICK_HEAD >/dev/null 2>&1; then
-    git cherry-pick --abort \
-      || die "failed to abort the current cherry-pick"
+abort_cherry_pick_attempt() {
+  git -c core.hooksPath=/dev/null cherry-pick --abort \
+    || die "failed to abort the current cherry-pick"
+}
+
+unmerged_path_has_stage() {
+  local file_path="$1"
+  local wanted_stage="$2"
+  git ls-files -u -- "$file_path" \
+    | awk -v wanted="$wanted_stage" '$3 == wanted { found=1 } END { exit(found ? 0 : 1) }'
+}
+
+resolve_conflicted_path() {
+  local file_path="$1"
+  local side="theirs"
+  local stage=3
+
+  if unmerged_path_has_stage "$file_path" "$stage"; then
+    git checkout "--$side" -- "$file_path" \
+      && git add -- "$file_path"
   else
-    git restore --source=HEAD --staged --worktree -- . \
-      || die "failed to restore the clean generated release branch"
+    # The selected side deleted the path (modify/delete, rename/delete, etc.).
+    # Staging the remaining worktree copy would silently choose the opposite
+    # side, so record the deletion explicitly.
+    git rm -f -- "$file_path"
   fi
 }
 
 cherry_pick_one() {
   local sha="$1"
-  local short
+  local short cherry_output
   short="$(git --no-pager log --oneline -1 "$sha")"
 
   # Already an ancestor of HEAD (tag already contains it)
@@ -812,59 +708,108 @@ cherry_pick_one() {
     return 0
   fi
 
-  # Try clean cherry-pick (--no-commit to detect empty results)
-  if git cherry-pick -x --no-commit "$sha" 2>/dev/null; then
-    if git diff --cached --quiet 2>/dev/null; then
-      log "  skip (empty):    $short"
-      discard_cherry_pick_attempt
-      return 0
-    fi
-    HUSKY=0 LEFTHOOK=0 git -c core.hooksPath=/dev/null \
-      commit -C "$sha" --no-verify 2>/dev/null
+  # Let Git own the complete sequencer state. This preserves the -x
+  # provenance trailer and guarantees CHERRY_PICK_HEAD exists on conflicts.
+  local cherry_log
+  cherry_log="$(mktemp)"
+  if HUSKY=0 LEFTHOOK=0 git -c core.hooksPath=/dev/null \
+    cherry-pick -x "$sha" >"$cherry_log" 2>&1; then
+    rm -f "$cherry_log"
     log "  applied:         $short"
     return 0
   fi
 
-  # ── Conflict handling ──
+  local conflicted
+  conflicted="$(git diff --name-only --diff-filter=U 2>/dev/null || true)"
+  if [[ -z "$conflicted" ]]; then
+    # A patch already present upstream is a valid empty replay. Git leaves
+    # sequencer state behind; --skip clears it without manufacturing a commit.
+    if git rev-parse --verify -q CHERRY_PICK_HEAD >/dev/null 2>&1 \
+      && git diff --cached --quiet; then
+      git -c core.hooksPath=/dev/null cherry-pick --skip
+      rm -f "$cherry_log"
+      log "  skip (empty):    $short"
+      return 0
+    fi
+    cherry_output="$(tail -40 "$cherry_log")"
+    rm -f "$cherry_log"
+    if git rev-parse --verify -q CHERRY_PICK_HEAD >/dev/null 2>&1; then
+      abort_cherry_pick_attempt
+    fi
+    log "[error] cherry-pick failed without resolvable conflicts: $short"
+    [[ -z "$cherry_output" ]] || log "$cherry_output"
+    die "unexpected cherry-pick failure on $short"
+  fi
+
   if [[ "$CONFLICT_STRATEGY" == "stop" ]]; then
-    die "conflict on $short — resolve then: git cherry-pick --continue"
+    abort_cherry_pick_attempt
+    rm -f "$cherry_log"
+    die "conflict on $short — release branch restored cleanly; semantically re-port the conflicting change onto custom-main, commit it, then rerun"
   fi
 
   log "  conflict:        $short — auto-resolving (prefer custom)"
-  local conflicted
-  conflicted="$(git diff --name-only --diff-filter=U 2>/dev/null || true)"
-  if [[ -n "$conflicted" ]]; then
-    while IFS= read -r f; do
-      [[ -n "$f" ]] || continue
-      if is_protected_custom_script_path "$f"; then
-        git checkout --ours -- "$f" 2>/dev/null && git add "$f" 2>/dev/null
-      else
-        git checkout --theirs -- "$f" 2>/dev/null && git add "$f" 2>/dev/null
-      fi
-    done <<< "$conflicted"
-  fi
-  # Stage any remaining non-conflicting changes
-  git add -A 2>/dev/null || true
+  local f
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if ! resolve_conflicted_path "$f"; then
+      abort_cherry_pick_attempt
+      rm -f "$cherry_log"
+      die "failed to resolve $f while cherry-picking $short"
+    fi
+  done <<< "$conflicted"
 
-  if git diff --cached --quiet 2>/dev/null; then
+  if [[ -n "$(git ls-files -u)" ]]; then
+    abort_cherry_pick_attempt
+    rm -f "$cherry_log"
+    die "unresolved index entries remain after auto-resolving $short"
+  fi
+
+  if git diff --cached --quiet; then
+    git -c core.hooksPath=/dev/null cherry-pick --skip
+    rm -f "$cherry_log"
     log "  skip (empty after resolve): $short"
-    discard_cherry_pick_attempt
     return 0
   fi
 
-  if ! HUSKY=0 LEFTHOOK=0 git -c core.hooksPath=/dev/null \
-    commit -C "$sha" --no-verify 2>/dev/null; then
-    discard_cherry_pick_attempt
+  if ! GIT_EDITOR=true HUSKY=0 LEFTHOOK=0 git -c core.hooksPath=/dev/null \
+    cherry-pick --continue >>"$cherry_log" 2>&1; then
+    abort_cherry_pick_attempt
+    cherry_output="$(tail -40 "$cherry_log")"
+    rm -f "$cherry_log"
+    [[ -z "$cherry_output" ]] || log "$cherry_output"
     die "failed to commit resolved cherry-pick: $short"
   fi
+  rm -f "$cherry_log"
+  log "  applied (resolved): $short"
 }
 
-for sha in "${CUSTOM_COMMITS[@]}"; do
-  cherry_pick_one "$sha"
-done
+verify_custom_added_paths_survive() {
+  local path custom_entry release_entry
+  while IFS= read -r -d '' path; do
+    # Only inspect paths added relative to the custom source's base tag.
+    # Upstream may legitimately delete other paths in LATEST_TAG.
+    custom_entry="$(git ls-tree custom-main -- "$path")"
+    release_entry="$(git ls-tree HEAD -- "$path")"
+    if [[ -z "$release_entry" ]]; then
+      die "custom-added path missing after cherry-pick replay: $path"
+    fi
+    if [[ "${custom_entry%%$'\t'*}" != "${release_entry%%$'\t'*}" ]]; then
+      die "custom-added path differs after cherry-pick replay: $path"
+    fi
+  done < <(
+    git diff --no-renames --diff-filter=A --name-only -z \
+      "$BASE_COMMIT" custom-main
+  )
+  log "[ok] all custom-added paths survived cherry-pick replay"
+}
 
-sync_protected_scripts_from_custom_main
+if [[ "$REUSE_EXISTING" != "true" ]]; then
+  for sha in "${CUSTOM_COMMITS[@]}"; do
+    cherry_pick_one "$sha"
+  done
+fi
 
+verify_custom_added_paths_survive
 log "cherry-pick complete ($(elapsed))"
 
 # ── Cross-file symbol lint (post-cherry-pick, pre-install) ────────────────────
@@ -1008,7 +953,39 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8. Deploy + restart gateway
+# 8. Merge validated release tree → custom-main
+# ══════════════════════════════════════════════════════════════════════════════
+step "merge $TARGET_BRANCH → custom-main"
+git checkout custom-main --quiet
+
+if git merge-base --is-ancestor "$TARGET_BRANCH" custom-main 2>/dev/null; then
+  log "custom-main already contains $TARGET_BRANCH — skip merge"
+else
+  # The release branch has already passed replay checks and the build. Make
+  # the merge commit's tree exactly that validated release tree. A normal
+  # content merge can reintroduce pre-upgrade custom-main versions or stop on
+  # conflicts that were already resolved during the cherry-pick.
+  git merge "$TARGET_BRANCH" --no-ff --no-commit --no-verify >/dev/null 2>&1 || true
+  git rev-parse --verify -q MERGE_HEAD >/dev/null 2>&1 \
+    || die "failed to enter merge state for $TARGET_BRANCH"
+  git read-tree --reset -u "$TARGET_BRANCH" \
+    || { git merge --abort 2>/dev/null || true
+         die "failed to stage the validated $TARGET_BRANCH tree"; }
+  [[ -z "$(git ls-files -u)" ]] \
+    || { git merge --abort 2>/dev/null || true
+         die "unresolved index entries remain while integrating $TARGET_BRANCH"; }
+  git -c core.hooksPath=/dev/null commit --no-verify \
+    -m "chore: merge $TARGET_BRANCH into custom-main" >/dev/null \
+    || { git merge --abort 2>/dev/null || true
+         die "failed to commit $TARGET_BRANCH into custom-main"; }
+fi
+
+git diff --quiet "$TARGET_BRANCH" custom-main \
+  || die "custom-main tree differs from validated $TARGET_BRANCH after merge"
+log "[ok] custom-main now matches the validated release tree"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. Deploy + restart gateway
 # ══════════════════════════════════════════════════════════════════════════════
 if [[ "$SKIP_DEPLOY" != "true" ]]; then
   step "deploy to $DEPLOY_TARGET"
@@ -1072,51 +1049,19 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
 
   # ── Restart gateway service ──
   step "restart $SERVICE_NAME"
-  if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-    systemctl --user restart "$SERVICE_NAME"
-    sleep 3
+  systemctl --user restart "$SERVICE_NAME" \
+    || die "failed to restart $SERVICE_NAME"
+  gateway_ready="false"
+  for (( gateway_attempt=1; gateway_attempt<=10; gateway_attempt++ )); do
     if systemctl --user is-active --quiet "$SERVICE_NAME"; then
-      log "gateway restarted successfully"
-    else
-      log "WARN: gateway may have failed to start"
-      log "  check: journalctl --user -u $SERVICE_NAME -n 40"
+      gateway_ready="true"
+      break
     fi
-  else
-    log "WARN: $SERVICE_NAME not running; skip restart"
-  fi
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 9. Merge release branch → custom-main, then switch to custom-main
-# ══════════════════════════════════════════════════════════════════════════════
-step "merge $TARGET_BRANCH → custom-main"
-git checkout custom-main --quiet
-
-# Check if merge is needed (release-custom might already be an ancestor)
-if git merge-base --is-ancestor "$TARGET_BRANCH" custom-main 2>/dev/null; then
-  log "custom-main already contains $TARGET_BRANCH — skip merge"
-else
-  if ! git merge "$TARGET_BRANCH" --no-edit --no-verify \
-    -m "chore: merge $TARGET_BRANCH into custom-main" 2>/dev/null; then
-    if [[ "$CONFLICT_STRATEGY" == "stop" ]]; then
-      git merge --abort 2>/dev/null || true
-      die "merge conflict while integrating $TARGET_BRANCH into custom-main"
-    fi
-    log "merge conflict — auto-resolving (prefer release-custom)"
-    conflicted="$(git diff --name-only --diff-filter=U 2>/dev/null || true)"
-    if [[ -n "$conflicted" ]]; then
-      while IFS= read -r f; do
-        [[ -n "$f" ]] || continue
-        if is_protected_custom_script_path "$f"; then
-          git checkout --ours -- "$f" && git add "$f"
-        else
-          git checkout --theirs -- "$f" && git add "$f"
-        fi
-      done <<< "$conflicted"
-    fi
-    git commit --no-edit --no-verify 2>/dev/null \
-      || die "failed to commit resolved merge into custom-main"
-  fi
+    sleep 3
+  done
+  [[ "$gateway_ready" == "true" ]] \
+    || die "$SERVICE_NAME did not become active after restart; check: journalctl --user -u $SERVICE_NAME -n 40"
+  log "gateway restarted successfully"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
