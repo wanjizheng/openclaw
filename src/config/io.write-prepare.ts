@@ -46,24 +46,48 @@ export function configPathHasPrefix(path: ConfigPath, prefix: ConfigPath): boole
 }
 
 /**
- * Approximate byte cost of a serialized config value. Used to detect
- * destructive size changes (e.g. a long string replaced by a short string)
- * that path-removal tracking would miss.
+ * Approximate byte cost of a serialized config value, measured in UTF-8
+ * bytes. Used to detect destructive size changes (e.g. a long string
+ * replaced by a short string) that path-removal tracking would miss.
  *
- * Cheap upper bound: JSON.stringify length, or 0 for undefined. This is
- * not byte-precise against the writer's pretty-printer — it is intended as a
- * monotonic shrink detector, not a wire-format check.
+ * The destructive walker (`collectDestructiveChanges`) compares this cost
+ * between the before- and target-trees to decide whether a subtree has
+ * shrunk. The model is intentionally aligned with the writer's 50%
+ * size-drop guard, which also counts UTF-8 bytes via
+ * `Buffer.byteLength(raw, "utf-8")`. Both checks must use the same
+ * byte model so an unauthorized UTF-8 byte shrink (e.g. a long Unicode
+ * prompt replaced by a shorter ASCII string) cannot ride past the
+ * destructive-delta walker on a `.length`-based comparison — `.length`
+ * is a JavaScript UTF-16 code-unit count, which under-counts multi-byte
+ * characters and lets a real byte shrink look like growth.
+ *
+ * The walker uses `JSON.stringify(value)` as its serialization form,
+ * counted as UTF-8 bytes. The writer's pretty-printer emits 2-space
+ * indented JSON with newlines and `{}`/`[]` braces, so the absolute
+ * byte counts here are not byte-precise against the on-disk file. Both
+ * before and target use the same model, so the comparison is monotonic
+ * and directionally correct: a real UTF-8 byte shrink in the writer's
+ * output is also a shrink here, and a real growth is also a growth.
+ *
+ * The cost is intended as a monotonic shrink detector, not a wire-format
+ * check. The 50% file-level guard still uses pretty-printed bytes for
+ * the absolute threshold; this helper is the per-subtree comparison
+ * that powers the destructive-delta walker.
  */
 export function approxSerializedSize(value: unknown): number {
-  if (value === undefined || value === null) return 4;
-  if (typeof value === "string") return value.length + 2;
-  if (typeof value === "number") return String(value).length;
-  if (typeof value === "boolean") return value ? 4 : 5;
+  if (value === undefined) {
+    return 0;
+  }
+  let serialized: string | undefined;
   try {
-    return JSON.stringify(value)?.length ?? 0;
+    serialized = JSON.stringify(value);
   } catch {
     return 0;
   }
+  if (serialized === undefined) {
+    return 0;
+  }
+  return Buffer.byteLength(serialized, "utf-8");
 }
 
 type ManifestModelIdNormalizationProvider = {

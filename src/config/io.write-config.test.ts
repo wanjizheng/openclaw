@@ -1653,6 +1653,127 @@ describe("config io write", () => {
     expect(destructive).toEqual(new Set());
   });
 
+  it("flags Unicode shrink as destructive when target.length is larger but UTF-8 bytes are smaller (round-8 [P1] Unicode byte-shrink)", () => {
+    // Round-8 [P1]: the destructive-delta walker must use the same byte
+    // model as the writer's 50% size-drop guard. The walker previously
+    // compared `.length` (UTF-16 code units), while the writer's 50% guard
+    // used `Buffer.byteLength(raw, "utf-8")`. The mismatch created a real
+    // bypass: a long Unicode string whose UTF-8 byte cost is large could
+    // be replaced by a longer-but-fewer-bytes ASCII string and the
+    // destructive-diff would record the change as growth (non-destructive).
+    //
+    // Concrete numbers: `"中".repeat(1000)` is 1000 UTF-16 code units but
+    // 3000 UTF-8 bytes (each character is 3 bytes). `"a".repeat(1498)` is
+    // 1498 UTF-16 code units AND 1498 UTF-8 bytes. The UTF-16 comparison
+    // records growth (1000 → 1498, +50%). The UTF-8 comparison records
+    // shrink (3000 → 1498, roughly -50%). The writer's byte guard would
+    // catch the absolute file-level shrink, but the destructive-delta
+    // walker is the per-subtree check that records WHICH path shrunk —
+    // without it the walker would silently emit nothing and the
+    // unauthorized path would slip past the destructive-delta gate.
+    const destructive = new Set<string>();
+    destructive.clear();
+    collectDestructiveChanges(
+      { prompt: "中".repeat(1000) },
+      { prompt: "a".repeat(1498) },
+      [],
+      destructive,
+    );
+    expect(destructive).toEqual(new Set([configPathKey(["prompt"])]));
+  });
+
+  it("rejects a write that rides a trusted migration while shrinking a Unicode string (round-8 [P1] ride-along)", async () => {
+    // Round-8 [P1] ride-along: an attacker-style write that combines a
+    // legitimate trusted migration (the `channels` block legitimately
+    // removed) with a hidden Unicode-string shrink on a sibling field.
+    // The `channels` removal is authorized; the Unicode shrink is not.
+    // The destructive-delta walker must flag the shrunken path as
+    // destructive so the writer can reject the write before persisting.
+    //
+    // The ride-along field is `meta.lastTouchedVersion` (a freeform
+    // version string the schema accepts verbatim). The original is
+    // 1000 "中" characters (UTF-16 length 1000, UTF-8 byte length
+    // 3000). The target is 1498 "a" characters (UTF-16 length 1498,
+    // UTF-8 byte length 1498). The naive `.length` walker would have
+    // called this growth (1000 → 1498, +50%) and silently passed the
+    // write; the UTF-8 byte walker correctly sees a real shrink
+    // (3000 → 1498, roughly -50%) and reports it as destructive.
+    //
+    // Why a real end-to-end test: covering `collectDestructiveChanges` in
+    // isolation only proves the walker emits the right path. The writer
+    // then has to (1) recognize that the emitted path is unauthorized,
+    // (2) include it in the rejection's `unauthorized-destructive-paths`
+    // reason, and (3) leave the on-disk file untouched. The full path
+    // only fires here.
+    await withSuiteHome(async (home) => {
+      const configPath = path.join(home, ".openclaw", "openclaw.json");
+      await fs.mkdir(path.dirname(configPath), { recursive: true });
+      const original = {
+        meta: { lastTouchedVersion: "中".repeat(1000) },
+        channels: {
+          telegram: {
+            enabled: true,
+            allowFrom: Array.from({ length: 4000 }, (_, index) => `telegram:${index}`),
+          },
+        },
+      } as Record<string, unknown> as ConfigFileSnapshot["config"];
+      const originalRaw = `${JSON.stringify(original, null, 2)}\n`;
+      await fs.writeFile(configPath, originalRaw, "utf-8");
+      const io = createConfigIO({
+        env: { VITEST: "true" } as NodeJS.ProcessEnv,
+        homedir: () => home,
+        logger: silentLogger,
+      });
+      const baseSnapshot = {
+        path: configPath,
+        exists: true,
+        raw: originalRaw,
+        parsed: original,
+        sourceConfig: original,
+        resolved: original,
+        runtimeConfig: original,
+        config: original,
+        valid: true,
+        issues: [],
+        warnings: [],
+        legacyIssues: [],
+      } as ConfigFileSnapshot;
+
+      // Authorize ONLY the trusted migration path. The ride-along
+      // `meta.lastTouchedVersion` shrink is deliberately NOT authorized.
+      const authorizedDestructivePaths: Array<readonly (string | number)[]> = [["channels"]];
+
+      let caught: unknown = undefined;
+      try {
+        await io.writeConfigFile(
+          {
+            meta: { lastTouchedVersion: "a".repeat(1498) },
+          },
+          {
+            allowConfigSizeDrop: true,
+            authorizedDestructivePaths,
+            lastTouchedVersionOverride: "a".repeat(1498),
+            baseSnapshot,
+          },
+        );
+      } catch (err) {
+        caught = err;
+      }
+      expect((caught as { code?: string } | undefined)?.code).toBe("CONFIG_WRITE_REJECTED");
+      const reasons = (caught as { reasons?: string[] } | undefined)?.reasons ?? [];
+      expect(reasons.some((r) => r.startsWith("unauthorized-destructive-paths:"))).toBe(true);
+      expect(reasons.some((r) => r.includes(configPathKey(["meta", "lastTouchedVersion"])))).toBe(
+        true,
+      );
+
+      // The on-disk file must be untouched. The trusted migration
+      // block, the Chinese string, and everything else must remain
+      // byte-for-byte identical to the original snapshot.
+      const afterRaw = await fs.readFile(configPath, "utf-8");
+      expect(afterRaw).toBe(originalRaw);
+    });
+  });
+
   it("rejects parent destruction even when a leaf is authorized (round-6 [P1-2])", async () => {
     // Round-6 [P1-2]: authorization is DIRECTIONAL. An authorized leaf
     // (e.g. `["channels", "telegram"]`) must NOT cover destruction of its
