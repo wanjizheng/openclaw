@@ -415,7 +415,10 @@ verify_strict_typecheck() {
     typecheck_rc=$?
   fi
 
-  if (( typecheck_rc == 0 )) && [[ ! -s "$ts_err_file" ]]; then
+  # pnpm prints its invoked script line even when tsgo succeeds, so stdout is
+  # not expected to be empty. A zero exit status is authoritative; the
+  # baseline comparison is only needed for non-zero runs with diagnostics.
+  if (( typecheck_rc == 0 )); then
     rm -f "$ts_err_file"
     log "[ok] strict typecheck passed (no errors emitted)"
     return 0
