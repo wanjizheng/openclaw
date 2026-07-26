@@ -6,6 +6,7 @@ import {
   compact,
   estimateContextTokens,
   generateSummary,
+  prepareCompaction,
 } from "./compaction.js";
 import { createFileOps } from "./utils.js";
 
@@ -180,6 +181,33 @@ describe("generateSummary thinking options", () => {
 
     expect(result).toEqual({ ok: true, value: "summary" });
     expect(streamFn).toHaveBeenCalledOnce();
+  });
+});
+
+describe("prepareCompaction", () => {
+  it("does not create an empty compaction that retains the whole branch", () => {
+    const result = prepareCompaction(
+      [
+        {
+          type: "model_change",
+          id: "model",
+          parentId: null,
+          timestamp: "2026-01-01T00:00:00.000Z",
+          provider: "test",
+          modelId: "test",
+        },
+        {
+          type: "message",
+          id: "user",
+          parentId: "model",
+          timestamp: "2026-01-01T00:00:01.000Z",
+          message: { role: "user", content: "hello", timestamp: 1 },
+        },
+      ],
+      { enabled: true, reserveTokens: 16_384, keepRecentTokens: 20_000 },
+    );
+
+    expect(result).toEqual({ ok: true, value: undefined });
   });
 });
 

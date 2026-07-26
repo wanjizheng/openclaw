@@ -806,6 +806,32 @@ describe("buildContextOverflowRecoveryText", () => {
     expect(text).not.toContain("heartbeat model bleed");
   });
 
+  it("does not recommend increasing an already sufficient reserve floor", () => {
+    const text = buildContextOverflowRecoveryText({
+      cfg: {
+        agents: {
+          defaults: {
+            compaction: { reserveTokensFloor: 20_000 },
+          },
+        },
+        models: {
+          providers: {
+            deepseek: {
+              baseUrl: "https://api.deepseek.test",
+              models: [makeTestModel("deepseek-chat", 65_536)],
+            },
+          },
+        },
+      },
+      primaryProvider: "deepseek",
+      primaryModel: "deepseek-chat",
+    });
+
+    expect(text).toContain("already 20000");
+    expect(text).toContain("Do not increase it further");
+    expect(text).not.toContain("To prevent this, increase");
+  });
+
   it("uses session contextTokens as fallback when model metadata is unavailable", () => {
     const text = buildContextOverflowRecoveryText({
       cfg: {},
