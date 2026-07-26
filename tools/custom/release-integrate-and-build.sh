@@ -4,12 +4,13 @@
 # Workflow (matches user requirement exactly):
 #   1. Require a clean worktree (never auto-commit or discard local changes)
 #   2. Fetch upstream + tags
-#   3. Find latest stable release tag (e.g. v2026.2.26)
-#   4. Find the newest stable upstream tag already contained by custom-main
-#   5. Materialize the exact net tree delta (<base-tag>..custom-main) as one
+#   3. Resolve the exact npm stable version and its published build-info commit
+#   4. Verify that commit belongs to upstream and find custom-main's merge base
+#   5. Materialize the exact net tree delta (<merge-base>..custom-main) as one
 #      synthetic commit (no subject/history heuristics)
-#   6. Create release-custom/<tag> from the latest tag + cherry-pick that delta
-#   7. Build (pnpm install + build + ui:build)
+#   6. Create release-custom/v<exact-version> from the npm source commit, then
+#      cherry-pick that exact custom delta
+#   7. Stamp the exact npm version, then build (pnpm install + build + ui:build)
 #   8. Merge the validated release tree back into custom-main
 #   9. Deploy built artifacts to global install + refresh gateway service + restart
 #  10. Push everything & switch to custom-main
@@ -510,6 +511,9 @@ return_to_custom_main_on_exit() {
       exit_code=1
     fi
   fi
+  if [[ -n "${NPM_METADATA_DIR:-}" && -d "$NPM_METADATA_DIR" ]]; then
+    find "$NPM_METADATA_DIR" -depth -delete 2>/dev/null || true
+  fi
   exit "$exit_code"
 }
 trap return_to_custom_main_on_exit EXIT
@@ -539,8 +543,58 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. Find latest stable tag published by upstream
+# 3. Resolve the exact npm stable version and published source commit
 # ══════════════════════════════════════════════════════════════════════════════
+command -v npm >/dev/null 2>&1 || die "npm is required to resolve the exact stable release"
+command -v jq >/dev/null 2>&1 || die "jq is required to verify npm release metadata"
+
+TARGET_VERSION="${OPENCLAW_TARGET_VERSION:-}"
+if [[ -z "$TARGET_VERSION" ]]; then
+  TARGET_VERSION="$(npm view openclaw@latest version --json | jq -er 'select(type == "string")')" \
+    || die "failed to resolve openclaw@latest from npm"
+fi
+[[ "$TARGET_VERSION" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+(-[0-9]+)?$ ]] \
+  || die "npm target is not a stable exact version: $TARGET_VERSION"
+
+NPM_METADATA_DIR="$(mktemp -d)"
+NPM_PACK_FILE="$(
+  cd "$NPM_METADATA_DIR"
+  npm pack --silent "openclaw@$TARGET_VERSION" | tail -1
+)"
+[[ "$NPM_PACK_FILE" != */* && -f "$NPM_METADATA_DIR/$NPM_PACK_FILE" ]] \
+  || die "npm pack returned an unsafe or missing archive path: $NPM_PACK_FILE"
+tar -xzf "$NPM_METADATA_DIR/$NPM_PACK_FILE" \
+  -C "$NPM_METADATA_DIR" \
+  package/package.json package/dist/build-info.json \
+  || die "published npm package is missing package.json or dist/build-info.json"
+
+PUBLISHED_VERSION="$(jq -er '.version | select(type == "string")' "$NPM_METADATA_DIR/package/package.json")" \
+  || die "published npm package has no valid package.json version"
+BUILD_INFO_VERSION="$(jq -er '.version | select(type == "string")' "$NPM_METADATA_DIR/package/dist/build-info.json")" \
+  || die "published npm package has no valid build-info version"
+TARGET_SOURCE_COMMIT="$(jq -er '.commit | select(type == "string")' "$NPM_METADATA_DIR/package/dist/build-info.json")" \
+  || die "published npm package has no valid build-info commit"
+[[ "$PUBLISHED_VERSION" == "$TARGET_VERSION" && "$BUILD_INFO_VERSION" == "$TARGET_VERSION" ]] \
+  || die "npm metadata version mismatch: target=$TARGET_VERSION package=$PUBLISHED_VERSION build-info=$BUILD_INFO_VERSION"
+[[ "$TARGET_SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+  || die "published npm build-info commit is not a full SHA-1: $TARGET_SOURCE_COMMIT"
+
+git rev-parse --verify -q "${TARGET_SOURCE_COMMIT}^{commit}" >/dev/null \
+  || git fetch upstream "$TARGET_SOURCE_COMMIT" --quiet \
+  || die "npm build-info source commit is unavailable from upstream: $TARGET_SOURCE_COMMIT"
+[[ -n "$(git for-each-ref --format='%(refname)' --contains "$TARGET_SOURCE_COMMIT" refs/remotes/upstream | head -1)" ]] \
+  || die "npm build-info commit is not reachable from an upstream remote branch: $TARGET_SOURCE_COMMIT"
+
+TARGET_CORE_VERSION="${TARGET_VERSION%%-*}"
+SOURCE_TAG="v${TARGET_CORE_VERSION}"
+TARGET_LABEL="v${TARGET_VERSION}"
+git rev-parse --verify -q "${SOURCE_TAG}^{commit}" >/dev/null \
+  || die "source release tag was not fetched locally: $SOURCE_TAG"
+git merge-base --is-ancestor "${SOURCE_TAG}^{commit}" "$TARGET_SOURCE_COMMIT" \
+  || die "npm build-info commit does not descend from source tag $SOURCE_TAG"
+log "exact npm stable: $TARGET_VERSION"
+log "published source: ${TARGET_SOURCE_COMMIT:0:12} (anchor $SOURCE_TAG)"
+
 mapfile -t UPSTREAM_STABLE_TAGS < <(
   git ls-remote --tags --refs upstream 'refs/tags/v*' \
     | awk '{print $2}' \
@@ -549,27 +603,24 @@ mapfile -t UPSTREAM_STABLE_TAGS < <(
     | sort -Vu
 )
 (( ${#UPSTREAM_STABLE_TAGS[@]} > 0 )) || die "no stable upstream tag found"
-LATEST_TAG="${UPSTREAM_STABLE_TAGS[${#UPSTREAM_STABLE_TAGS[@]} - 1]}"
-git rev-parse --verify -q "${LATEST_TAG}^{commit}" >/dev/null \
-  || die "latest upstream tag was not fetched locally: $LATEST_TAG"
-log "latest stable tag: $LATEST_TAG"
 
 # vYYYY.M.patch -> train YYYY.M. Re-porting across trains requires semantic
 # review because upstream may have moved or deleted fork-touched symbols.
+BASE_COMMIT="$(git merge-base custom-main "$TARGET_SOURCE_COMMIT")"
+[[ -n "$BASE_COMMIT" ]] || die "cannot determine merge base between custom-main and npm source commit"
 BASE_TAG=""
 for (( tag_index=${#UPSTREAM_STABLE_TAGS[@]} - 1; tag_index >= 0; tag_index-- )); do
   upstream_tag="${UPSTREAM_STABLE_TAGS[$tag_index]}"
-  if git merge-base --is-ancestor "${upstream_tag}^{commit}" custom-main 2>/dev/null; then
+  if git merge-base --is-ancestor "${upstream_tag}^{commit}" "$BASE_COMMIT" 2>/dev/null; then
     BASE_TAG="$upstream_tag"
     break
   fi
 done
-[[ -n "$BASE_TAG" ]] || die "cannot determine stable base tag reachable from custom-main"
-BASE_COMMIT="$(git rev-parse "${BASE_TAG}^{commit}")"
-LATEST_TRAIN="$(printf '%s' "${LATEST_TAG#v}" | cut -d. -f1,2)"
+[[ -n "$BASE_TAG" ]] || die "cannot determine stable upstream tag anchoring the custom merge base"
+LATEST_TRAIN="$(printf '%s' "$TARGET_CORE_VERSION" | cut -d. -f1,2)"
 BASE_TRAIN="$(printf '%s' "${BASE_TAG#v}" | cut -d. -f1,2)"
 if [[ "$BASE_TRAIN" != "$LATEST_TRAIN" ]]; then
-  log "WARN: release-train drift: custom-main base=$BASE_TAG, latest=$LATEST_TAG"
+  log "WARN: release-train drift: custom-main base=$BASE_TAG, target=$TARGET_LABEL"
   if [[ "$CONFLICT_STRATEGY" == "stop" ]]; then
     log "      exact custom delta will be replayed; stop mode will abort cleanly on the first semantic conflict"
   else
@@ -579,7 +630,7 @@ if [[ "$BASE_TRAIN" != "$LATEST_TRAIN" ]]; then
     die "automatic prefer-custom resolution across release trains requires OPENCLAW_ALLOW_MAJOR_DRIFT=true after manual review"
   fi
 else
-  log "[ok] release-train check passed: base=$BASE_TAG latest=$LATEST_TAG"
+  log "[ok] release-train check passed: base=$BASE_TAG target=$TARGET_LABEL"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -587,11 +638,11 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 CUSTOM_SOURCE_HEAD="$(git rev-parse custom-main)"
 CUSTOM_SOURCE_TREE="$(git rev-parse 'custom-main^{tree}')"
-log "custom source: ${CUSTOM_SOURCE_HEAD:0:12} (base $BASE_TAG)"
+log "custom source: ${CUSTOM_SOURCE_HEAD:0:12} (merge-base ${BASE_COMMIT:0:12}, anchor $BASE_TAG)"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. Materialize the exact custom-main delta
-#    A synthetic commit with parent BASE_TAG and tree custom-main represents
+#    A synthetic commit with parent BASE_COMMIT and tree custom-main represents
 #    every net fork change exactly once. This includes changes introduced by
 #    re-port commits, merge-conflict resolutions, deletions, mode changes, and
 #    custom-added paths. It deliberately does not infer intent from subjects.
@@ -601,7 +652,7 @@ CUSTOM_DELTA_COMMIT="$(
   printf '%s\n\n%s\n%s\n' \
     "chore(custom): replay custom-main delta from $BASE_TAG" \
     "Source custom-main: $CUSTOM_SOURCE_HEAD" \
-    "Base upstream tag: $BASE_TAG" \
+    "Base upstream commit: $BASE_COMMIT ($BASE_TAG)" \
     | git commit-tree "$CUSTOM_SOURCE_TREE" -p "$BASE_COMMIT"
 )"
 CUSTOM_COMMITS=("$CUSTOM_DELTA_COMMIT")
@@ -609,13 +660,13 @@ CUSTOM_DELTA_PATHS="$(git diff-tree --no-commit-id --name-only -r "$CUSTOM_DELTA
 log "synthetic delta: ${CUSTOM_DELTA_COMMIT:0:12} ($CUSTOM_DELTA_PATHS changed paths)"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 6. Create release branch from tag + cherry-pick custom commits
+# 6. Create release branch from the exact npm source + cherry-pick custom delta
 # ══════════════════════════════════════════════════════════════════════════════
-TARGET_BRANCH="release-custom/${LATEST_TAG}"
+TARGET_BRANCH="release-custom/${TARGET_LABEL}"
 
 # ── --reuse-existing fast-path ────────────────────────────────────────────────
 # Used only for an explicit rebuild when custom-main already contains the
-# integration for $LATEST_TAG. In that case the cherry-pick
+# integration for $TARGET_LABEL. In that case the cherry-pick
 # step would be a no-op duplicated work — skip straight to rebuilding the
 # existing release branch (still re-running pnpm install + pnpm build to
 # refresh dist/ before deploy).
@@ -623,31 +674,31 @@ TARGET_BRANCH="release-custom/${LATEST_TAG}"
 # Pre-conditions for skipping:
 #   1. $REUSE_EXISTING = "true" (set by `--reuse-existing`)
 #   2. refs/heads/$TARGET_BRANCH exists locally
-#   3. The branch descends from $LATEST_TAG and contains no merge commits
-#      after the tag (a generated release branch must be a linear replay).
+#   3. The branch descends from $TARGET_SOURCE_COMMIT and contains no merge
+#      commits after it (a generated release branch must be a linear replay).
 #   4. Its tree is byte-for-byte identical to current custom-main. An
 #      ancestor-only check is insufficient: an old release branch is normally
 #      an ancestor of custom-main precisely when it is stale.
-#   5. The branch has at least one commit past $LATEST_TAG.
+#   5. The branch has at least one commit past $TARGET_SOURCE_COMMIT.
 if [[ "$REUSE_EXISTING" == "true" ]]; then
   if ! git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
     log "[warn] --reuse-existing requested but refs/heads/$TARGET_BRANCH missing; falling back to full pipeline"
     REUSE_EXISTING="false"
-  elif ! git merge-base --is-ancestor "$LATEST_TAG" "$TARGET_BRANCH"; then
-    log "[warn] --reuse-existing but $TARGET_BRANCH doesn't descend from $LATEST_TAG; falling back to full pipeline"
+  elif ! git merge-base --is-ancestor "$TARGET_SOURCE_COMMIT" "$TARGET_BRANCH"; then
+    log "[warn] --reuse-existing but $TARGET_BRANCH doesn't descend from npm source ${TARGET_SOURCE_COMMIT:0:12}; falling back to full pipeline"
     REUSE_EXISTING="false"
-  elif [[ -n "$(git rev-list --merges "$LATEST_TAG".."$TARGET_BRANCH")" ]]; then
+  elif [[ -n "$(git rev-list --merges "$TARGET_SOURCE_COMMIT".."$TARGET_BRANCH")" ]]; then
     log "[warn] --reuse-existing but $TARGET_BRANCH is not a linear release replay; falling back to full pipeline"
     REUSE_EXISTING="false"
   elif ! git diff --quiet "$TARGET_BRANCH" custom-main; then
     log "[warn] --reuse-existing but $TARGET_BRANCH tree differs from current custom-main; falling back to full pipeline"
     REUSE_EXISTING="false"
   else
-    # Count commits the branch has past the tag — must be > 0 to be a real
-    # integration (otherwise it's just an empty pointer at the tag).
-    commits_past_tag=$(git rev-list --count "$LATEST_TAG".."$TARGET_BRANCH" 2>/dev/null || echo 0)
+    # Count commits the branch has past the npm source — must be > 0 to be a
+    # real integration (otherwise it is just an empty pointer at upstream).
+    commits_past_tag=$(git rev-list --count "$TARGET_SOURCE_COMMIT".."$TARGET_BRANCH" 2>/dev/null || echo 0)
     if (( commits_past_tag <= 0 )); then
-      log "[warn] --reuse-existing but $TARGET_BRANCH has no commits past $LATEST_TAG; falling back to full pipeline"
+      log "[warn] --reuse-existing but $TARGET_BRANCH has no commits past npm source; falling back to full pipeline"
       REUSE_EXISTING="false"
     fi
   fi
@@ -659,13 +710,13 @@ if [[ "$REUSE_EXISTING" == "true" ]]; then
   log "[info] cherry-pick step skipped; will refresh pnpm install + pnpm build then deploy."
   git checkout "$TARGET_BRANCH" --quiet
 else
-  step "create $TARGET_BRANCH from $LATEST_TAG"
+  step "create $TARGET_BRANCH from npm source ${TARGET_SOURCE_COMMIT:0:12}"
   if git show-ref --verify --quiet "refs/heads/$TARGET_BRANCH"; then
     SNAPSHOT_BRANCH="auto-update/snapshot-release-$(date -u +%Y%m%d-%H%M%S)-$$"
     git branch "$SNAPSHOT_BRANCH" "$TARGET_BRANCH"
     log "saved existing $TARGET_BRANCH at $SNAPSHOT_BRANCH before regeneration"
   fi
-  git checkout -B "$TARGET_BRANCH" "$LATEST_TAG" --quiet
+  git checkout -B "$TARGET_BRANCH" "$TARGET_SOURCE_COMMIT" --quiet
 fi
 
 abort_cherry_pick_attempt() {
@@ -786,7 +837,7 @@ verify_custom_added_paths_survive() {
   local path custom_entry release_entry
   while IFS= read -r -d '' path; do
     # Only inspect paths added relative to the custom source's base tag.
-    # Upstream may legitimately delete other paths in LATEST_TAG.
+    # Upstream may legitimately delete other paths in the npm source commit.
     custom_entry="$(git ls-tree custom-main -- "$path")"
     release_entry="$(git ls-tree HEAD -- "$path")"
     if [[ -z "$release_entry" ]]; then
@@ -828,6 +879,20 @@ verify_cross_file_symbols || {
 # 7. Build
 # ══════════════════════════════════════════════════════════════════════════════
 if [[ "$SKIP_BUILD" != "true" ]]; then
+  # The compiler embeds package.json.version into dist/build-info.json and
+  # generated runtime constants. Stamp the exact npm revision before any
+  # build command; changing it afterwards leaves a self-contradictory bundle.
+  step "stamp exact release version $TARGET_VERSION"
+  CURRENT_VERSION="$(jq -er '.version | select(type == "string")' package.json)" \
+    || die "source package.json has no valid version"
+  if [[ "$CURRENT_VERSION" != "$TARGET_VERSION" ]]; then
+    jq --arg version "$TARGET_VERSION" '.version = $version' package.json > package.json.tmp
+    mv package.json.tmp package.json
+    log "package.json version: $CURRENT_VERSION → $TARGET_VERSION"
+  else
+    log "package.json already carries exact target version"
+  fi
+
   if [[ "$SKIP_INSTALL" != "true" ]]; then
     # Run pnpm install with --frozen-lockfile, but allow a one-shot fallback
     # to a non-frozen install when the failure is ERR_PNPM_OUTDATED_LOCKFILE.
@@ -915,33 +980,13 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
   "${UI_BUILD_CMD[@]}" 2>&1 | tail -5
   log "build complete ($(elapsed))"
 
-  # ── Normalize version string for stable releases ──
-  # Git tag v2026.3.1 may point to package.json with version 2026.3.1-beta.1
-  # because OpenClaw promotes beta to stable via npm dist-tag without updating git tags.
-  # Strip -beta.N suffix to match the stable release tag.
-  step "normalize package.json version to match tag"
-  CURRENT_VERSION="$(jq -r '.version' package.json)"
-  NORMALIZED_VERSION="${LATEST_TAG#v}"  # v2026.3.1 → 2026.3.1
-  if [[ "$CURRENT_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-beta\.[0-9]+$ ]]; then
-    BASE_VERSION="${BASH_REMATCH[1]}"
-    if [[ "$BASE_VERSION" == "$NORMALIZED_VERSION" ]]; then
-      log "patching package.json version: $CURRENT_VERSION → $NORMALIZED_VERSION"
-      jq --arg v "$NORMALIZED_VERSION" '.version = $v' package.json > package.json.tmp
-      mv package.json.tmp package.json
-    else
-      log "version mismatch: tag=$NORMALIZED_VERSION, base=$BASE_VERSION (keep as-is)"
-    fi
-  else
-    log "version $CURRENT_VERSION already normalized (not beta format)"
-  fi
-
-  # Lockfile regeneration and stable-version normalization are source changes,
-  # not build artifacts. Commit only these known files so the following branch
-  # switch cannot fail or silently leave release metadata outside the branch.
+  # Lockfile regeneration and exact release version stamping are source
+  # changes, not build artifacts. Commit only these known files so the
+  # following branch switch cannot leave metadata outside the branch.
   if ! git diff --quiet -- package.json pnpm-lock.yaml; then
     git add -- package.json pnpm-lock.yaml
     git -c core.hooksPath=/dev/null commit \
-      -m "chore(release): normalize ${LATEST_TAG} build metadata" \
+      -m "chore(release): stamp ${TARGET_LABEL} build metadata" \
       --no-verify \
       || die "failed to commit release build metadata"
   fi
@@ -950,6 +995,25 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
     die "build left unexpected worktree changes; refusing to deploy or switch branches"
   fi
 fi
+
+# A stale or skipped build must never be merged or deployed under the new
+# label. Validate all three independently produced version surfaces.
+step "verify exact built version"
+[[ "$(jq -er '.version | select(type == "string")' package.json)" == "$TARGET_VERSION" ]] \
+  || die "source package version does not match exact npm target $TARGET_VERSION"
+[[ -f dist/build-info.json ]] \
+  || die "dist/build-info.json is missing; refusing to merge an unbuilt release"
+[[ "$(jq -er '.version | select(type == "string")' dist/build-info.json)" == "$TARGET_VERSION" ]] \
+  || die "compiled build-info version does not match exact npm target $TARGET_VERSION"
+BUILT_CLI_VERSION="$(
+  node openclaw.mjs --version 2>/dev/null \
+    | sed -nE 's/^OpenClaw ([^ ]+)( .*)?$/\1/p' \
+    | tail -1
+)" \
+  || die "built CLI could not report its version"
+[[ "$BUILT_CLI_VERSION" == "$TARGET_VERSION" ]] \
+  || die "built CLI version mismatch: expected=$TARGET_VERSION actual=$BUILT_CLI_VERSION"
+log "[ok] package, build-info, and CLI all report $TARGET_VERSION"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 8. Merge validated release tree → custom-main
@@ -1005,7 +1069,7 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   # ── Backup current install ──
   mkdir -p "$BACKUP_DIR"
   STAMP="$(date +%Y%m%d-%H%M%S)"
-  BACKUP_FILE="$BACKUP_DIR/openclaw-pre-${LATEST_TAG}-${STAMP}.tar.gz"
+  BACKUP_FILE="$BACKUP_DIR/openclaw-pre-${TARGET_LABEL}-${STAMP}.tar.gz"
   if [[ -d "$DEPLOY_TARGET/dist" ]]; then
     log "backup → $BACKUP_FILE"
     DEPLOY_NAME="$(basename "$DEPLOY_TARGET")"
@@ -1039,13 +1103,13 @@ if [[ "$SKIP_DEPLOY" != "true" ]]; then
   systemctl --user stop "$SERVICE_NAME" \
     || die "failed to stop $SERVICE_NAME before deployment"
 
-  step "install official ${LATEST_TAG} runtime dependencies"
-  npm install --global "openclaw@${LATEST_TAG#v}" \
-    || die "failed to install official ${LATEST_TAG} runtime dependency base"
+  step "install official ${TARGET_VERSION} runtime dependencies"
+  npm install --global "openclaw@${TARGET_VERSION}" \
+    || die "failed to install official ${TARGET_VERSION} runtime dependency base"
   [[ -f "$DEPLOY_TARGET/package.json" ]] \
     || die "official npm install did not create $DEPLOY_TARGET/package.json"
-  [[ "$(jq -r '.version // empty' "$DEPLOY_TARGET/package.json")" == "${LATEST_TAG#v}" ]] \
-    || die "official npm install version does not match ${LATEST_TAG#v}"
+  [[ "$(jq -r '.version // empty' "$DEPLOY_TARGET/package.json")" == "$TARGET_VERSION" ]] \
+    || die "official npm install version does not match $TARGET_VERSION"
 
   # The v7 monolithic tarball carries the compiled Discord extension manifest
   # but npm does not install that nested manifest's dependency closure. Install
@@ -1165,13 +1229,14 @@ TOTAL="$(elapsed)"
 
 if [[ "$JSON_MODE" == "true" ]]; then
   cat <<EOF
-{"status":"ok","tag":"$LATEST_TAG","branch":"$TARGET_BRANCH","head":"$HEAD_SHA","elapsed":"$TOTAL","deployed":$([ "$SKIP_DEPLOY" = "true" ] && echo false || echo true),"customCommits":${#CUSTOM_COMMITS[@]}}
+{"status":"ok","version":"$TARGET_VERSION","tag":"$TARGET_LABEL","sourceTag":"$SOURCE_TAG","sourceCommit":"$TARGET_SOURCE_COMMIT","branch":"$TARGET_BRANCH","head":"$HEAD_SHA","elapsed":"$TOTAL","deployed":$([ "$SKIP_DEPLOY" = "true" ] && echo false || echo true),"customCommits":${#CUSTOM_COMMITS[@]}}
 EOF
 else
   log ""
   log "═══════════════════════════════════════════════════"
   log "  Release integration complete!"
-  log "  tag:       $LATEST_TAG"
+  log "  version:   $TARGET_VERSION"
+  log "  source:    ${TARGET_SOURCE_COMMIT:0:12} ($SOURCE_TAG)"
   log "  release:   $TARGET_BRANCH"
   log "  head:      $HEAD_SHA"
   log "  commits:   ${#CUSTOM_COMMITS[@]} custom"
