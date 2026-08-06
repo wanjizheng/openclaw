@@ -13,7 +13,7 @@
 
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -137,6 +137,7 @@ export async function generateHybridAudioFile(params: {
 
     const sagOk = await synthesizeWithSag(params.text, destPath);
     if (sagOk) {
+      chmodSync(destPath, 0o644);
       return destPath;
     }
 
@@ -157,6 +158,9 @@ export async function generateHybridAudioFile(params: {
         });
         if (ttsResult.success && ttsResult.audioPath) {
           copyFileSync(ttsResult.audioPath, destPath);
+          // Core TTS temp files are private. The hosted copy must be readable by
+          // the nginx worker or Twilio receives a 403 and ends the call.
+          chmodSync(destPath, 0o644);
           return destPath;
         }
       }
