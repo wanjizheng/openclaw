@@ -5,6 +5,29 @@ Each entry should explain:
 
 - What changed
 
+## 2026-08-18
+
+### Pre-generate outbound greeting audio before dialing (hybrid mode)
+
+Outbound hybrid-mode calls used to dial first, then synthesize the opening
+line's mp3 (ElevenLabs via `sag`) only after Twilio reported the call
+answered. The callee heard several seconds of dead air before the greeting
+started.
+
+`extensions/voice-call/src/manager/outbound.ts` now calls
+`generateHybridAudioUrl` for the initial message **before** placing the
+Twilio call (in `initiateCall`), storing the resulting URL in
+`callRecord.metadata.initialMessageAudioUrl`. `speak()` gained a
+`preGeneratedAudioUrl` option that skips synthesis and reuses that URL;
+`speakInitialMessage()` passes it through and clears it from metadata after
+successful playback. Falls back to the original on-answer generation if
+pre-generation fails or hybrid mode is off. Notify mode is unaffected (it
+already speaks immediately via inline Polly `<Say>`).
+
+**Files touched (1):**
+
+- `extensions/voice-call/src/manager/outbound.ts`
+
 ## 2026-06-03
 
 ### Hybrid mode fixes (queue-driven endCall + empty-call filter + replay-detection fix)

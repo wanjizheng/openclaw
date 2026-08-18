@@ -212,6 +212,37 @@ export async function initiateCall(
     },
   };
 
+  // Hybrid mode: synthesize the opening line's mp3 before dialing so the
+  // callee hears speech immediately on answer instead of dead air while
+  // ElevenLabs generates it post-connect (see manager.ts speakInitialMessage
+  // callers). Best-effort — falls back to on-answer generation if this fails.
+  if (mode !== "notify" && initialMessage && ctx.config.streaming?.hybridMode) {
+    const pregenStartedAt = Date.now();
+    try {
+      const audioUrl = await generateHybridAudioUrl({
+        text: initialMessage,
+        voiceConfig: ctx.config,
+        coreConfig: { messages: { tts: ctx.config.tts } } as never,
+        callId,
+      });
+      if (audioUrl) {
+        callRecord.metadata!.initialMessageAudioUrl = audioUrl;
+        console.log(
+          `[voice-call][hybrid] Pre-generated initial message audio for ${callId} in ${Date.now() - pregenStartedAt}ms`,
+        );
+      } else {
+        console.warn(
+          `[voice-call][hybrid] Pre-generation produced no audio URL for ${callId}; will generate on answer instead`,
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `[voice-call][hybrid] Pre-generation of initial message audio failed for ${callId}:`,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
   ctx.activeCalls.set(callId, callRecord);
   persistCallRecord(ctx.storePath, callRecord);
 
@@ -294,6 +325,8 @@ export async function initiateCall(
 export type SpeakOptions = {
   listenAfterPlayback?: boolean;
   endCall?: boolean;
+  /** Skip TTS synthesis and use this already-generated hybrid audio URL. */
+  preGeneratedAudioUrl?: string;
 };
 
 export async function speak(
@@ -328,8 +361,10 @@ export async function speak(
 
     // Hybrid mode: pre-generate the mp3 file and pass its public URL.
     // Twilio plays it via Call Update <Play> instead of streaming over WS.
-    let audioUrl: string | undefined;
-    if (ctx.config.streaming?.hybridMode) {
+    let audioUrl: string | undefined = options?.preGeneratedAudioUrl;
+    if (audioUrl) {
+      console.log(`[voice-call][hybrid] Using pre-generated audio for ${callId}`);
+    } else if (ctx.config.streaming?.hybridMode) {
       try {
         audioUrl = await generateHybridAudioUrl({
           text,
@@ -429,6 +464,7 @@ export async function speakInitialMessage(
   }
 
   const initialMessage = call.metadata?.initialMessage as string | undefined;
+  const initialMessageAudioUrl = call.metadata?.initialMessageAudioUrl as string | undefined;
   const mode = (call.metadata?.mode as CallMode) ?? "conversation";
 
   if (!initialMessage) {
@@ -446,7 +482,9 @@ export async function speakInitialMessage(
 
   try {
     console.log(`[voice-call] Speaking initial message for call ${call.callId} (mode: ${mode})`);
-    const result = await speak(ctx, call.callId, initialMessage);
+    const result = await speak(ctx, call.callId, initialMessage, {
+      preGeneratedAudioUrl: initialMessageAudioUrl,
+    });
     if (!result.success) {
       console.warn(`[voice-call] Failed to speak initial message: ${result.error}`);
       return;
@@ -455,6 +493,7 @@ export async function speakInitialMessage(
     // Clear only after successful playback so transient provider failures can retry.
     if (call.metadata) {
       delete call.metadata.initialMessage;
+      delete call.metadata.initialMessageAudioUrl;
       persistCallRecord(ctx.storePath, call);
     }
 
