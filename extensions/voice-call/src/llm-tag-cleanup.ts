@@ -68,7 +68,7 @@ export function stripLlmReasoningTags(text: string, options?: { isFinal?: boolea
   cleaned = cleaned.replace(MALFORMED_DOUBLE_CLOSE_RE, "");
   cleaned = cleaned.replace(MALFORMED_INLINE_PREFIX_RE, "");
   if (options?.isFinal) {
-    cleaned = cleaned.replace(TRAILING_PARTIAL_TAG_RE, "");
+    cleaned = cleaned.replace(TRAILING_PARTIAL_TAG_RE, "").replace(/<\s*\/\s*$/g, "");
   }
 
   return cleaned;

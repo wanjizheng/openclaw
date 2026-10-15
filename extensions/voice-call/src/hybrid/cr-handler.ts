@@ -1,200 +1,170 @@
-/**
- * Hybrid mode ConversationRelay WebSocket handler.
- *
- * In hybrid mode the inbound audio is forked to our own STT via `<Start><Stream>`,
- * so the CR socket is used purely as an event channel: setup / interrupt /
- * hangup detection.  We deliberately ignore CR's own `prompt` (Deepgram
- * transcript) events to avoid double-transcription.
- *
- * The CR socket also gets disconnected each time we issue a Call Update with
- * `<Play>` (Twilio replaces the active TwiML). This is expected — we suppress
- * synthesizing `call.ended` while a hybrid play queue is active for the SID.
- */
-
-import http from "node:http";
+import crypto from "node:crypto";
+import type http from "node:http";
 import type { Duplex } from "node:stream";
-import { WebSocket, WebSocketServer } from "ws";
+import type { PluginServiceSchedulerV1 } from "openclaw/plugin-sdk/plugin-entry";
+import { type WebSocket, WebSocketServer } from "openclaw/plugin-sdk/websocket-runtime";
 import type { CallManager } from "../manager.js";
-import type { NormalizedEvent } from "../types.js";
+import { TerminalStates } from "../types.js";
+import type { CrAdmission, HybridCrAdmission } from "./cr-admission.js";
 
 export type HybridCrHandlerDeps = {
   manager: CallManager;
-  /** Returns true while a hybrid play queue is active for the given SID. */
-  isHybridPlaying: (callSid: string) => boolean;
-  /** Abort any in-flight LLM response for a callId. */
-  abortInFlightResponse?: (callId: string) => void;
-  /** Speak the call's stored initial message via its provider call ID. */
+  scheduler: PluginServiceSchedulerV1;
+  admission: HybridCrAdmission;
   speakInitialMessage?: (providerCallId: string) => Promise<void>;
 };
 
+/** Signature admission belongs to the webhook owner; setup also binds a live call. */
 export class HybridCrHandler {
-  private wss: WebSocketServer | null = null;
-  private connections = new Map<string, WebSocket>();
+  private readonly wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+  private readonly connections = new Map<string, WebSocket>();
+  private closed = false;
 
   constructor(private readonly deps: HybridCrHandlerDeps) {}
 
-  /** Mount the WS upgrade for a given path. Idempotent. */
-  handleUpgrade(request: http.IncomingMessage, socket: Duplex, head: Buffer): void {
-    if (!this.wss) {
-      this.wss = new WebSocketServer({ noServer: true });
+  handleUpgrade(
+    request: http.IncomingMessage,
+    socket: Duplex,
+    head: Buffer,
+    admission: CrAdmission,
+  ): void {
+    if (this.closed || this.deps.scheduler.signal.aborted) {
+      socket.destroy();
+      return;
     }
-    this.wss.handleUpgrade(request, socket, head, (ws) => {
-      this.handleConnection(ws);
+    this.wss.handleUpgrade(request, socket, head, (ws) => this.handleConnection(ws, admission));
+  }
+
+  getConnection(sid: string): WebSocket | undefined {
+    return this.connections.get(sid);
+  }
+
+  close(): void {
+    this.closed = true;
+    for (const ws of this.wss.clients) {
+      ws.terminate();
+    }
+    this.connections.clear();
+    this.wss.close();
+  }
+
+  private handleConnection(ws: WebSocket, admission: CrAdmission): void {
+    let callSid: string | undefined;
+    let callId: string | undefined;
+    let rejected = false;
+    const currentCall = () => {
+      if (
+        this.closed ||
+        this.deps.scheduler.signal.aborted ||
+        callSid === undefined ||
+        callId === undefined ||
+        this.connections.get(callSid) !== ws ||
+        !this.deps.admission.isActive(admission)
+      ) {
+        return undefined;
+      }
+      const call = this.deps.manager.getCall(callId);
+      return call !== undefined && !TerminalStates.has(call.state) ? call : undefined;
+    };
+    const timeout = this.deps.scheduler.schedule({
+      id: `voice:cr:setup:${crypto.randomUUID()}`,
+      delayMs: 5000,
+      run: () => {
+        if (!callSid) {
+          ws.terminate();
+        }
+      },
     });
-  }
-
-  getConnection(callSid: string): WebSocket | undefined {
-    return this.connections.get(callSid);
-  }
-
-  private handleConnection(ws: WebSocket): void {
-    let callSid: string | null = null;
-    let callId: string | null = null;
-
-    console.log("[voice-call][cr] New ConversationRelay WebSocket connection");
-
-    ws.on("message", (data: Buffer | string | ArrayBuffer | Buffer[]) => {
+    ws.on("message", (data) => {
+      if (rejected) {
+        return;
+      }
       try {
-        let raw: string;
-        if (typeof data === "string") {
-          raw = data;
-        } else if (Array.isArray(data)) {
-          raw = Buffer.concat(data).toString();
-        } else if (Buffer.isBuffer(data)) {
-          raw = data.toString();
-        } else {
-          raw = Buffer.from(new Uint8Array(data)).toString();
+        const bytes = Buffer.isBuffer(data)
+          ? data
+          : Array.isArray(data)
+            ? Buffer.concat(data)
+            : Buffer.from(data);
+        const msg: unknown = JSON.parse(bytes.toString("utf8"));
+        if (!msg || typeof msg !== "object") {
+          return;
         }
-        const msg = JSON.parse(raw);
-        const summary = JSON.stringify(msg).slice(0, 300);
-        console.log(`[voice-call][cr] Received: ${summary}`);
-
-        switch (msg.type) {
-          case "setup": {
-            const sid = typeof msg.callSid === "string" ? msg.callSid : null;
-            if (!sid) {
-              console.warn("[voice-call][cr] setup message missing callSid");
-              break;
-            }
-            callSid = sid;
-            this.connections.set(sid, ws);
-
-            const call = this.deps.manager.getCallByProviderCallId(sid);
-            if (!call) {
-              console.warn(`[voice-call][cr] No call record for callSid ${sid}`);
-              break;
-            }
-            callId = call.callId;
-            console.log(`[voice-call][cr] Linked CR session to call ${callId} (${sid})`);
-
-            // Synthesize call.answered if still ringing.
-            if (call.state === "ringing") {
-              const answered: NormalizedEvent = {
-                id: `cr-answered-${Date.now()}`,
-                type: "call.answered",
-                callId: call.callId,
-                providerCallId: sid,
-                timestamp: Date.now(),
-              };
-              this.deps.manager.processEvent(answered);
-              console.log(`[voice-call][cr] Synthesized call.answered for ${callId}`);
-            }
-
-            // Speak initial message via the manager (which routes through the
-            // hybrid TTS queue + Call Update <Play> path when hybrid is on).
-            if (
-              typeof call.metadata?.initialMessage === "string" &&
-              this.deps.speakInitialMessage
-            ) {
-              const cid = call.callId;
-              const providerCallId = sid;
-              const direction = call.direction;
-              setTimeout(() => {
-                this.deps.speakInitialMessage!(providerCallId)
-                  .then(() => {
-                    console.log(
-                      `[voice-call][cr] Greeting playback initiated for ${cid} (${direction})`,
-                    );
-                  })
-                  .catch((err: unknown) => {
-                    console.warn(`[voice-call][cr] Failed to speak greeting:`, err);
-                  });
-              }, 300);
-            }
-            break;
+        const value = msg as Record<string, unknown>;
+        if (value.type === "setup") {
+          if (
+            this.closed ||
+            this.deps.scheduler.signal.aborted ||
+            callSid ||
+            typeof value.callSid !== "string"
+          ) {
+            rejected = true;
+            ws.close(1008);
+            return;
           }
-
-          case "prompt": {
-            // Hybrid mode: STT comes from the fork Media Stream (OpenAI).
-            // Ignore CR's Deepgram transcripts to avoid double-transcription.
-            const text = typeof msg.voicePrompt === "string" ? msg.voicePrompt : "";
-            console.log(
-              `[voice-call][cr][hybrid] Ignoring CR prompt (using fork STT): "${text.slice(0, 60)}" (call ${callId})`,
-            );
-            break;
+          const call = this.deps.manager.getCallByProviderCallId(value.callSid);
+          if (
+            !call ||
+            call.callId !== admission.callId ||
+            TerminalStates.has(call.state) ||
+            !this.deps.admission.promote(admission, value.callSid)
+          ) {
+            rejected = true;
+            ws.close(1008);
+            return;
           }
-
-          case "interrupt": {
-            console.log(`[voice-call][cr] Interrupt received for call ${callId}`);
-            if (callId && this.deps.abortInFlightResponse) {
-              this.deps.abortInFlightResponse(callId);
-            }
-            break;
+          callSid = value.callSid;
+          callId = call.callId;
+          this.connections.get(callSid)?.close(1000);
+          this.connections.set(callSid, ws);
+          timeout.cancel();
+          this.deps.scheduler.schedule({
+            id: `voice:cr:greeting:${callId}`,
+            delayMs: 0,
+            run: async () => {
+              const greetingCall = currentCall();
+              if (greetingCall === undefined) {
+                return;
+              }
+              if (greetingCall.state === "ringing" || greetingCall.state === "initiated") {
+                await this.deps.manager.processEvent({
+                  id: `cr-answered:${callId}`,
+                  type: "call.answered",
+                  callId: greetingCall.callId,
+                  providerCallId: callSid,
+                  timestamp: Date.now(),
+                });
+              }
+              const readyCall = currentCall();
+              if (
+                readyCall !== undefined &&
+                typeof readyCall.metadata?.initialMessage === "string" &&
+                readyCall.providerCallId !== undefined
+              ) {
+                await this.deps.speakInitialMessage?.(readyCall.providerCallId);
+              }
+            },
+          });
+        } else if (value.type === "interrupt") {
+          const interruptedCall = currentCall();
+          if (interruptedCall !== undefined) {
+            this.deps.manager.invalidateAutoResponse(interruptedCall);
           }
-
-          case "dtmf": {
-            console.log(`[voice-call][cr] DTMF digit: ${msg.digit} for call ${callId}`);
-            break;
-          }
-
-          default:
-            console.log(`[voice-call][cr] Unknown message type: ${msg.type}`);
         }
-      } catch (err) {
-        console.error("[voice-call][cr] Message parse error:", err);
+        // STT comes exclusively from the authenticated inbound media fork.
+      } catch {
+        rejected = true;
+        ws.close(1007);
       }
     });
-
-    ws.on("close", (code: number, reason: Buffer) => {
-      console.log(`[voice-call][cr] WebSocket closed (code=${code}, reason=${reason?.toString()})`);
-      if (callSid) {
+    ws.on("close", () => {
+      timeout.cancel();
+      // Release this transport even after its call was finalized; never remove its replacement.
+      if (callSid && this.connections.get(callSid) === ws) {
         this.connections.delete(callSid);
       }
-      if (!callId || !callSid) {
-        return;
-      }
-
-      // Suppress call.ended when CR disconnects due to hybrid <Play> injection.
-      if (this.deps.isHybridPlaying(callSid)) {
-        console.log(
-          `[voice-call][cr][hybrid] Expected CR disconnect during play for ${callId}, not ending call`,
-        );
-        return;
-      }
-
-      const call = this.deps.manager.getCall(callId);
-      if (!call) {
-        return;
-      }
-      const terminalStates = new Set(["ended", "failed", "no-answer", "busy", "canceled"]);
-      if (terminalStates.has(call.state)) {
-        return;
-      }
-
-      console.log(`[voice-call][cr] Synthesizing call.ended for ${callId}`);
-      const ended: NormalizedEvent = {
-        id: `cr-ended-${Date.now()}`,
-        type: "call.ended",
-        callId,
-        providerCallId: callSid,
-        timestamp: Date.now(),
-        reason: "hangup-user",
-      };
-      this.deps.manager.processEvent(ended);
+      // Carrier terminal callbacks own termination. A replaced/dropped CR socket
+      // alone does not prove the call ended, including expected MP3 Call Updates.
     });
-
-    ws.on("error", (err: Error) => {
-      console.error(`[voice-call][cr] WebSocket error:`, err);
-    });
+    ws.on("error", () => {});
   }
 }

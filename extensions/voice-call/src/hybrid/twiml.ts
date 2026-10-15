@@ -33,6 +33,7 @@ export function escapeXml(str: string): string {
  */
 export type ConversationRelayOptions = {
   wsUrl: string;
+  actionUrl?: string;
   language?: string;
   ttsProvider?: string;
   voice?: string;
@@ -60,7 +61,7 @@ export function buildConversationRelayElement(opts: ConversationRelayOptions): s
 export function buildConversationRelayTwiml(opts: ConversationRelayOptions): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect>
+  <Connect${opts.actionUrl ? ` action="${escapeXml(opts.actionUrl)}" method="POST"` : ""}>
     ${buildConversationRelayElement(opts)}
   </Connect>
 </Response>`;
@@ -93,7 +94,7 @@ export function buildHybridInitialTwiml(opts: {
     <Stream url="${escapeXml(cleanStreamUrl)}" track="inbound_track">${tokenParam}
     </Stream>
   </Start>${playElement}
-  <Connect>
+  <Connect${opts.cr.actionUrl ? ` action="${escapeXml(opts.cr.actionUrl)}" method="POST"` : ""}>
     ${buildConversationRelayElement(opts.cr)}
   </Connect>
 </Response>`;
@@ -108,7 +109,7 @@ export function buildResumeRelayTwiml(cr: ConversationRelayOptions): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Pause length="1"/>
-  <Connect>
+  <Connect${rest.actionUrl ? ` action="${escapeXml(rest.actionUrl)}" method="POST"` : ""}>
     ${buildConversationRelayElement(rest)}
   </Connect>
 </Response>`;

@@ -1,69 +1,45 @@
 // Final doctor config-write decision after preview/repair mode has collected mutations.
-import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import { hashConfigRaw } from "../../config/io.read-helpers.js";
+import type { ConfigFileSnapshot, OpenClawConfig } from "../../config/types.openclaw.js";
 
 /** Decide whether doctor should write the repaired candidate config or only print hints. */
 export async function finalizeDoctorConfigFlow(params: {
   cfg: OpenClawConfig;
   candidate: OpenClawConfig;
+  snapshot: Pick<ConfigFileSnapshot, "path" | "hash" | "raw">;
   pendingChanges: boolean;
+  allowConfigSizeDropOnWrite?: boolean;
   shouldRepair: boolean;
   fixHints: string[];
   confirm: (p: { message: string; initialValue: boolean }) => Promise<boolean>;
   note: (message: string, title?: string) => void;
-  /**
-   * Explicit opt-in for the 50% size-drop guard. Owner: a named migration
-   * step that knows it must remove legacy keys. Generic `shouldWriteConfig`
-   * is no longer enough — auto-update's `doctor --fix` non-interactive pass
-   * also trips that flag, which previously let unattended update flows
-   * silently shrink the user's config and force a `.bak` → main auto-restore
-   * on next startup (#80077 regression vector).
-   *
-   * The opt-in is independent of `shouldRepair`: it is validated against the
-   * FINAL write decision, including the interactive `confirm` path, so a
-   * user-confirmed legacy migration in plain `openclaw doctor` still gets
-   * the size-drop override when the upstream migration step set it.
-   */
-  allowConfigSizeDropOnWrite?: boolean;
 }): Promise<{
   cfg: OpenClawConfig;
   shouldWriteConfig: boolean;
   allowConfigSizeDropOnWrite: boolean;
+  confirmedConfigSource: { path: string; hash: string };
 }> {
-  const requestedSizeDropOptIn = params.allowConfigSizeDropOnWrite === true;
-
+  const confirmedConfigSource = {
+    path: params.snapshot.path,
+    hash: params.snapshot.hash ?? hashConfigRaw(params.snapshot.raw),
+  };
+  let cfg = params.cfg;
+  let shouldWriteConfig = params.shouldRepair && params.pendingChanges;
   if (!params.shouldRepair && params.pendingChanges) {
-    const shouldApply = await params.confirm({
+    shouldWriteConfig = await params.confirm({
       message: "Apply recommended config repairs now?",
       initialValue: true,
     });
-    if (shouldApply) {
-      return {
-        cfg: params.candidate,
-        shouldWriteConfig: true,
-        allowConfigSizeDropOnWrite: requestedSizeDropOptIn,
-      };
-    }
-    if (params.fixHints.length > 0) {
+    if (shouldWriteConfig) {
+      cfg = params.candidate;
+    } else if (params.fixHints.length > 0) {
       params.note(params.fixHints.join("\n"), "Doctor");
     }
-    return {
-      cfg: params.cfg,
-      shouldWriteConfig: false,
-      allowConfigSizeDropOnWrite: false,
-    };
   }
-
-  if (params.shouldRepair && params.pendingChanges) {
-    return {
-      cfg: params.cfg,
-      shouldWriteConfig: true,
-      allowConfigSizeDropOnWrite: requestedSizeDropOptIn,
-    };
-  }
-
   return {
-    cfg: params.cfg,
-    shouldWriteConfig: false,
-    allowConfigSizeDropOnWrite: false,
+    cfg,
+    shouldWriteConfig,
+    allowConfigSizeDropOnWrite: shouldWriteConfig && params.allowConfigSizeDropOnWrite === true,
+    confirmedConfigSource,
   };
 }

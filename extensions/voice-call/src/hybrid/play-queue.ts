@@ -11,6 +11,7 @@
  * issue a Call Update to switch back to ConversationRelay.
  */
 
+import crypto from "node:crypto";
 import {
   buildPauseThenRedirectTwiml,
   buildPlayThenRedirectTwiml,
@@ -27,15 +28,18 @@ export type HybridPlayQueueEntry = {
   callId?: string;
   /** Bumped on barge-in to invalidate in-flight redirects. */
   generation: number;
+  callbackToken: string;
+  callbackStep: number;
+  isCurrent?: () => boolean;
 };
 
 export type CallUpdateApi = {
   /** POST `<Twiml>` to `/Calls/{sid}.json`. */
-  updateCallTwiml(callSid: string, twiml: string): Promise<void>;
+  updateCallTwiml(callSid: string, twiml: string, isCurrent?: () => boolean): Promise<void>;
   /** Build the public redirect URL for the next-sentence callback. */
   getPlayNextUrl(callSid: string, callId?: string): string | null;
   /** Resolve current ConversationRelay options (wsUrl + voice/etc). */
-  getConversationRelayOptions(): ConversationRelayOptions | null;
+  getConversationRelayOptions(callSid: string): ConversationRelayOptions | null;
 };
 
 export class HybridPlayQueue {
@@ -44,16 +48,38 @@ export class HybridPlayQueue {
 
   constructor(private readonly api: CallUpdateApi) {}
 
+  private redirectUrl(callSid: string, q: HybridPlayQueueEntry): string | null {
+    const base = this.api.getPlayNextUrl(callSid, q.callId);
+    if (!base) {
+      return null;
+    }
+    const url = new URL(base);
+    url.searchParams.set("playToken", q.callbackToken);
+    url.searchParams.set("playStep", String(++q.callbackStep));
+    return url.toString();
+  }
+
   /** Whether a queue exists for this call (even if empty/aborted). */
   has(callSid: string): boolean {
     return this.queues.has(callSid);
   }
 
   /** Queue a sentence's public audio URL. */
-  enqueue(callSid: string, publicUrl: string, callId?: string): void {
+  enqueue(callSid: string, publicUrl: string, callId?: string, isCurrent?: () => boolean): void {
     let q = this.queues.get(callSid);
     if (!q) {
-      q = { urls: [], drained: 0, done: false, endCall: false, callId, generation: 0 };
+      q = {
+        urls: [],
+        drained: 0,
+        done: false,
+        endCall: false,
+        callId,
+        generation: 0,
+        callbackToken: crypto.randomUUID(),
+        callbackStep: 0,
+        isCurrent,
+      };
+      this.interrupted.delete(callSid);
       this.queues.set(callSid, q);
     }
     q.urls.push(publicUrl);
@@ -99,9 +125,10 @@ export class HybridPlayQueue {
     if (!q || q.drained >= q.urls.length) {
       return;
     }
-    const url = q.urls[q.drained];
+    const url = q.urls[q.drained]!;
 
-    const redirectUrl = this.api.getPlayNextUrl(callSid, q.callId);
+    q.drained++;
+    const redirectUrl = this.redirectUrl(callSid, q);
     if (!redirectUrl) {
       this.clear(callSid);
       throw new Error(`No hybrid play-next URL available for ${callSid}`);
@@ -110,10 +137,16 @@ export class HybridPlayQueue {
     const twiml = buildPlayThenRedirectTwiml(url, redirectUrl);
     console.log(`[voice-call][hybrid] Playing first sentence via Call Update for ${callSid}`);
     try {
-      await this.api.updateCallTwiml(callSid, twiml);
-      q.drained++;
+      await this.api.updateCallTwiml(
+        callSid,
+        twiml,
+        () => this.queues.get(callSid) === q && (!q.isCurrent || q.isCurrent()),
+      );
+      // The redirect index is committed before the update awaits its response.
     } catch (err) {
-      this.clear(callSid);
+      if (this.queues.get(callSid) === q) {
+        this.clear(callSid);
+      }
       console.error(
         `[voice-call][hybrid] Call Update for first play failed for ${callSid}:`,
         err instanceof Error ? err.message : err,
@@ -138,17 +171,20 @@ export class HybridPlayQueue {
 
     this.interrupted.add(callSid);
     q.generation++;
-    q.urls = [];
-    q.drained = 0;
+    this.queues.delete(callSid);
 
-    const cr = this.api.getConversationRelayOptions();
+    const cr = this.api.getConversationRelayOptions(callSid);
     if (!cr) {
       console.warn(`[voice-call][hybrid] No CR options available to abort ${callSid}`);
       return;
     }
 
     try {
-      await this.api.updateCallTwiml(callSid, buildResumeRelayTwiml(cr));
+      await this.api.updateCallTwiml(
+        callSid,
+        buildResumeRelayTwiml(cr),
+        () => !this.queues.has(callSid),
+      );
       console.log(
         `[voice-call][hybrid] Switched from PLAYING to RELAY for ${callSid} due to interrupt`,
       );
@@ -164,14 +200,29 @@ export class HybridPlayQueue {
    * Handle the playAction redirect callback.  Returns TwiML for the next
    * sentence, resumes ConversationRelay when done, or hangs up if endCall.
    */
-  handlePlayNextAction(callSid: string, callId?: string): string {
+  handlePlayNextAction(callSid: string, callId?: string, token?: string, step?: number): string {
     const q = this.queues.get(callSid);
-    const cr = this.api.getConversationRelayOptions();
+    const resume = () => {
+      const cr = this.api.getConversationRelayOptions(callSid);
+      return cr ? buildResumeRelayTwiml(cr) : HYBRID_HANGUP_TWIML;
+    };
 
     console.log(
       `[voice-call][hybrid] handlePlayNextAction callSid=${callSid} ` +
         `queueLen=${q?.urls.length ?? "none"} drained=${q?.drained ?? "N/A"} done=${q?.done ?? "N/A"} generation=${q?.generation ?? "N/A"}`,
     );
+
+    if (
+      token !== undefined &&
+      (!q ||
+        q.callbackToken !== token ||
+        q.callbackStep !== step ||
+        (callId && q.callId !== callId))
+    ) {
+      // Twilio can POST an obsolete Redirect after Call Update replaced its TwiML.
+      // Its discarded response must not rotate the current relay admission.
+      return '<?xml version="1.0" encoding="UTF-8"?><Response/>';
+    }
 
     // Stale redirect after barge-in → resume CR
     if (q && this.interrupted.has(callSid)) {
@@ -179,16 +230,16 @@ export class HybridPlayQueue {
         `[voice-call][hybrid] Ignoring stale Redirect for interrupted call ${callSid}, resuming CR`,
       );
       this.clear(callSid);
-      return cr ? buildResumeRelayTwiml(cr) : HYBRID_HANGUP_TWIML;
+      return resume();
     }
 
     // More sentences queued → play next
     if (q && q.drained < q.urls.length) {
-      const url = q.urls[q.drained];
+      const url = q.urls[q.drained]!;
       q.drained++;
-      const redirectUrl = this.api.getPlayNextUrl(callSid, callId ?? q.callId);
+      const redirectUrl = this.redirectUrl(callSid, q);
       if (!redirectUrl) {
-        return cr ? buildResumeRelayTwiml(cr) : HYBRID_HANGUP_TWIML;
+        return resume();
       }
       return buildPlayThenRedirectTwiml(url, redirectUrl);
     }
@@ -203,18 +254,18 @@ export class HybridPlayQueue {
     if (q?.done) {
       this.clear(callSid);
       console.log(`[voice-call][hybrid] All sentences played, resuming CR for ${callSid}`);
-      return cr ? buildResumeRelayTwiml(cr) : HYBRID_HANGUP_TWIML;
+      return resume();
     }
 
     // No queue at all → resume relay
     if (!q) {
-      return cr ? buildResumeRelayTwiml(cr) : HYBRID_HANGUP_TWIML;
+      return resume();
     }
 
     // Queue not yet marked done — LLM still generating.  Pause then redirect.
-    const redirectUrl = this.api.getPlayNextUrl(callSid, callId ?? q?.callId);
+    const redirectUrl = this.redirectUrl(callSid, q);
     if (!redirectUrl) {
-      return cr ? buildResumeRelayTwiml(cr) : HYBRID_HANGUP_TWIML;
+      return resume();
     }
     return buildPauseThenRedirectTwiml(redirectUrl, 1);
   }

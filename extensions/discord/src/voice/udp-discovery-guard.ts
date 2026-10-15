@@ -1,37 +1,26 @@
-// Discord plugin module filters the @discordjs/voice UDP discovery race.
-// Upstream UDPDiscovery.performIPDiscovery() can reject its Promise with this exact
-// message in a microtask window where the consumer's .then() has not been attached.
-// Node 15+ treats such rejections as unhandled and terminates the process, which
-// drops in-progress Twilio calls. Anything else is re-raised to preserve the
-// default unhandledRejection behavior (process exit) for unrelated failures.
-const BENIGN_REJECTION_MESSAGE = "Cannot perform IP discovery - socket closed";
+// The SDK may reject IP discovery after its UDP socket closes during reconnect.
+const CLOSED_DISCOVERY_MESSAGE = "Cannot perform IP discovery - socket closed";
 
-export type UdpDiscoveryRejectionVerdict = "suppress" | "exit";
+type RejectionListener = (reason: unknown, promise: Promise<unknown>) => void;
+type RejectionEvents = {
+  on(event: "unhandledRejection", listener: RejectionListener): unknown;
+  off(event: "unhandledRejection", listener: RejectionListener): unknown;
+};
 
-export function judgeUdpDiscoveryRejection(reason: unknown): UdpDiscoveryRejectionVerdict {
-  if (reason instanceof Error && reason.message === BENIGN_REJECTION_MESSAGE) {
-    return "suppress";
-  }
-  return "exit";
-}
-
-let installed = false;
-
-export function installUdpDiscoveryGuard(): void {
-  if (installed) {
-    return;
-  }
-  installed = true;
-  process.on("unhandledRejection", (reason) => {
-    if (judgeUdpDiscoveryRejection(reason) === "suppress") {
-      console.warn(
-        "[discord-voice] suppressed benign UDP discovery rejection:",
-        reason instanceof Error ? reason.message : reason,
-      );
+/** Keep the known reconnect race inside its audio worker's lifetime. */
+export function installUdpDiscoveryGuard(
+  onFailure: (reason: unknown) => void,
+  warn: (message: string) => void,
+  events: RejectionEvents = process,
+): () => void {
+  const listener: RejectionListener = (reason) => {
+    if (reason instanceof Error && reason.message === CLOSED_DISCOVERY_MESSAGE) {
+      warn("[discord-voice] suppressed UDP discovery rejection after socket close");
       return;
     }
-    // Replicate Node's default unhandledRejection behavior (terminate) for unrelated failures.
-    console.error("[unhandledRejection]", reason);
-    process.exit(1);
-  });
+    // Unrelated failures still flow through the worker's error/stop owner.
+    onFailure(reason);
+  };
+  events.on("unhandledRejection", listener);
+  return () => events.off("unhandledRejection", listener);
 }

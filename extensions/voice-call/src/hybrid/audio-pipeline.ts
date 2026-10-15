@@ -17,8 +17,8 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { OpenClawConfig as CoreConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { VoiceCallConfig } from "../config.js";
-import type { CoreConfig } from "../core-bridge.js";
 
 /** Resolve the directory where hybrid mode writes generated mp3 files. */
 export function resolveVoiceMessagesDir(): string {
@@ -86,7 +86,7 @@ async function synthesizeWithSag(text: string, outputPath: string): Promise<bool
 
     let stderr = "";
     proc.stderr.on("data", (chunk) => {
-      stderr += String(chunk ?? "");
+      stderr = (stderr + String(chunk ?? "")).slice(-8192);
     });
 
     const timer = setTimeout(
@@ -131,7 +131,7 @@ export async function generateHybridAudioFile(params: {
     const outputDir = resolveVoiceMessagesDir();
     mkdirSync(outputDir, { recursive: true });
 
-    const callTag = params.callId ? `voice_${params.callId.replace(/-/g, "")}` : "call";
+    const callTag = params.callId ? `voice_${params.callId.replace(/[^a-zA-Z0-9]/g, "")}` : "call";
     const fileName = `${callTag}_${Date.now()}_${crypto.randomUUID().slice(0, 8)}.mp3`;
     const destPath = path.join(outputDir, fileName);
 
@@ -187,12 +187,19 @@ export async function generateHybridAudioUrl(params: {
   voiceConfig: VoiceCallConfig;
   coreConfig: CoreConfig;
   callId?: string;
+  isCurrent?: () => boolean;
 }): Promise<string | undefined> {
   const localPath = await generateHybridAudioFile(params);
   if (!localPath) {
     return undefined;
   }
-  return localPathToPublicUrl(localPath, params.voiceConfig);
+  const publicUrl = localPathToPublicUrl(localPath, params.voiceConfig);
+  if (!publicUrl || (params.isCurrent && !params.isCurrent())) {
+    // Release only this synthesis result; a superseding turn may own other call audio.
+    await fsp.unlink(localPath).catch(() => {});
+    return undefined;
+  }
+  return publicUrl;
 }
 
 /**
@@ -203,40 +210,45 @@ export async function generateHybridAudioUrl(params: {
 export async function deleteCallAudioFiles(
   callId: string,
   extraUrls: string[] = [],
+  directory = resolveVoiceMessagesDir(),
 ): Promise<void> {
-  const dir = resolveVoiceMessagesDir();
-  const tag = `voice_${callId.replace(/-/g, "")}`;
-  const deleted: string[] = [];
-
+  const tag = "voice_" + callId.replace(/[^a-zA-Z0-9]/g, "") + "_";
+  const names = new Set<string>();
+  const failures: unknown[] = [];
   try {
-    const files = await fsp.readdir(dir);
-    await Promise.all(
-      files
-        .filter((f) => f.startsWith(tag) && f.endsWith(".mp3"))
-        .map((f) => {
-          deleted.push(f);
-          return fsp.unlink(path.join(dir, f)).catch(() => {});
-        }),
-    );
-  } catch {
-    // Directory missing or unreadable — nothing to do.
-  }
-
-  await Promise.all(
-    extraUrls.map(async (urlOrPath) => {
-      const fileName = decodeURIComponent(urlOrPath.split("/").pop() ?? "");
-      if (!fileName) {
-        return;
+    for (const name of await fsp.readdir(directory)) {
+      if (name.startsWith(tag) && name.endsWith(".mp3")) {
+        names.add(name);
       }
-      const fp = path.join(dir, fileName);
-      deleted.push(fileName);
-      await fsp.unlink(fp).catch(() => {});
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      failures.push(error);
+    }
+  }
+  for (const urlOrPath of extraUrls) {
+    try {
+      const name = decodeURIComponent(urlOrPath.split("/").pop() ?? "");
+      if (name && path.basename(name) === name && name.startsWith(tag) && name.endsWith(".mp3")) {
+        names.add(name);
+      }
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  // Every owned file gets an attempt; one permission/I/O failure cannot skip siblings.
+  await Promise.all(
+    [...names].map(async (name) => {
+      try {
+        await fsp.unlink(path.join(directory, name));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          failures.push(error);
+        }
+      }
     }),
   );
-
-  if (deleted.length > 0) {
-    console.log(
-      `[voice-call][hybrid] Cleaned up ${deleted.length} audio file(s) for call ${callId}`,
-    );
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Call audio cleanup remains pending for " + callId);
   }
 }

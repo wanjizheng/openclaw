@@ -1,44 +1,42 @@
-// Discord tests cover the @discordjs/voice UDP discovery rejection filter.
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { judgeUdpDiscoveryRejection } from "./udp-discovery-guard.js";
+import { EventEmitter } from "node:events";
+import { describe, expect, it, vi } from "vitest";
+import { installUdpDiscoveryGuard } from "./udp-discovery-guard.js";
 
-describe("judgeUdpDiscoveryRejection", () => {
-  let warnSpy: ReturnType<typeof vi.spyOn>;
-  let errorSpy: ReturnType<typeof vi.spyOn>;
-
-  beforeEach(() => {
-    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+describe("audio worker UDP discovery guard", () => {
+  it("suppresses only the known reconnect rejection and forwards other failures", () => {
+    const events = new EventEmitter();
+    const fail = vi.fn();
+    const warn = vi.fn();
+    const dispose = installUdpDiscoveryGuard(fail, warn, events);
+    const promise = Promise.resolve();
+    events.emit(
+      "unhandledRejection",
+      new Error("Cannot perform IP discovery - socket closed"),
+      promise,
+    );
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(fail).not.toHaveBeenCalled();
+    for (const reason of [
+      new Error("prefix Cannot perform IP discovery - socket closed"),
+      "Cannot perform IP discovery - socket closed",
+      new Error("other failure"),
+      undefined,
+    ]) {
+      events.emit("unhandledRejection", reason, promise);
+      expect(fail).toHaveBeenLastCalledWith(reason);
+    }
+    expect(fail).toHaveBeenCalledTimes(4);
+    dispose();
+    expect(events.listenerCount("unhandledRejection")).toBe(0);
   });
 
-  afterEach(() => {
-    warnSpy.mockRestore();
-    errorSpy.mockRestore();
-  });
-
-  it("suppresses the benign UDP discovery race message", () => {
-    const err = new Error("Cannot perform IP discovery - socket closed");
-    expect(judgeUdpDiscoveryRejection(err)).toBe("suppress");
-  });
-
-  it("does not suppress a different Error message", () => {
-    const err = new Error("Cannot perform IP discovery - some other cause");
-    expect(judgeUdpDiscoveryRejection(err)).toBe("exit");
-  });
-
-  it("does not suppress a string with the same substring but a different error", () => {
-    // Defensive: only exact message match should suppress.
-    const err = new Error("prefix: Cannot perform IP discovery - socket closed suffix");
-    expect(judgeUdpDiscoveryRejection(err)).toBe("exit");
-  });
-
-  it("exits on unrelated Error rejections", () => {
-    expect(judgeUdpDiscoveryRejection(new Error("something else broke"))).toBe("exit");
-  });
-
-  it("exits on non-Error rejections", () => {
-    expect(judgeUdpDiscoveryRejection("string rejection")).toBe("exit");
-    expect(judgeUdpDiscoveryRejection(undefined)).toBe("exit");
-    expect(judgeUdpDiscoveryRejection({ code: "ECONNRESET" })).toBe("exit");
+  it("releases only its own listener when the audio worker stops", () => {
+    const events = new EventEmitter();
+    const sibling = vi.fn();
+    events.on("unhandledRejection", sibling);
+    const dispose = installUdpDiscoveryGuard(vi.fn(), vi.fn(), events);
+    dispose();
+    dispose();
+    expect(events.listeners("unhandledRejection")).toEqual([sibling]);
   });
 });

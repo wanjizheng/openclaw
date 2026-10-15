@@ -6,7 +6,7 @@
  *   # 联系人列表
  *
  *   ## 基正
- *   - 电话: +447393866686
+ *   - 电话: +15550000001
  *   - 邮箱: someone@example.com
  *   - 问候语: 宝贝～是{name}来啦！岚岚好想你～
  *
@@ -15,7 +15,7 @@
  *   ---
  *
  *   ## 朋友
- *   - 电话: +447544852225
+ *   - 电话: +15550000002
  *
  * Each `## Name` section becomes one contact.  The optional `- 电话:`,
  * `- 邮箱:`, and `- 问候语:` bullet lines are parsed as structured metadata.
@@ -148,16 +148,26 @@ export function loadContactsFileSync(filePath = DEFAULT_CONTACTS_PATH): ParsedCo
 }
 
 /**
- * Asynchronously load contacts from CONTACT_LIST.md.
- * Returns an empty array if the file is missing or unreadable.
+ * Load the effective agent's contacts, retaining the legacy file only when its
+ * workspace file is absent. Empty or unreadable workspace files remain isolated.
+ * Explicit file paths retain their original behavior.
  */
 export async function loadContactsFileAsync(
-  filePath = DEFAULT_CONTACTS_PATH,
+  source: string | { workspaceDir: string } = DEFAULT_CONTACTS_PATH,
 ): Promise<ParsedContact[]> {
+  const filePath =
+    typeof source === "string" ? source : path.join(source.workspaceDir, "CONTACT_LIST.md");
   try {
     const content = await fsp.readFile(filePath, "utf-8");
     return parseContactsFile(content);
-  } catch {
+  } catch (error) {
+    if (
+      typeof source !== "string" &&
+      filePath !== DEFAULT_CONTACTS_PATH &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return loadContactsFileAsync(DEFAULT_CONTACTS_PATH);
+    }
     return [];
   }
 }

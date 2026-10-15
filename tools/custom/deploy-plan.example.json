@@ -1,0 +1,27 @@
+{
+  "prefix": "/absolute/npm-prefix",
+  "stateDir": "/absolute/private/openclaw-state",
+  "configPath": "/absolute/private/openclaw-state/openclaw.json",
+  "nodeExecutable": "/absolute/node",
+  "services": [
+    "openclaw-gateway.service",
+    "openclaw-node.service"
+  ],
+  "systemdPaths": [
+    "/absolute/private/systemd/openclaw-gateway.service",
+    "/absolute/private/systemd/openclaw-node.service",
+    "/absolute/private/systemd/openclaw-gateway.service.d",
+    "/absolute/private/systemd/openclaw-node.service.d"
+  ],
+  "binPaths": [
+    "/absolute/npm-prefix/bin/openclaw"
+  ],
+  "externalPaths": [
+    "/absolute/workspace-outside-state",
+    "/absolute/included-config-outside-state"
+  ],
+  "externalPathsReviewed": false,
+  "readinessTimeoutSeconds": 600,
+  "npmExecutable": "/absolute/npm11/bin/npm",
+  "pluginProjectsDir": "/absolute/private/openclaw-state/npm/projects"
+}
