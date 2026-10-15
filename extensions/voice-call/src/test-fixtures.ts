@@ -33,6 +33,8 @@ export function createVoiceCallBaseConfig(params?: {
       trustedProxyIPs: [],
     },
     streaming: {
+      hybridMode: false,
+      crPath: "/voice/cr",
       enabled: false,
       providers: {
         openai: {

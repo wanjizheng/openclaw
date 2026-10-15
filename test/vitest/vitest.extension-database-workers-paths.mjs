@@ -412,6 +412,7 @@ export const databaseWorkerExtensionTestFiles = [
   "extensions/telegram/src/update-offset-store.test.ts",
   "extensions/visitor-access/index.test.ts",
   "extensions/voice-call/doctor-contract-api.test.ts",
+  "extensions/voice-call/src/call-cleanup.test.ts",
   "extensions/voice-call/src/manager.async-store.test.ts",
   "extensions/voice-call/src/manager.closed-loop.test.ts",
   "extensions/voice-call/src/manager.inbound-allowlist.test.ts",

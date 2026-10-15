@@ -1068,6 +1068,48 @@ describe("config io write", () => {
     await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(malformedRaw);
   });
 
+  itWithHome("bounds migration size-drop authority to its exact paths", async (home) => {
+    const original = {
+      gateway: { mode: "local" as const },
+      channels: {
+        telegram: {
+          enabled: true,
+          allowFrom: Array.from({ length: 80 }, (_, i) => `telegram:${i}`),
+        },
+      },
+      tools: { allow: ["exec", "read", "write"] },
+    };
+    await writeConfigFixture(home, original);
+    const configPath = configPathForHome(home);
+    const originalRaw = await fs.readFile(configPath, "utf-8");
+    const io = createHomeConfigIO(home, { env: { VITEST: "true" } as NodeJS.ProcessEnv });
+    const candidate = { gateway: original.gateway, tools: original.tools };
+    await expectConfigWriteRejected(
+      io.writeConfigFile(candidate, {
+        allowConfigSizeDrop: true,
+        authorizedDestructivePaths: [["channels", "telegram"]],
+      }),
+    );
+    await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(originalRaw);
+    await expectConfigWriteRejected(
+      io.writeConfigFile(
+        { gateway: original.gateway },
+        {
+          allowConfigSizeDrop: true,
+          authorizedDestructivePaths: [["channels"]],
+        },
+      ),
+    );
+    await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(originalRaw);
+    await io.writeConfigFile(candidate, {
+      allowConfigSizeDrop: true,
+      authorizedDestructivePaths: [["channels"]],
+    });
+    const persisted = JSON.parse(await fs.readFile(configPath, "utf-8"));
+    expect(persisted.channels).toBeUndefined();
+    expect(persisted.tools).toEqual(original.tools);
+  });
+
   itWithHome(
     "allows intentional size-drop writes without disabling gateway-mode protection",
     async (home) => {

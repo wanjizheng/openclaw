@@ -12,6 +12,15 @@ import { configureRuntimeActionDecisionSink } from "../../audit/runtime-action-d
 import { setReplyPayloadMetadata } from "../../auto-reply/reply-payload.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import {
+  claimAgentRunDelegatedAuthority,
+  releaseAgentRunDelegatedAuthority,
+} from "../../infra/agent-run-registry.js";
+import {
+  bindAgentRunTerminalWriteContext,
+  captureAgentRunTerminalWriteContext,
+  clearAgentRunTerminalWriteContext,
+} from "../../infra/agent-run-terminal-writes.js";
+import {
   assertMemoryAudienceCurrent,
   assertMemoryAudienceSession,
   resolveMemoryAudienceFromEntry,
@@ -158,6 +167,85 @@ describe("plugin embedded-agent runtime admission", () => {
     ).rejects.toThrow("core failed");
     expect(mocks.close).toHaveBeenCalledOnce();
   });
+
+  it.each(["completed", "timed-out", "threw", "external-abort", "fallback"] as const)(
+    "settles accepted terminal persistence with exact authority when core %s",
+    async (outcome) => {
+      vi.useFakeTimers();
+      const authority = claimAgentRunDelegatedAuthority({
+        instanceId: `terminal-instance:${outcome}`,
+        runId: params.runId,
+      });
+      const controller = new AbortController();
+      const releaseWrite = createDeferred();
+      let persistence: Promise<void> | undefined;
+      const committed: string[] = [];
+      mocks.prepareAgentRunAdmission.mockReturnValueOnce({
+        operationalRunInstance: authority.operationalRunInstance,
+        admit: vi.fn(),
+        close: () => {
+          mocks.close();
+          releaseAgentRunDelegatedAuthority(authority);
+        },
+      });
+      const coreFailure = new Error("core failed after publishing terminal lifecycle");
+      const result = {
+        payloads: [],
+        ...(outcome === "timed-out" ? { meta: { aborted: true } } : {}),
+      };
+      mocks.runEmbeddedAgentCore.mockImplementationOnce(async () => {
+        // The Gateway accepts a terminal write before its asynchronous writer can commit.
+        if (outcome === "fallback") {
+          bindAgentRunTerminalWriteContext(authority, { run: (write) => write() });
+        }
+        const captured = captureAgentRunTerminalWriteContext(params.runId);
+        if (!captured) {
+          throw new Error("Expected the exact live terminal writer");
+        }
+        persistence = releaseWrite.promise.then(() => {
+          captured.assertCurrent();
+          committed.push(outcome);
+        });
+        captured.track(persistence);
+        void persistence.catch(() => {});
+        if (outcome === "external-abort") {
+          controller.abort(new Error("caller cancelled"));
+        } else if (outcome === "fallback") {
+          clearAgentRunTerminalWriteContext(authority.operationalRunInstance);
+        }
+        setTimeout(() => releaseWrite.resolve(), 1);
+        if (outcome === "threw") {
+          throw coreFailure;
+        }
+        return result;
+      });
+      const run = withPluginRuntimePluginScope({ pluginId: "terminal-plugin" }, () =>
+        runPluginEmbeddedAgent({ ...params, abortSignal: controller.signal }),
+      );
+      void run.catch(() => {});
+      try {
+        await vi.advanceTimersByTimeAsync(1);
+        if (outcome === "external-abort" || outcome === "fallback") {
+          await expect(persistence).rejects.toThrow("Terminal write owner changed before commit");
+          expect(committed).toEqual([]);
+        } else {
+          await expect(persistence).resolves.toBeUndefined();
+          expect(committed).toEqual([outcome]);
+        }
+        if (outcome === "threw") {
+          await expect(run).rejects.toBe(coreFailure);
+        } else {
+          await expect(run).resolves.toEqual(result);
+        }
+        expect(mocks.close).toHaveBeenCalledOnce();
+      } finally {
+        releaseWrite.resolve();
+        await Promise.allSettled([run, persistence]);
+        releaseAgentRunDelegatedAuthority(authority);
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("rejects a forged inherited memory audience before admitting the child run", async () => {
     await expect(

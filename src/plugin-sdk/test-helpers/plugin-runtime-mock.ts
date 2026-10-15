@@ -520,6 +520,14 @@ export function createPluginRuntimeMock(overrides: PluginRuntimeMockOverrides = 
       resolveAgentIdentity: vi.fn<PluginRuntime["agent"]["resolveAgentIdentity"]>(() => ({
         name: "test-agent",
       })),
+      resolveAgentDisplayIdentity: vi.fn<PluginRuntime["agent"]["resolveAgentDisplayIdentity"]>(
+        async ({ agentId }) => ({
+          agentId: agentId ?? "main",
+          name: "test-agent",
+          avatar: "T",
+          nameSource: "agent",
+        }),
+      ),
       resolveSessionCatalogCreateTarget: vi.fn<
         PluginRuntime["agent"]["resolveSessionCatalogCreateTarget"]
       >(resolveAgentCatalogCreateTarget),

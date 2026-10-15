@@ -16,6 +16,7 @@ import {
   speakInitialMessage as speakInitialMessageWithContext,
   type SpeakOptions,
 } from "./manager/outbound.js";
+import { copyCallRecord } from "./manager/state.js";
 import {
   findCallInStore,
   getCallHistoryFromStore,
@@ -44,7 +45,7 @@ function markRestoredCallSkipped(call: CallRecord, endReason: "completed" | "tim
   call.state = endReason;
 }
 
-function resolveDefaultStoreBase(config: VoiceCallConfig, storePath?: string): string {
+export function resolveVoiceCallStoreBase(config: VoiceCallConfig, storePath?: string): string {
   const rawOverride = storePath?.trim() || config.store?.trim();
   if (rawOverride) {
     return resolveUserPath(rawOverride);
@@ -75,6 +76,16 @@ export class CallManager {
   private readonly notifyHangupTimers = new Map<CallId, NodeJS.Timeout>();
   private initialization: Promise<void> | null = null;
   private closing = false;
+  private onCallEnded?: (call: CallRecord) => void | Promise<void>;
+  private beforeCallFinalized?: (call: CallRecord) => Promise<void>;
+
+  setOnCallEnded(handler: (call: CallRecord) => void | Promise<void>): void {
+    this.onCallEnded = handler;
+  }
+
+  setBeforeCallFinalized(handler: (call: CallRecord) => Promise<void>): void {
+    this.beforeCallFinalized = handler;
+  }
   private stopPromise: Promise<void> | null = null;
 
   private trackCallWork = (work: Promise<unknown>): void => {
@@ -166,7 +177,7 @@ export class CallManager {
   ) {
     this.config = config;
     this.coreSession = coreSession;
-    this.storePath = resolveDefaultStoreBase(config, storePath);
+    this.storePath = resolveVoiceCallStoreBase(config, storePath);
     this.stateRuntime = stateRuntime;
   }
 
@@ -218,6 +229,7 @@ export class CallManager {
         const elapsed = Date.now() - maxDurationAnchor;
         const maxDurationMs = resolveVoiceCallSecondsTimerDelayMs(this.config.maxDurationSeconds);
         if (elapsed >= maxDurationMs) {
+          await this.finalizeRestoredCall(call, "timeout");
           verified.delete(callId);
           skippedAlreadyElapsedTimers += 1;
           continue;
@@ -267,6 +279,18 @@ export class CallManager {
    * Calls without providerCallId or older than maxDurationSeconds are skipped.
    * Transient provider errors keep the call (rely on timer fallback).
    */
+  private async finalizeRestoredCall(
+    call: CallRecord,
+    reason: "completed" | "timeout",
+  ): Promise<void> {
+    const next = copyCallRecord(call);
+    markRestoredCallSkipped(next, reason);
+    await this.beforeCallFinalized?.(copyCallRecord(next));
+    await persistCallRecord(this.storePath, next, this.stateRuntime);
+    Object.assign(call, next);
+    await this.onCallEnded?.(copyCallRecord(call));
+  }
+
   private async verifyRestoredCalls(
     provider: VoiceCallProvider,
     candidates: Map<CallId, CallRecord>,
@@ -302,13 +326,13 @@ export class CallManager {
         }
         if (!call.providerCallId) {
           skippedNoProviderCallId += 1;
+          await this.finalizeRestoredCall(call, "completed");
           continue;
         }
 
         if (now - call.startedAt > maxAgeMs) {
           skippedOlderThanMaxDuration += 1;
-          markRestoredCallSkipped(call, "timeout");
-          await persistCallRecord(this.storePath, call, this.stateRuntime);
+          await this.finalizeRestoredCall(call, "timeout");
           if (this.closing) {
             break;
           }
@@ -332,8 +356,7 @@ export class CallManager {
             if (result.isTerminal) {
               const status = normalizeOptionalString(result.status) ?? "terminal";
               skippedTerminalStatuses.set(status, (skippedTerminalStatuses.get(status) ?? 0) + 1);
-              markRestoredCallSkipped(call, "completed");
-              await persistCallRecord(this.storePath, call, this.stateRuntime);
+              await this.finalizeRestoredCall(call, "completed");
             } else if (result.isUnknown) {
               keptUnknownProviderStatus += 1;
               verified.set(callId, call);
@@ -458,6 +481,9 @@ export class CallManager {
       transcriptWaiters: this.transcriptWaiters,
       maxDurationTimers: this.maxDurationTimers,
       initialMessageInFlight: this.initialMessageInFlight,
+      beforeCallFinalized: (call) => this.beforeCallFinalized?.(call) ?? Promise.resolve(),
+      // Cleanup admission settles during shutdown; reports have separate generation checks.
+      onCallEnded: (call) => this.onCallEnded?.(call),
       onCallerSpeech: (call) => this.invalidateAutoResponse(call),
       onCallAnswered: (call) => {
         this.maybeSpeakInitialMessageOnAnswered(call);

@@ -1,5 +1,6 @@
 import type { DeferredPluginMigration } from "../infra/deferred-plugin-migrations.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
+import type { ConfigPath } from "./io.destructive-paths.js";
 import type { ConfigIoDeps, ConfigSnapshotReadMeasure } from "./io.read.types.js";
 import type { ConfigMutationBase } from "./mutation-types.js";
 import type {
@@ -77,6 +78,11 @@ export type ConfigWriteOptions = {
   allowDestructiveWrite?: boolean;
   /** Allow an intentional size drop while retaining other destructive guards. */
   allowConfigSizeDrop?: boolean;
+  /** Bound a size-drop opt-in to typed paths produced by its trusted migration.
+   * Ancestors cover descendants; leaf authorization never covers parent removal.
+   * Omitted lists retain intentional full-write compatibility.
+   */
+  authorizedDestructivePaths?: readonly ConfigPath[];
   /** Suppress human-readable overwrite and anomaly logs. */
   skipOutputLogs?: boolean;
   /** Runtime reload intent for committed-write observers. */

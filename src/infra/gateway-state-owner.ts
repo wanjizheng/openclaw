@@ -25,6 +25,7 @@ import {
   type LockPayload,
   parseGatewayLockPayload,
 } from "./gateway-lock-payload.js";
+import * as ownerDiagnostics from "./gateway-state-owner-diagnostics.js";
 import {
   ensureOwnerDirectory,
   removeCreatedProjectionDirectories,
@@ -102,7 +103,7 @@ export function createGatewayStateProjection(
 }
 
 type StateOwnerFile = Pick<GatewayStateProjection, "lockPath" | "verifyStillHeld" | "release">;
-type ProcessOwner = {
+type ProcessOwner = ownerDiagnostics.DiagnosticOwner & {
   kind: "process" | "schema";
   payload: LockPayload;
   projectionPath?: string;
@@ -111,8 +112,6 @@ type ProcessOwner = {
   heartbeat?: ReturnType<typeof startGatewayStateOwnerHeartbeat>;
   lost: AbortController;
   projectionDirectories: StateOwnerDirectoryIdentity[];
-  // Retained leases keep custody after this stops new admission.
-  accepting: boolean;
   verifiedAt?: number;
 };
 
@@ -162,6 +161,7 @@ function loseOwner(owner: ProcessOwner, error: Error) {
   if (owner.lost.signal.aborted) {
     return;
   }
+  ownerDiagnostics.capture(owner, error);
   owner.accepting = false;
   owner.verifiedAt = undefined;
   readOwnerPaths.clear();
@@ -720,10 +720,9 @@ export function assertStateDatabaseAccessAllowed(
   };
   const pathname = resolveGatewayStateOwnerPath(databasePath);
   const local = owners.get(pathname);
-  const unavailable = `OpenClaw state ownership at ${databasePath} could not be verified; retry after maintenance finishes.`;
   if (local) {
     if (!hasPhysicalOwnership(local)) {
-      throw new Error(unavailable);
+      throw ownerDiagnostics.unavailable(databasePath, local);
     }
     const role = local.payload.role ?? "gateway";
     if (!local.accepting || (role !== "gateway" && role !== "agent-embedded")) {

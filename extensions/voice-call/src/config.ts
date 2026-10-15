@@ -18,6 +18,7 @@ import { TtsConfigSchema } from "../api.js";
 import { normalizePhoneNumber } from "./allowlist.js";
 import { TWILIO_REGIONS } from "./providers/twilio-region.js";
 import { DEFAULT_VOICE_CALL_REALTIME_INSTRUCTIONS } from "./realtime-defaults.js";
+import { PostCallReportConfigSchema } from "./report-config.js";
 import { isTailscalePortAllowed, VoiceCallTailscaleConfigSchema } from "./tailscale-config.js";
 
 const E164Schema = z
@@ -264,6 +265,8 @@ const VoiceCallStreamingConfigSchema = z
     maxPendingConnectionsPerIp: z.number().int().positive().default(4),
     /** Hard cap for all open media stream sockets (pending + active). */
     maxConnections: z.number().int().positive().default(128),
+    hybridMode: z.boolean().default(false),
+    crPath: z.string().min(1).default("/voice/cr"),
   })
   .strict()
   .default({
@@ -274,6 +277,8 @@ const VoiceCallStreamingConfigSchema = z
     maxPendingConnections: 32,
     maxPendingConnectionsPerIp: 4,
     maxConnections: 128,
+    hybridMode: false,
+    crPath: "/voice/cr",
   });
 
 export const VoiceCallConfigSchema = z
@@ -352,6 +357,9 @@ export const VoiceCallConfigSchema = z
     /** Response/session owner. Required when multiple agents have no legacy owner. */
     agentId: z.string().min(1).optional(),
 
+    /** Optional explicit report delivery; absent means local Markdown only. */
+    postCallReport: PostCallReportConfigSchema.optional(),
+
     responseModel: z.string().optional(),
 
     responseSystemPrompt: z.string().optional(),
@@ -428,6 +436,12 @@ export function resolveVoiceCallStreamExposurePaths(
     if (
       !exposurePaths.some((path) => path.localPath === localPath && path.publicPath === localPath)
     ) {
+      exposurePaths.push({ localPath, publicPath: localPath });
+    }
+  }
+  if (config.streaming.hybridMode) {
+    const localPath = normalizeWebhookPath(config.streaming.crPath);
+    if (!exposurePaths.some((entry) => entry.localPath === localPath)) {
       exposurePaths.push({ localPath, publicPath: localPath });
     }
   }
@@ -564,6 +578,7 @@ export function normalizeVoiceCallConfig(config: VoiceCallConfigInput): VoiceCal
   return {
     ...defaults,
     ...config,
+    postCallReport: PostCallReportConfigSchema.optional().parse(config.postCallReport),
     allowFrom: config.allowFrom ?? defaults.allowFrom,
     numbers: sanitizeVoiceCallNumberRoutes(
       (config.numbers ?? defaults.numbers) as Record<string, unknown>,
@@ -778,6 +793,21 @@ export function validateProviderConfig(config: VoiceCallConfig): {
     requireCredential("authToken", config.plivo?.authToken, "PLIVO_AUTH_TOKEN");
   }
 
+  if (
+    config.streaming.hybridMode &&
+    (!config.streaming.enabled || config.provider !== "twilio" || config.realtime.enabled)
+  ) {
+    errors.push(
+      "Hybrid mode requires the Twilio provider with streaming.enabled=true and realtime.enabled=false",
+    );
+  }
+  if (
+    config.streaming.hybridMode &&
+    normalizeWebhookPath(config.streaming.crPath) ===
+      normalizeWebhookPath(config.streaming.streamPath)
+  ) {
+    errors.push("Hybrid ConversationRelay and media stream paths must be different");
+  }
   if (config.realtime.enabled && config.inboundPolicy === "disabled") {
     errors.push(
       'plugins.entries.voice-call.config.inboundPolicy must not be "disabled" when realtime.enabled is true',

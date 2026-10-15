@@ -1,6 +1,6 @@
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { VoiceCallConfigSchema } from "./config.js";
 import { CallManager } from "./manager.js";
 import {
@@ -36,6 +36,26 @@ async function initiateCall() {
 }
 
 describe("CallManager termination lifecycle", () => {
+  it("reports a persisted terminal call once after releasing its active identity", async () => {
+    const { manager } = await createManagerHarness();
+    const started = await manager.initiateCall("+15550000001");
+    const onEnded = vi.fn((call) => {
+      expect(manager.getCall(call.callId)).toBeUndefined();
+      expect(call.endedAt).toBeDefined();
+    });
+    manager.setOnCallEnded(onEnded);
+    await manager.endCall(started.callId);
+    expect(onEnded).toHaveBeenCalledTimes(1);
+    await manager.processEvent({
+      id: "late-terminal",
+      type: "call.ended",
+      callId: started.callId,
+      timestamp: Date.now(),
+      reason: "hangup-user",
+    });
+    expect(onEnded).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     { providerName: "twilio", restart: false },
     { providerName: "twilio", restart: true },

@@ -119,6 +119,15 @@
       "label": "Allow ngrok Free Tier (Loopback Bypass)",
       "advanced": true
     },
+    "streaming.hybridMode": {
+      "label": "Hybrid MP3 Playback",
+      "help": "Use Twilio ConversationRelay events, inbound streaming transcription and publicly hosted MP3 playback.",
+      "advanced": true
+    },
+    "streaming.crPath": {
+      "label": "ConversationRelay Path",
+      "advanced": true
+    },
     "streaming.enabled": {
       "label": "Enable Streaming",
       "help": "Classic streaming transcription currently requires the Twilio call provider.",
@@ -258,6 +267,14 @@
     "responseSystemPrompt": {
       "label": "Response System Prompt",
       "advanced": true
+    },
+    "postCallReport.discord.target": {
+      "label": "Post-call Discord Report Target",
+      "help": "Explicit user:<numeric-id> or channel:<numeric-id> (optional discord: prefix). Unset saves local Markdown only; sender allowlists never select report recipients."
+    },
+    "postCallReport.discord.accountId": {
+      "label": "Post-call Discord Account ID",
+      "help": "Optional configured Discord account to send reports with. Unset uses the Discord adapter default account."
     },
     "responseTimeoutMs": {
       "label": "Response Timeout (ms)",
@@ -589,6 +606,13 @@
           "maxConnections": {
             "type": "integer",
             "minimum": 1
+          },
+          "hybridMode": {
+            "type": "boolean"
+          },
+          "crPath": {
+            "type": "string",
+            "minLength": 1
           }
         }
       },
@@ -1021,6 +1045,24 @@
       },
       "responseSystemPrompt": {
         "type": "string"
+      },
+      "postCallReport": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "discord": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["target"],
+            "properties": {
+              "target": {
+                "type": "string",
+                "pattern": "^\\s*(?:discord:)?(?:user|channel):\\d+\\s*$"
+              },
+              "accountId": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
       },
       "responseTimeoutMs": {
         "type": "integer",

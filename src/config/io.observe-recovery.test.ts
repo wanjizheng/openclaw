@@ -677,6 +677,31 @@ describe("config observe recovery", () => {
     expect(observe?.restoredBackupPath).toBe(resolveLastKnownGoodConfigPath(configPath));
   });
 
+  it("rejects changed last-good bytes before validating or replacing the active config", async () => {
+    const { deps, configPath } = makeDeps(home);
+    const snapshot = await makeSnapshot(configPath, { gateway: { mode: "local" } });
+    expect(await promoteConfigSnapshotToLastKnownGoodCore({ deps, snapshot })).toBe(true);
+    const brokenRaw = "{ gateway: { mode: 123 } }\n";
+    await fsp.writeFile(configPath, brokenRaw, "utf-8");
+    await fsp.writeFile(
+      resolveLastKnownGoodConfigPath(configPath),
+      JSON.stringify({ gateway: { mode: "local", port: 19999 } }),
+      "utf-8",
+    );
+    const prepareCandidate = vi.fn(approveRecoveryCandidate);
+    expect(
+      await recoverConfigFromLastKnownGoodCore({
+        deps,
+        snapshot: invalidSnapshot(snapshot, brokenRaw),
+        reason: "tampered-last-good",
+        prepareCandidate,
+      }),
+    ).toBe(false);
+    expect(prepareCandidate).not.toHaveBeenCalled();
+    await expect(fsp.readFile(configPath, "utf-8")).resolves.toBe(brokenRaw);
+    await expect(listClobberFiles(configPath)).resolves.toHaveLength(0);
+  });
+
   it("leaves the active config untouched when its owner rejects last-known-good recovery", async () => {
     const { deps, configPath, warn } = makeDeps(home);
     const snapshot = await makeSnapshot(configPath, {

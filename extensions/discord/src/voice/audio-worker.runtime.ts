@@ -6,6 +6,7 @@ import {
   type DiscordAudioWorkerOptions,
 } from "./audio-worker-protocol.js";
 import { DiscordAudioWorker } from "./audio-worker.js";
+import { installUdpDiscoveryGuard } from "./udp-discovery-guard.js";
 
 const port = parentPort;
 if (!port) {
@@ -25,6 +26,7 @@ const fail = (error: unknown) => {
   } satisfies DiscordAudioEvent);
   void media.stop();
 };
+const removeDiscoveryGuard = installUdpDiscoveryGuard(fail, (message) => console.warn(message));
 port.on("message", (command: DiscordAudioCommand) => {
   try {
     media.receive(command);
@@ -33,6 +35,6 @@ port.on("message", (command: DiscordAudioCommand) => {
   }
 });
 port.on("close", () => {
-  void media.stop();
+  void media.stop().finally(removeDiscoveryGuard);
 });
 void media.connect().catch(fail);

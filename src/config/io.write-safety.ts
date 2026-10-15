@@ -562,14 +562,25 @@ export function resolveConfigWriteSuspiciousReasons(params: {
 
 export function resolveConfigWriteBlockingReasons(
   suspicious: string[],
-  options: Pick<ConfigWriteOptions, "allowConfigSizeDrop"> = {},
+  options: Pick<ConfigWriteOptions, "allowConfigSizeDrop" | "authorizedDestructivePaths"> = {},
+  unauthorizedDestructivePaths: readonly string[] = [],
 ): string[] {
-  return suspicious.filter(
+  const blocked = suspicious.filter(
     (reason) =>
       reason === "unreadable-config-before-write" ||
       (reason.startsWith("size-drop:") && options.allowConfigSizeDrop !== true) ||
       reason === "gateway-mode-removed",
   );
+  if (
+    options.allowConfigSizeDrop === true &&
+    options.authorizedDestructivePaths !== undefined &&
+    unauthorizedDestructivePaths.length > 0
+  ) {
+    blocked.push(
+      `unauthorized-destructive-paths:${unauthorizedDestructivePaths.length}:${unauthorizedDestructivePaths.slice(0, 5).join(",")}`,
+    );
+  }
+  return blocked;
 }
 
 export function formatConfigArtifactTimestamp(ts: string): string {

@@ -311,7 +311,9 @@ export async function runWriteConfigHealth(
               : {}),
             expectedConfigPath: path,
             auditOrigin: "doctor",
-            allowConfigSizeDrop: ctx.configResult.shouldWriteConfig === true || updateDoctorRun,
+            allowConfigSizeDrop: ctx.configResult.allowConfigSizeDropOnWrite === true,
+            // Missing authority must remain bounded even during update handoff.
+            authorizedDestructivePaths: ctx.configResult.authorizedDestructivePaths ?? [],
             skipPluginValidation:
               ctx.configResult.skipPluginValidationOnWrite === true || updateDoctorRun,
             ...(ctx.configResult.explicitSetPaths

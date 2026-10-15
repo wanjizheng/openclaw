@@ -35,6 +35,8 @@ import {
   type VoiceCallConfig,
 } from "./config.js";
 import { getHeader } from "./http-headers.js";
+import { HybridCrHandler } from "./hybrid/cr-handler.js";
+import { buildResumeRelayTwiml } from "./hybrid/twiml.js";
 import type { CallManager } from "./manager.js";
 import type { MediaStreamConfig } from "./media-stream.js";
 import { MediaStreamHandler } from "./media-stream.js";
@@ -189,6 +191,9 @@ export class VoiceCallWebhookServer {
     logger?: PluginLogger,
   ) {
     this.config = normalizeVoiceCallConfig(config);
+    if (provider.name === "twilio" && this.config.streaming.hybridMode) {
+      (provider as TwilioProvider).hybridCr.bind((sid) => manager.getCallByProviderCallId(sid));
+    }
     const rawLogger = logger ?? {
       info: console.log,
       warn: console.warn,
@@ -309,7 +314,13 @@ export class VoiceCallWebhookServer {
     const generation = Symbol("stream speech");
     this.streamSpeechGenerations.set(current.call, generation);
     this.manager.invalidateAutoResponse(current.call);
-    current.provider.clearTtsQueue(providerCallId);
+    if (current.provider.isHybridMode && current.provider.hasActiveHybridQueue(providerCallId)) {
+      void current.provider
+        .abortHybridPlay(providerCallId)
+        .catch((error: unknown) => this.logger.warn(`Hybrid interrupt failed: ${String(error)}`));
+    } else {
+      current.provider.clearTtsQueue(providerCallId);
+    }
     return generation;
   }
 
@@ -478,6 +489,20 @@ export class VoiceCallWebhookServer {
     this.logger.info("Media streaming initialized");
   }
 
+  private crHandler: HybridCrHandler | null = null;
+
+  private ensureCrHandler(): HybridCrHandler {
+    if (!this.crHandler) {
+      this.crHandler = new HybridCrHandler({
+        manager: this.manager,
+        scheduler: this.scheduler,
+        admission: (this.provider as TwilioProvider).hybridCr,
+        speakInitialMessage: (sid) => this.manager.speakInitialMessage(sid),
+      });
+    }
+    return this.crHandler;
+  }
+
   async start(): Promise<string> {
     if (this.stopPromise) {
       await this.stopPromise;
@@ -514,7 +539,40 @@ export class VoiceCallWebhookServer {
             return;
           }
           const path = this.getUpgradePathname(request);
-          if (path === streamPath && this.mediaStreamHandler) {
+          if (
+            this.config.streaming.hybridMode &&
+            this.provider.name === "twilio" &&
+            path === this.config.streaming.crPath
+          ) {
+            const origin = (this.provider as TwilioProvider).getPublicUrl();
+            if (
+              !origin ||
+              this.scheduler.signal.aborted ||
+              !this.provider.verifyWebhook({
+                headers: request.headers,
+                rawBody: "",
+                url: new URL(request.url ?? "/", origin).toString(),
+                method: "GET",
+                remoteAddress: request.socket.remoteAddress,
+              }).ok
+            ) {
+              rejectWebSocketUpgrade(socket, { status: 401 });
+              return;
+            }
+            const admission = (this.provider as TwilioProvider).hybridCr.claim(
+              new URL(request.url ?? "/", origin),
+            );
+            if (!admission) {
+              rejectWebSocketUpgrade(socket, { status: 401 });
+              return;
+            }
+            this.ensureCrHandler().handleUpgrade(request, socket, head, admission);
+            return;
+          }
+          if (
+            (path === streamPath || path?.startsWith(`${streamPath}/`)) &&
+            this.mediaStreamHandler
+          ) {
             this.mediaStreamHandler.handleUpgrade(request, socket, head);
           } else {
             // HTTP relinquishes upgraded sockets; own errors while the 404 flushes.
@@ -575,6 +633,11 @@ export class VoiceCallWebhookServer {
       });
     });
     this.startPromise = null;
+    this.crHandler?.close();
+    this.crHandler = null;
+    if (this.provider.name === "twilio" && this.config.streaming.hybridMode) {
+      (this.provider as TwilioProvider).hybridCr.invalidateAll();
+    }
     this.streamDisconnectGrace.close();
     const reaperStopped = this.stopStaleCallReaper?.();
     this.stopStaleCallReaper = null;
@@ -588,6 +651,8 @@ export class VoiceCallWebhookServer {
         this.realtimeHandler?.close(serverClosePromise) ?? Promise.resolve(),
       ]);
 
+      this.crHandler?.close();
+      this.crHandler = null;
       this.streamDisconnectGrace.close();
       if (this.server === server) {
         this.server = null;
@@ -742,6 +807,51 @@ export class VoiceCallWebhookServer {
       }
 
       const buildResponse = async (): Promise<WebhookResponsePayload> => {
+        if (
+          this.config.streaming.hybridMode &&
+          this.provider.name === "twilio" &&
+          ctx.query?.crAction
+        ) {
+          const sid = new URLSearchParams(ctx.rawBody).get("CallSid") ?? "";
+          const cr = !this.scheduler.signal.aborted
+            ? (this.provider as TwilioProvider).reconnectHybridRelay(new URL(ctx.url), sid)
+            : null;
+          return cr
+            ? {
+                statusCode: 200,
+                headers: { "Content-Type": "application/xml" },
+                body: buildResumeRelayTwiml(cr),
+              }
+            : { statusCode: 410, body: "Relay connection is no longer current" };
+        }
+        if (
+          this.config.streaming.hybridMode &&
+          this.provider.name === "twilio" &&
+          ctx.query?.playAction === "1"
+        ) {
+          const sid = new URLSearchParams(ctx.rawBody).get("CallSid") ?? "";
+          const call = this.manager.getCallByProviderCallId(sid);
+          if (
+            !call ||
+            call.callId !== ctx.query.callId ||
+            typeof ctx.query.playToken !== "string" ||
+            typeof ctx.query.playStep !== "string" ||
+            !/^\d+$/.test(ctx.query.playStep) ||
+            this.scheduler.signal.aborted
+          ) {
+            return { statusCode: 410, body: "Call or playback is no longer active" };
+          }
+          return {
+            statusCode: 200,
+            headers: { "Content-Type": "application/xml" },
+            body: (this.provider as TwilioProvider).handlePlayNextAction(
+              sid,
+              call.callId,
+              ctx.query.playToken,
+              Number(ctx.query.playStep),
+            ),
+          };
+        }
         const initialTwiML = this.provider.consumeInitialTwiML?.(ctx);
         if (initialTwiML !== undefined && initialTwiML !== null) {
           const params = new URLSearchParams(ctx.rawBody);
@@ -779,6 +889,12 @@ export class VoiceCallWebhookServer {
           verification.releaseReplay?.();
         }
 
+        if (this.config.streaming.hybridMode && this.provider.name === "twilio") {
+          // Inbound manager IDs are allocated while processing events. Issue only after exact admission.
+          parsed.providerResponseBody = (this.provider as TwilioProvider).generateTwimlResponse(
+            ctx,
+          );
+        }
         return normalizeWebhookResponse(parsed);
       };
 
@@ -790,6 +906,13 @@ export class VoiceCallWebhookServer {
         verification.verifiedRequestKey,
         buildResponse,
         verification.releaseReplay,
+        this.provider.name === "twilio" &&
+          this.config.streaming.hybridMode &&
+          !this.config.skipSignatureVerification &&
+          typeof ctx.query?.crAction === "string" &&
+          ctx.query.crAction.length > 0
+          ? "exact-cr-action"
+          : "token-free",
       );
     } finally {
       this.webhookInFlightLimiter.release(inFlightKey);
@@ -825,6 +948,7 @@ export class VoiceCallWebhookServer {
     key: string,
     buildResponse: () => Promise<WebhookResponsePayload>,
     releaseReplay?: () => void,
+    replayPolicy: "token-free" | "exact-cr-action" = "token-free",
   ): Promise<WebhookResponsePayload> {
     const now = Date.now();
     const expiresAt = resolveExpiresAtMsFromDurationMs(WEBHOOK_REPLAY_RESPONSE_TTL_MS, {
@@ -845,9 +969,12 @@ export class VoiceCallWebhookServer {
         releaseReplay?.();
         throw err;
       });
-    // Twilio owners receive the real one-time TwiML; waiters only see token-free XML.
+    // Only the authenticated CR action branch returns CR-only reconnect instructions.
+    // Retrying its lost HTTP response reuses the SAME grant, without minting or extending it.
+    // Initial/media TwiML remains token-free for replay waiters.
     const response = ownerResponse.then((payload) =>
-      this.provider.name === "twilio"
+      this.provider.name === "twilio" &&
+      !(replayPolicy === "exact-cr-action" && payload.statusCode === 200)
         ? buildTwilioReplayTwiML()
         : cloneWebhookResponsePayload(payload),
     );
@@ -1036,8 +1163,15 @@ export class VoiceCallWebhookServer {
         return false;
       }
       this.logger.info(`AI response queued ${callId} chars=${text.length}`);
-      const result = await this.manager.speak(callId, text, {
-        listenAfterPlayback: true,
+      const marker = /\[END_CALL\]/i.test(text);
+      const farewell =
+        /(拜拜|拜啦|掰掰|白白|再见|\bbye\b|goodbye|see\s*you|先这样|没事了|挂了|挂啦|挂了吧|mua)/i;
+      const endCall =
+        this.config.streaming.hybridMode &&
+        (marker || (farewell.test(userMessage) && farewell.test(text)));
+      const result = await this.manager.speak(callId, text.replace(/\[END_CALL\]/gi, "").trim(), {
+        ...(endCall ? { endCall: true } : {}),
+        listenAfterPlayback: !endCall,
         isCurrent: response.isCurrent,
       });
       return result.success;
@@ -1056,7 +1190,7 @@ export class VoiceCallWebhookServer {
         agentRuntime: this.agentRuntime,
         callId,
         sessionKey: call.sessionKey,
-        from: call.from,
+        from: call.direction === "inbound" ? call.from : call.to,
         senderIsOwner: call.direction === "inbound" ? false : undefined,
         agentId: resolveCallAgentId(call),
         transcript: call.transcript,

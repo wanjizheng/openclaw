@@ -20,6 +20,8 @@ import {
 import { truncateUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import type { OpenClawPluginApi } from "../api.js";
 import { resolveVoiceCallSessionKey, type VoiceCallConfig } from "./config.js";
+import { findContactByPhone, loadContactsFileAsync } from "./contact-file.js";
+import { stripLlmReasoningTags } from "./llm-tag-cleanup.js";
 import { resolveCallAgentId } from "./resolve-call-agent-id.js";
 import { resolveVoiceResponseModel } from "./response-model.js";
 
@@ -222,7 +224,11 @@ function extractSpokenTextFromPayloads(payloads: VoiceResponsePayload[]): string
       continue;
     }
 
-    const structured = tryParseSpokenJson(rawText);
+    const strippedText = stripLlmReasoningTags(rawText, { isFinal: true }).trim();
+    if (!strippedText) {
+      continue;
+    }
+    const structured = tryParseSpokenJson(strippedText);
     if (structured !== null) {
       if (structured.length > 0) {
         spokenSegments.push(structured);
@@ -230,7 +236,7 @@ function extractSpokenTextFromPayloads(payloads: VoiceResponsePayload[]): string
       continue;
     }
 
-    const plain = sanitizePlainSpokenText(rawText);
+    const plain = sanitizePlainSpokenText(strippedText);
     if (plain) {
       spokenSegments.push(plain);
     }
@@ -300,6 +306,9 @@ export async function generateVoiceResponse(
         const workspaceDir = agentRuntime.resolveAgentWorkspaceDir(cfg, agentId);
 
         await agentRuntime.ensureAgentWorkspace({ dir: workspaceDir });
+        const contact = await loadContactsFileAsync({ workspaceDir })
+          .then((contacts) => findContactByPhone(from, contacts))
+          .catch(() => undefined);
 
         const now = Date.now();
         const existingSessionEntry = agentRuntime.session.getSessionEntry({
@@ -368,15 +377,19 @@ export async function generateVoiceResponse(
 
         const thinkLevel = agentRuntime.resolveThinkingDefault({ cfg, provider, model });
 
-        const identity = agentRuntime.resolveAgentIdentity(cfg, agentId);
-        const agentName = identity?.name?.trim() || "assistant";
-
         // Keep trusted voice instructions in system context; audible history stays user-priority.
         const basePrompt =
           voiceConfig.responseSystemPrompt ??
-          `You are ${agentName}, a helpful voice assistant on a phone call. Keep responses brief and conversational (1-2 sentences max). Be natural and friendly. The caller's phone number is ${from}. You have access to tools - use them when helpful.`;
+          `You are ${
+            (await agentRuntime.resolveAgentDisplayIdentity({ cfg, agentId, workspaceDir })).name
+          }, a helpful voice assistant on a phone call. Keep responses brief and conversational (1-2 sentences max). Be natural and friendly. The caller's phone number is ${from}. You have access to tools - use them when helpful.`;
         const extraSystemPrompt = [
           basePrompt,
+          ...(contact
+            ? [
+                `Known caller: ${contact.name} (${from})${contact.info ? `\nCaller info:\n${contact.info}` : ""}`,
+              ]
+            : []),
           VOICE_OPENING_CONTEXT_POLICY,
           VOICE_SPOKEN_OUTPUT_CONTRACT,
         ].join("\n\n");

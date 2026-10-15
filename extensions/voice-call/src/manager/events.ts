@@ -37,6 +37,8 @@ type EventContext = Pick<
   | "maxDurationTimers"
   | "notifyHangupTimers"
   | "endCallOperations"
+  | "onCallEnded"
+  | "beforeCallFinalized"
   | "onCallAnswered"
   | "onCallerSpeech"
   | "streamSessionIssuer"

@@ -20,6 +20,7 @@ const CALL_RECORD_CHUNK_MAX_ENTRIES =
 const RAW_CALL_RECORD_CHUNK_BYTES = 47 * 1024;
 const CALL_RECORD_READ_BATCH_KEYS = 128;
 let callRecordEventSequence = 0;
+let lastCallRecordPersistedAt = 0;
 
 type CallRecordEventMeta = {
   chunkCount: number;
@@ -94,7 +95,11 @@ function buildChunkKey(eventKey: string, index: number): string {
 function nextCallRecordOrder(): { persistedAt: number; sequence: number } {
   const sequence = callRecordEventSequence;
   callRecordEventSequence = (callRecordEventSequence + 1) % 1_000_000;
-  return { persistedAt: Date.now(), sequence };
+  // An NTP/VM clock correction cannot reorder snapshots admitted by this writer.
+  // The existing sequence breaks ties while wall time advances across restarts.
+  const persistedAt = Math.max(Date.now(), lastCallRecordPersistedAt);
+  lastCallRecordPersistedAt = persistedAt;
+  return { persistedAt, sequence };
 }
 
 function parseEventKeySequence(key: string): number {
