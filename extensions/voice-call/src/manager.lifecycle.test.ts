@@ -272,8 +272,8 @@ ${fixture.contact === "no-greeting" ? "" : "- 问候语: Welcome {name}!"}
     const reads: string[] = [];
     const originalRead = fsp.readFile;
     const read = vi.spyOn(fsp, "readFile").mockImplementation(async (...args) => {
-      const file = String(args[0]);
-      if (file !== workspaceFile && file !== legacyFile) {
+      const file = args[0];
+      if (typeof file !== "string" || (file !== workspaceFile && file !== legacyFile)) {
         return Reflect.apply(originalRead, fsp, args);
       }
       reads.push(file);
