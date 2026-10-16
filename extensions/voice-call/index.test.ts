@@ -8,6 +8,7 @@ import {
   createTestPluginApi,
   createTestPluginServiceScheduler,
 } from "openclaw/plugin-sdk/plugin-test-api";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "./api.js";
 import type { VoiceCallRuntime } from "./runtime-entry.js";
@@ -169,7 +170,7 @@ function setup(
     registrationMode: "full",
     config: {},
     pluginConfig: config,
-    runtime: { tts: { textToSpeechTelephony: vi.fn() } } as unknown as OpenClawPluginApi["runtime"],
+    runtime: createPluginRuntimeMock({ tts: { textToSpeechTelephony: vi.fn() } }),
     logger: noopLogger,
     registerGatewayMethod: (method: string, handler: unknown, opts?: { scope?: string }) => {
       methods.set(method, handler);
@@ -256,7 +257,7 @@ async function registerVoiceCallCli(
     registrationMode: "full",
     config: {},
     pluginConfig,
-    runtime: { tts: { textToSpeechTelephony: vi.fn() } },
+    runtime: createPluginRuntimeMock({ tts: { textToSpeechTelephony: vi.fn() } }),
     logger: noopLogger,
     registerGatewayMethod: () => {},
     registerTool: () => {},
