@@ -11,6 +11,7 @@ import {
 import { createPluginRuntimeMock } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "./api.js";
+import { createVoiceCallCliTestHarness } from "./index.test-support.js";
 import type { VoiceCallRuntime } from "./runtime-entry.js";
 import type { CallRecord } from "./src/types.js";
 
@@ -35,6 +36,9 @@ const noopLogger = {
   error: vi.fn(),
   debug: vi.fn(),
 };
+
+const { captureStdout, registerVoiceCallCli, runVoiceCallCli } =
+  createVoiceCallCliTestHarness(noopLogger);
 
 type TestGatewayHandler = (ctx: {
   params: Record<string, unknown>;
@@ -61,26 +65,6 @@ type RespondCall = [
     message?: unknown;
   },
 ];
-type RegisterVoiceCall = (api: Record<string, unknown>) => void;
-type RegisterCliContext = {
-  program: Command;
-  config: Record<string, unknown>;
-  workspaceDir?: string;
-  logger: typeof noopLogger;
-};
-
-function captureStdout() {
-  let output = "";
-  const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(((chunk: unknown) => {
-    output += String(chunk);
-    return true;
-  }) as typeof process.stdout.write);
-  return {
-    output: () => output,
-    restore: () => writeSpy.mockRestore(),
-  };
-}
-
 function createRuntimeStub(callId = "call-1"): VoiceCallRuntime {
   const call = createCallRecord({ callId });
   return {
@@ -238,54 +222,6 @@ function expectRedactedVoiceCallStatus(value: unknown): void {
   expect(value).not.toHaveProperty("transcript");
   expect(value).not.toHaveProperty("processedEventIds");
   expect(value).not.toHaveProperty("metadata");
-}
-
-async function registerVoiceCallCli(
-  program: Command,
-  pluginConfig: Record<string, unknown> = { provider: "mock" },
-) {
-  const registerCli = vi.fn<(fn: (ctx: RegisterCliContext) => void | Promise<void>) => void>();
-  const { register } = plugin as unknown as {
-    register: RegisterVoiceCall;
-  };
-  register({
-    id: "voice-call",
-    name: "Voice Call",
-    description: "test",
-    version: "0",
-    source: "test",
-    registrationMode: "full",
-    config: {},
-    pluginConfig,
-    runtime: createPluginRuntimeMock({ tts: { textToSpeechTelephony: vi.fn() } }),
-    logger: noopLogger,
-    registerGatewayMethod: () => {},
-    registerTool: () => {},
-    registerCli,
-    registerService: () => {},
-    resolvePath: (p: string) => p,
-  });
-  const registrar = registerCli.mock.calls[0]?.[0];
-  if (!registrar) {
-    throw new Error("voice-call CLI registrar was not registered");
-  }
-  await registrar({ program, config: {}, workspaceDir: undefined, logger: noopLogger });
-}
-
-async function runVoiceCallCli(
-  args: string[],
-  pluginConfig: Record<string, unknown> = { provider: "mock" },
-): Promise<string> {
-  vi.stubEnv("OPENCLAW_CLI", "1");
-  const program = new Command();
-  const stdout = captureStdout();
-  try {
-    await registerVoiceCallCli(program, pluginConfig);
-    await program.parseAsync(args, { from: "user" });
-    return stdout.output();
-  } finally {
-    stdout.restore();
-  }
 }
 
 describe("voice-call plugin", () => {
