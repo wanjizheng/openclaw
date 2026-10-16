@@ -118,7 +118,12 @@ local-source trust class; custom naming never implies official/ClawHub trust. Bo
 custom plugin tarballs use managed npm-pack: installation; no registry fallback
 is allowed. Plugin install and Doctor receive
 OPENCLAW_SERVICE_REPAIR_POLICY=external and cannot activate services. Services
-must remain stopped through migration. After config validation the tool starts
+must remain stopped through migration. Plugin installation uses the explicit
+package-swap phase. After both custom packages are verified, the final Doctor
+runs with the native post-core-convergence marker, with Gateway activation and
+service repair forbidden. Ordinary catalog/readiness calls clear inherited
+update-phase markers. No second external Doctor handoff is required.
+After config validation the tool starts
 services and waits for the readiness deadline. Success requires matching
 core/CLI/Gateway identities and CLI physical root/source/member hashes for both
 plugins. The Gateway plugins.list RPC returns projected catalog metadata and

@@ -333,12 +333,14 @@ ${fixture.contact === "no-greeting" ? "" : "- 问候语: Welcome {name}!"}
       const call = manager.getCallByProviderCallId("provider-inbound");
       expect(call?.metadata?.initialMessage).toBe(fixture.expected);
       expect(call?.agentId).toBe(fixture.routed ? "voice-agent" : "main");
-      expect((await manager.getCallHistory())[0]?.metadata?.initialMessage).toBe(fixture.expected);
+      expect((await manager.getCallHistory()).at(-1)?.metadata?.initialMessage).toBe(
+        fixture.expected,
+      );
       await manager.speakInitialMessage("provider-inbound");
       expect(provider.playTtsCalls).toEqual([
         expect.objectContaining({ text: fixture.expected, providerCallId: "provider-inbound" }),
       ]);
-      const persisted = (await manager.getCallHistory())[0];
+      const persisted = (await manager.getCallHistory()).at(-1);
       expect(persisted?.metadata?.initialMessage).toBeUndefined();
       expect(persisted?.transcript).toContainEqual(
         expect.objectContaining({ speaker: "bot", text: fixture.expected }),
