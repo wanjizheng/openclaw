@@ -22,6 +22,7 @@ export type CallManagerContext = {
   provider: VoiceCallProvider | null;
   config: VoiceCallConfig;
   coreSession?: VoiceCallCoreSessionConfig;
+  resolveAgentWorkspaceDir?: (agentId: string) => string;
   storePath: string;
   stateRuntime?: VoiceCallStateRuntime["state"];
   webhookUrl: string | null;
@@ -35,6 +36,8 @@ export type CallManagerContext = {
   maxDurationTimers: Map<CallId, NodeJS.Timeout>;
   notifyHangupTimers: Map<CallId, NodeJS.Timeout>;
   initialMessageInFlight: Set<CallId>;
+  beforeCallFinalized?: (call: CallRecord) => Promise<void>;
+  onCallEnded?: (call: CallRecord) => void | Promise<void>;
   onCallAnswered?: (call: CallRecord) => void;
   onCallerSpeech?: (call: CallRecord) => void;
   streamSessionIssuer?: StreamSessionIssuer;

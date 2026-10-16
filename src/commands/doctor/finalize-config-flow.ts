@@ -8,6 +8,7 @@ export async function finalizeDoctorConfigFlow(params: {
   candidate: OpenClawConfig;
   snapshot: Pick<ConfigFileSnapshot, "path" | "hash" | "raw">;
   pendingChanges: boolean;
+  allowConfigSizeDropOnWrite?: boolean;
   shouldRepair: boolean;
   fixHints: string[];
   confirm: (p: { message: string; initialValue: boolean }) => Promise<boolean>;
@@ -15,6 +16,7 @@ export async function finalizeDoctorConfigFlow(params: {
 }): Promise<{
   cfg: OpenClawConfig;
   shouldWriteConfig: boolean;
+  allowConfigSizeDropOnWrite: boolean;
   confirmedConfigSource: { path: string; hash: string };
 }> {
   const confirmedConfigSource = {
@@ -34,5 +36,10 @@ export async function finalizeDoctorConfigFlow(params: {
       params.note(params.fixHints.join("\n"), "Doctor");
     }
   }
-  return { cfg, shouldWriteConfig, confirmedConfigSource };
+  return {
+    cfg,
+    shouldWriteConfig,
+    allowConfigSizeDropOnWrite: shouldWriteConfig && params.allowConfigSizeDropOnWrite === true,
+    confirmedConfigSource,
+  };
 }

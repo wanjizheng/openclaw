@@ -177,19 +177,21 @@ function resolveConfigPathTarget(root: unknown, pathLocal: Array<string | number
 export function stripUnknownConfigKeys(config: OpenClawConfig): {
   config: OpenClawConfig;
   removed: string[];
+  removedPaths: Array<readonly (string | number)[]>;
 } {
   const updating = process.env.OPENCLAW_UPDATE_IN_PROGRESS;
   if (updating === "1" || updating === "true") {
-    return { config, removed: [] };
+    return { config, removed: [], removedPaths: [] };
   }
 
   const parsed = OpenClawSchema.safeParse(config);
   if (parsed.success) {
-    return { config, removed: [] };
+    return { config, removed: [], removedPaths: [] };
   }
 
   const next = structuredClone(config);
   const removed: string[] = [];
+  const removedPaths: Array<readonly (string | number)[]> = [];
   for (const issue of parsed.error.issues) {
     if (issue.code !== "unrecognized_keys") {
       continue;
@@ -209,11 +211,13 @@ export function stripUnknownConfigKeys(config: OpenClawConfig): {
         continue;
       }
       delete target[key];
-      removed.push(formatConfigKeyPath([...issuePath, key]));
+      const fullPath = [...issuePath, key];
+      removed.push(formatConfigKeyPath(fullPath));
+      removedPaths.push(fullPath);
     }
   }
 
-  return { config: next, removed };
+  return { config: next, removed, removedPaths };
 }
 
 /** Warns when legacy OpenCode overrides shadow an active plugin-provided catalog. */

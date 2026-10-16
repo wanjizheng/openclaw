@@ -31,6 +31,7 @@ import {
 } from "../../config/sessions/session-accessor.js";
 import { normalizeResolvedMaintenanceConfigInput } from "../../config/sessions/store-maintenance.js";
 import type { SessionAcpMeta, SessionEntry } from "../../config/sessions/types.js";
+import { resolveAssistantIdentity } from "../../gateway/assistant-identity.js";
 import {
   captureSessionInitializationOwner,
   createSessionInitialization,
@@ -622,6 +623,7 @@ export function createRuntimeAgent(): PluginRuntime["agent"] {
     resolveAgentDir,
     resolveAgentWorkspaceDir,
     resolveAgentIdentity,
+    resolveAgentDisplayIdentity: resolveAssistantIdentity,
     resolveSessionCatalogCreateTarget: resolveAgentCatalogCreateTarget,
     resolveThinkingDefault,
     normalizeThinkingLevel: normalizeThinkLevel,

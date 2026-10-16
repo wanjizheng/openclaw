@@ -740,6 +740,25 @@ describe("resolveVoiceCallConfig session routing", () => {
 });
 
 describe("normalizeVoiceCallConfig", () => {
+  it("validates explicit report delivery at the partial config boundary", () => {
+    expect(normalizeVoiceCallConfig({}).postCallReport).toBeUndefined();
+    expect(normalizeVoiceCallConfig({ postCallReport: {} }).postCallReport).toEqual({});
+    expect(
+      normalizeVoiceCallConfig({
+        postCallReport: { discord: { target: "discord:channel:123", accountId: "Reports" } },
+      }).postCallReport,
+    ).toEqual({ discord: { target: "channel:123", accountId: "reports" } });
+    for (const discord of [
+      {},
+      { accountId: "reports" },
+      { target: "*" },
+      { target: "access-group:operators" },
+      { target: "123" },
+    ]) {
+      expect(() => normalizeVoiceCallConfig({ postCallReport: { discord } })).toThrow();
+    }
+  });
+
   it("fills nested runtime defaults from a partial config boundary", () => {
     const normalized = normalizeVoiceCallConfig({
       enabled: true,

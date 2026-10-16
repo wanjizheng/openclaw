@@ -1160,6 +1160,32 @@ describe("VoiceCallWebhookServer classic response routing", () => {
     };
   }
 
+  it.each([
+    { hybrid: false, user: "bye", reply: "Goodbye", end: false },
+    { hybrid: true, user: "hello", reply: "[END_CALL] Goodbye", end: true },
+    { hybrid: true, user: "bye", reply: "Goodbye", end: true },
+    { hybrid: true, user: "hello", reply: "Goodbye", end: false },
+  ])(
+    "applies queue-driven farewell only to hybrid calls ($hybrid/$user/$reply)",
+    async ({ hybrid, user, reply, end }) => {
+      const call = createCall(Date.now());
+      const config = createConfig({
+        provider: "twilio",
+        streaming: { enabled: hybrid, hybridMode: hybrid },
+      });
+      const { speak, respond } = responseFixture(call, config);
+      mocks.generateVoiceResponse
+        .mockReset()
+        .mockResolvedValue({ text: reply, deliveredEarly: false });
+      await respond(user);
+      expect(speak).toHaveBeenCalledWith(call.callId, reply.replace(/\[END_CALL\]/g, "").trim(), {
+        ...(end ? { endCall: true } : {}),
+        listenAfterPlayback: !end,
+        isCurrent: expect.any(Function),
+      });
+    },
+  );
+
   it("keeps outbound calls on their frozen agent when the dialed number has an inbound route", async () => {
     const call = createCall(Date.now());
     call.agentId = "support";

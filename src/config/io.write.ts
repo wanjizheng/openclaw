@@ -48,6 +48,7 @@ import {
 } from "./io.audit.js";
 import type { ConfigIoContext } from "./io.context.js";
 import { prepareCronOwnerWriteRefusal } from "./io.cron-owner-refusal.js";
+import { collectUnauthorizedDestructivePathsForWrite } from "./io.destructive-paths.js";
 import {
   projectWebhookMigrationIncludeWrite,
   recordConfigWriteMetadata,
@@ -443,7 +444,11 @@ export async function writeConfigFileFromContext(
       }),
     });
   };
-  const blockingReasons = resolveConfigWriteBlockingReasons(suspiciousReasons, options);
+  const blockingReasons = resolveConfigWriteBlockingReasons(
+    suspiciousReasons,
+    options,
+    collectUnauthorizedDestructivePathsForWrite(snapshot, stampedOutputConfig, options, deps.env),
+  );
   if (blockingReasons.length > 0 && options.allowDestructiveWrite !== true) {
     const rejectedPath = `${configPath}.rejected.${formatConfigArtifactTimestamp(new Date().toISOString())}`;
     // Only the completed exclusive create proves this payload is available for inspection.

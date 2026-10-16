@@ -74,6 +74,41 @@ describe("doctor config flow steps", () => {
     stripUnknownConfigKeysMock.mockReset();
   });
 
+  it("records only destructive legacy migration paths before sibling repairs", () => {
+    const source = {
+      session: { scope: "per-sender" as const, typingMode: "thinking" },
+      gateway: { mode: "local" as const, auth: { mode: "token" as const, token: "kept-token" } },
+    };
+    migrateLegacyConfigMock.mockReturnValueOnce({
+      config: { session: { scope: source.session.scope }, gateway: source.gateway },
+      changes: ["Removed legacy session.typingMode."],
+    });
+    const result = createLegacyStepResult({
+      parsed: source,
+      sourceConfig: source,
+      sourceConfigBeforeMigrations: source,
+      legacyIssues: [{ path: "session.typingMode", message: "legacy key" }],
+    });
+    expect(result.removedPaths).toEqual([["session", "typingMode"]]);
+    expect(result.state.candidate.session?.scope).toBe("per-sender");
+    expect(result.state.candidate.session).not.toHaveProperty("typingMode");
+    expect(result.removedPaths).not.toContainEqual(["gateway"]);
+  });
+
+  it("preserves typed schema-removal paths instead of deriving them from dotted display", () => {
+    stripUnknownConfigKeysMock.mockReturnValueOnce({
+      config: {},
+      removed: ["unknown.key"],
+      removedPaths: [["unknown.key"]],
+    });
+    const result = applyUnknownConfigKeyStep({
+      state: { cfg: {}, candidate: {}, pendingChanges: false, fixHints: [] },
+      shouldRepair: true,
+      doctorFixCommand: "openclaw doctor --fix",
+    });
+    expect(result.removedPaths).toEqual([["unknown.key"]]);
+  });
+
   it("collects legacy compatibility issue lines and preview fix hints", () => {
     migrateLegacyConfigMock.mockReturnValueOnce({
       config: {},

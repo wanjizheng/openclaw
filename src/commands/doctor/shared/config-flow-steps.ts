@@ -6,6 +6,10 @@ import {
   setDeferredPluginMigrationConfigFacts,
 } from "../../../config/deferred-plugin-migration-config.js";
 import { restoreEnvVarRefsFromResolved } from "../../../config/env-preserve.js";
+import {
+  collectDestructiveChanges,
+  type ConfigPath,
+} from "../../../config/io.destructive-paths.js";
 import { coerceConfig } from "../../../config/io.read-helpers.js";
 import { projectAuthoredAgentRosterForWrite } from "../../../config/io.write-prepare.js";
 import { formatConfigIssueLines } from "../../../config/issue-format.js";
@@ -34,6 +38,7 @@ export function applyLegacyCompatibilityStep(params: {
   state: DoctorConfigMutationState;
   issueLines: string[];
   changeLines: string[];
+  removedPaths: ConfigPath[];
   partiallyValid?: boolean;
   blocksWrite?: boolean;
 } {
@@ -42,6 +47,7 @@ export function applyLegacyCompatibilityStep(params: {
       state: params.state,
       issueLines: [],
       changeLines: [],
+      removedPaths: [],
     };
   }
 
@@ -64,6 +70,7 @@ export function applyLegacyCompatibilityStep(params: {
         `- ${otelPath}: Doctor cannot safely rewrite this $include ownership.${targets} No config files were changed.`,
       ],
       changeLines: [],
+      removedPaths: [],
       blocksWrite: true,
     };
   }
@@ -92,6 +99,16 @@ export function applyLegacyCompatibilityStep(params: {
       params.snapshot.sourceConfig,
     );
 
+  const destructive = new Set<string>();
+  if (migrationCandidate) {
+    // Compare pre-normalization resolved values, not literal env/include templates.
+    collectDestructiveChanges(
+      params.snapshot.sourceConfigBeforeMigrations ?? params.snapshot.sourceConfig,
+      migrationCandidate,
+      [],
+      destructive,
+    );
+  }
   return {
     state: {
       // Keep migrated previews in memory; confirmation controls persistence.
@@ -109,6 +126,7 @@ export function applyLegacyCompatibilityStep(params: {
     },
     issueLines: [...issueLines, ...(warnings ?? [])],
     changeLines: changes,
+    removedPaths: [...destructive].map((key) => JSON.parse(key) as ConfigPath),
     partiallyValid: partiallyValid === true ? true : undefined,
   };
 }
@@ -121,12 +139,13 @@ export function applyUnknownConfigKeyStep(params: {
 }): {
   state: DoctorConfigMutationState;
   removed: string[];
+  removedPaths: ConfigPath[];
   repairs: string[];
   warnings: string[];
 } {
   const unknown = stripUnknownConfigKeys(params.state.candidate);
   if (unknown.removed.length === 0) {
-    return { state: params.state, removed: [], repairs: [], warnings: [] };
+    return { state: params.state, removed: [], removedPaths: [], repairs: [], warnings: [] };
   }
   const protectedAuth = protectActiveAuthProfileConfig({
     before: params.state.candidate,
@@ -143,6 +162,7 @@ export function applyUnknownConfigKeyStep(params: {
         : [...params.state.fixHints, `Run "${params.doctorFixCommand}" to remove these keys.`],
     },
     removed: unknown.removed,
+    removedPaths: unknown.removedPaths ?? [],
     repairs: protectedAuth.repairs,
     warnings: protectedAuth.warnings,
   };

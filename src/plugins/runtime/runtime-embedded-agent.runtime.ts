@@ -15,6 +15,7 @@ import {
 } from "../../auto-reply/reply-payload.js";
 import { getRuntimeConfig } from "../../config/config.js";
 import { resolveSessionStorePathCore } from "../../config/sessions/paths.js";
+import { drainAgentRunTerminalWrites } from "../../infra/agent-run-terminal-writes.js";
 import { resolveSendableOutboundReplyParts } from "../../infra/outbound/reply-payload-parts.js";
 import {
   delegateMemoryAudience,
@@ -182,7 +183,13 @@ export const runPluginEmbeddedAgent: PluginRuntime["agent"]["runEmbeddedAgent"] 
     }
     return result;
   } finally {
-    params.abortSignal?.removeEventListener("abort", close);
-    close();
+    try {
+      // Accepted lifecycle writes retain this owner through normal settlement.
+      // The external abort listener still revokes authority immediately.
+      await drainAgentRunTerminalWrites(preparedRunAdmission.operationalRunInstance);
+    } finally {
+      params.abortSignal?.removeEventListener("abort", close);
+      close();
+    }
   }
 };

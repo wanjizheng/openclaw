@@ -7,6 +7,7 @@ import {
   resolveVoiceCallSessionKey,
   type CallMode,
 } from "../config.js";
+import { generateHybridAudioUrl } from "../hybrid/audio-pipeline.js";
 import { resolvePreferredTtsVoice } from "../tts-provider-voice.js";
 import {
   type EndReason,
@@ -24,7 +25,11 @@ import { addTranscriptEntry, copyCallRecord, transitionState } from "./state.js"
 import { persistCallRecord } from "./store.js";
 import { resolveVoiceCallSecondsTimerDelayMs } from "./timer-delays.js";
 import { clearTranscriptWaiter, startMaxDurationTimer, waitForFinalTranscript } from "./timers.js";
-import { generateDtmfRedirectTwiml, generateNotifyTwiml } from "./twiml.js";
+import {
+  generateDtmfRedirectTwiml,
+  generateHybridNotifyTwiml,
+  generateNotifyTwiml,
+} from "./twiml.js";
 
 type InitiateContext = Pick<
   CallManagerContext,
@@ -38,6 +43,7 @@ type InitiateContext = Pick<
   | "webhookUrl"
   | "streamSessionIssuer"
   | "mutationQueue"
+  | "onCallEnded"
   | "pendingCallAdmissions"
   | "isStopping"
 >;
@@ -57,6 +63,7 @@ type EndCallContext = Pick<
   | "stateRuntime"
   | "transcriptWaiters"
   | "maxDurationTimers"
+  | "onCallEnded"
   | "endCallOperations"
   | "mutationQueue"
 >;
@@ -178,6 +185,27 @@ export async function initiateCall(
 
   ctx.pendingCallAdmissions.add(callId);
   try {
+    if (mode !== "notify" && initialMessage && ctx.config.streaming.hybridMode) {
+      try {
+        const audioUrl = await generateHybridAudioUrl({
+          text: initialMessage,
+          voiceConfig: ctx.config,
+          coreConfig: { tts: ctx.config.tts },
+          callId,
+          isCurrent: () => ctx.pendingCallAdmissions.has(callId) && !ctx.isStopping(),
+        });
+        if (audioUrl) {
+          callRecord.metadata!.initialMessageAudioUrl = audioUrl;
+        }
+      } catch (error) {
+        console.warn(
+          `[voice-call][hybrid] Initial audio preparation failed; retrying on answer: ${formatErrorMessage(error)}`,
+        );
+      }
+    }
+    if (ctx.isStopping()) {
+      throw new Error("Voice Call manager is stopping");
+    }
     await ctx.mutationQueue.enqueue("state", async () => {
       await persistCallRecord(ctx.storePath, callRecord, ctx.stateRuntime);
       ctx.activeCalls.set(callId, callRecord);
@@ -195,7 +223,9 @@ export async function initiateCall(
     let preConnectTwiml: string | undefined;
     if (mode === "notify" && initialMessage) {
       const pollyVoice = mapVoiceToPolly(resolvePreferredTtsVoice(ctx.config));
-      inlineTwiml = generateNotifyTwiml(initialMessage, pollyVoice);
+      inlineTwiml = ctx.config.streaming.hybridMode
+        ? generateHybridNotifyTwiml(initialMessage, pollyVoice)
+        : generateNotifyTwiml(initialMessage, pollyVoice);
       console.log(`[voice-call] Using inline TwiML for notify mode (voice: ${pollyVoice})`);
     } else if (dtmfSequence) {
       preConnectTwiml = generateDtmfRedirectTwiml(dtmfSequence, ctx.webhookUrl);
@@ -261,6 +291,8 @@ export async function initiateCall(
 }
 
 export type SpeakOptions = {
+  endCall?: boolean;
+  preGeneratedAudioUrl?: string;
   listenAfterPlayback?: boolean;
   isCurrent?: () => boolean;
 };
@@ -317,7 +349,31 @@ export async function speak(
     const voice = resolvePreferredTtsVoice(
       resolveVoiceCallEffectiveConfig(ctx.config, numberRouteKey).config,
     );
+    let audioUrl = options?.preGeneratedAudioUrl;
+    if (!audioUrl && ctx.config.streaming.hybridMode) {
+      audioUrl = await generateHybridAudioUrl({
+        text,
+        voiceConfig: ctx.config,
+        coreConfig: { tts: ctx.config.tts },
+        callId,
+        isCurrent: () =>
+          !ctx.isStopping() &&
+          isCurrentCall(ctx, call) &&
+          (!options?.isCurrent || options.isCurrent()),
+      });
+    }
+    // Synthesis awaits external work; revalidate call and turn authority at playback.
+    if (
+      ctx.isStopping() ||
+      !isCurrentCall(ctx, call) ||
+      (options?.isCurrent && !options.isCurrent())
+    ) {
+      throw new Error("Call or automatic reply superseded");
+    }
     await provider.playTts({
+      audioUrl,
+      endCall: options?.endCall,
+      isCurrent: options?.isCurrent,
       callId,
       providerCallId: call.providerCallId ?? providerCallId,
       text,
@@ -414,7 +470,12 @@ export async function speakInitialMessage(
 
   try {
     console.log(`[voice-call] Speaking initial message for call ${call.callId} (mode: ${mode})`);
-    const result = await speak(ctx, call.callId, initialMessage);
+    const result = await speak(ctx, call.callId, initialMessage, {
+      preGeneratedAudioUrl:
+        typeof call.metadata?.initialMessageAudioUrl === "string"
+          ? call.metadata.initialMessageAudioUrl
+          : undefined,
+    });
     if (!result.success) {
       console.warn(`[voice-call] Failed to speak initial message: ${result.error}`);
       return;
@@ -425,6 +486,7 @@ export async function speakInitialMessage(
       !(await updateCall(ctx, call, (next) => {
         if (next.metadata?.initialMessage === initialMessage) {
           delete next.metadata.initialMessage;
+          delete next.metadata.initialMessageAudioUrl;
         }
       })) ||
       !isCurrentCall(ctx, call)

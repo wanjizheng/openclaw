@@ -1,8 +1,10 @@
 import fs from "node:fs";
+import { runInNewContext } from "node:vm";
 import { MessageChannel } from "node:worker_threads";
 import { coerceErrorMessage } from "@openclaw/normalization-core/error-coercion";
 import { runInDetachedAsyncContext } from "../shared/async-work-scope.js";
 import { GATEWAY_OWNER_HEARTBEAT_MS } from "./gateway-lock-payload.js";
+import { observeGatewayStateOwnerLocks } from "./gateway-state-owner-diagnostics.js";
 import {
   type GatewayStateOwnerHeartbeatData,
   renewGatewayStateOwnerLock,
@@ -15,7 +17,22 @@ import {
 } from "./runtime-worker-url.js";
 import { createCpuTrackedWorker } from "./worker-cpu.js";
 
-const now = Date.now.bind(Date);
+// Native workers and lock mtimes use wall epoch. A separate realm keeps this
+// clock independent of business Date replacements, even when imported inside one.
+// The expression is constant and receives no application objects or code.
+const nativeDateNow: unknown = runInNewContext("Date.now");
+const ambientDateIsFakeAtImport = "isFake" in Date && Date.isFake === true;
+const ambientDateNameAtImport = Date.name;
+function now(): number {
+  if (typeof nativeDateNow !== "function") {
+    throw new Error("Native custody epoch clock is unavailable");
+  }
+  const epoch: unknown = Reflect.apply(nativeDateNow, undefined, []);
+  if (typeof epoch !== "number" || !Number.isFinite(epoch)) {
+    throw new Error("Native custody epoch clock returned an invalid timestamp");
+  }
+  return epoch;
+}
 
 /** Process and schema owners share one renewal worker and one failure deadline. */
 export function startGatewayStateOwnerHeartbeat(
@@ -58,11 +75,46 @@ export function startGatewayStateOwnerHeartbeat(
     // Parent expiration checks verify physical custody directly.
     port1.on("message", () => undefined);
     port1.unref();
-    worker.on("error", (err) => onLost(new Error(`${coerceErrorMessage(err)}; restart Gateway.`)));
+    let failure: string | null = null;
+    let observation:
+      | {
+          clock: "epoch";
+          clockSource: "isolated-realm-Date.now";
+          ambientDateIsFakeAtImport: boolean;
+          ambientDateNameAtImport: string;
+          globalNow: number;
+          now: number;
+          performanceNow: number;
+          lastBeat: string;
+          ageMs: number;
+          remainingMs: number;
+          workerThreadId: number;
+          failure: string | null;
+        }
+      | undefined;
+    worker.on("error", (error) => {
+      failure = coerceErrorMessage(error);
+      onLost(new Error(`${failure}; restart Gateway.`));
+    });
     const inspect = () => {
       const renewedAt = Atomics.load(lastBeat, 0);
-      const age = now() - Number(renewedAt);
+      const sampledAt = now();
+      const age = sampledAt - Number(renewedAt);
       const remaining = age < 0 ? 0 : 60_000 - age;
+      observation = {
+        clock: "epoch",
+        clockSource: "isolated-realm-Date.now",
+        ambientDateIsFakeAtImport,
+        ambientDateNameAtImport,
+        globalNow: Date.now(),
+        now: sampledAt,
+        performanceNow: performance.now(),
+        lastBeat: String(renewedAt),
+        ageMs: age,
+        remainingMs: remaining,
+        workerThreadId: worker.threadId,
+        failure,
+      };
       if (remaining <= 0) {
         try {
           const renewalStartedAt = now();
@@ -97,6 +149,10 @@ export function startGatewayStateOwnerHeartbeat(
           Atomics.store(lastBeat, 0, BigInt(renewalStartedAt));
           return 60_000;
         } catch (error) {
+          failure = coerceErrorMessage(error);
+          if (observation) {
+            observation.failure = failure;
+          }
           onLost(
             new Error(
               `Gateway state ownership is no longer current at ${rootPath}: ${coerceErrorMessage(error)}; restart the Gateway.`,
@@ -133,6 +189,11 @@ export function startGatewayStateOwnerHeartbeat(
       worker,
       paths: new Set(Object.keys(locks)),
       inspect,
+      diagnostic: () => ({
+        observation,
+        locks: observeGatewayStateOwnerLocks(locks),
+        lockCount: Object.keys(locks).length,
+      }),
       stop,
     };
   });

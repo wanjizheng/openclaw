@@ -2,6 +2,7 @@
 import { KeyedAsyncQueue } from "openclaw/plugin-sdk/keyed-async-queue";
 import { MAX_TIMER_TIMEOUT_MS } from "openclaw/plugin-sdk/number-runtime";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createVoiceCallBaseConfig } from "../test-fixtures.js";
 import { CallRecordSchema, type CallRecord } from "../types.js";
 
 const {
@@ -105,6 +106,7 @@ function createDialContext<T extends object>(config: T) {
     activeCalls: new Map<string, CallRecord>(),
     providerCallIdMap: new Map<string, string>(),
     config: {
+      ...createVoiceCallBaseConfig(),
       maxConcurrentCalls: 3,
       outbound: { defaultMode: "conversation" },
       fromNumber: "+14155550100",
@@ -134,6 +136,7 @@ describe("voice-call outbound helpers", () => {
       activeCalls: new Map(),
       providerCallIdMap: new Map(),
       config: {
+        ...createVoiceCallBaseConfig(),
         maxConcurrentCalls: 1,
         outbound: { defaultMode: "conversation", notifyHangupDelaySec: 0 },
       },
@@ -181,7 +184,7 @@ describe("voice-call outbound helpers", () => {
         {
           ...base,
           provider: { name: "twilio" },
-          config: { ...base.config, fromNumber: "" },
+          config: { ...createVoiceCallBaseConfig(), ...base.config, fromNumber: "" },
         } as never,
         "+14155550123",
       ),
@@ -364,7 +367,10 @@ describe("voice-call outbound helpers", () => {
       activeCalls: new Map([["call-1", call]]),
       providerCallIdMap: new Map(),
       provider: { name: "twilio", playTts },
-      config: { tts: { provider: "openai", providers: { openai: { voice: "alloy" } } } },
+      config: {
+        ...createVoiceCallBaseConfig(),
+        tts: { provider: "openai", providers: { openai: { voice: "alloy" } } },
+      },
       storePath: "/tmp/voice-call.json",
     };
 
@@ -412,7 +418,7 @@ describe("voice-call outbound helpers", () => {
         startListening,
         stopListening: vi.fn(async () => {}),
       },
-      config: { tts: { provider: "openai" } },
+      config: { ...createVoiceCallBaseConfig(), tts: { provider: "openai" } },
       storePath: "/tmp/voice-call.json",
       activeTurnCalls,
       transcriptWaiters: new Map(),
@@ -444,6 +450,7 @@ describe("voice-call outbound helpers", () => {
       providerCallIdMap: new Map(),
       provider: { name: "telnyx", playTts },
       config: {
+        ...createVoiceCallBaseConfig(),
         tts: {
           provider: "telnyx",
           providers: {
@@ -484,6 +491,7 @@ describe("voice-call outbound helpers", () => {
       provider: { name: "twilio", playTts },
       initialMessageInFlight: new Set(),
       config: {
+        ...createVoiceCallBaseConfig(),
         outbound: { notifyHangupDelaySec: Number.MAX_SAFE_INTEGER },
         tts: { provider: "openai", providers: { openai: { voice: "alloy" } } },
       },
@@ -515,6 +523,7 @@ describe("voice-call outbound helpers", () => {
       providerCallIdMap: new Map(),
       provider: { name: "twilio", playTts },
       config: {
+        ...createVoiceCallBaseConfig(),
         tts: { provider: "openai", providers: { openai: { voice: "coral" } } },
         numbers: {
           "+15550002222": {
@@ -552,6 +561,7 @@ describe("voice-call outbound helpers", () => {
       providerCallIdMap: new Map(),
       provider: { name: "twilio", playTts },
       config: {
+        ...createVoiceCallBaseConfig(),
         tts: { provider: "openai", providers: { openai: { voice: "coral" } } },
         numbers: {
           "+15550002222": {
@@ -584,7 +594,7 @@ describe("voice-call outbound helpers", () => {
       activeCalls: new Map([["call-1", call]]),
       providerCallIdMap: new Map(),
       provider: { name: "twilio", sendDtmf: sendDtmfProvider },
-      config: {},
+      config: { ...createVoiceCallBaseConfig() },
       storePath: "/tmp/voice-call.json",
     };
 
@@ -609,7 +619,7 @@ describe("voice-call outbound helpers", () => {
       activeCalls: new Map([["call-1", call]]),
       providerCallIdMap: new Map(),
       provider: { name: "telnyx" },
-      config: {},
+      config: { ...createVoiceCallBaseConfig() },
       storePath: "/tmp/voice-call.json",
     };
 
@@ -695,7 +705,7 @@ describe("voice-call outbound helpers", () => {
           activeCalls: new Map(),
           providerCallIdMap: new Map(),
           provider: { name: "twilio", playTts: vi.fn() },
-          config: {},
+          config: { ...createVoiceCallBaseConfig() },
           storePath: "/tmp/voice-call.json",
         } as never,
         "missing",

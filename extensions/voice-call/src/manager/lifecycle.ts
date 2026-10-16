@@ -14,7 +14,14 @@ type CallLifecycleContext = Pick<
   "activeCalls" | "providerCallIdMap" | "storePath" | "stateRuntime"
 > &
   Partial<
-    Pick<CallManagerContext, "transcriptWaiters" | "maxDurationTimers" | "notifyHangupTimers">
+    Pick<
+      CallManagerContext,
+      | "transcriptWaiters"
+      | "maxDurationTimers"
+      | "notifyHangupTimers"
+      | "onCallEnded"
+      | "beforeCallFinalized"
+    >
   >;
 
 /** Finalize under the manager mutation queue, publishing cleanup only after persistence. */
@@ -35,6 +42,8 @@ export async function finalizeCall(params: {
     next.endedAt = params.endedAt ?? Date.now();
     next.endReason = endReason;
     transitionState(next, endReason);
+    // Failed intent admission leaves the call nonterminal and recoverable.
+    await ctx.beforeCallFinalized?.(copyCallRecord(next));
     await persistCallRecord(ctx.storePath, next, ctx.stateRuntime);
     Object.assign(call, next);
     log.info(
@@ -62,5 +71,11 @@ export async function finalizeCall(params: {
   // Remove a provider-call mapping only when it still points at this call.
   if (call.providerCallId && ctx.providerCallIdMap.get(call.providerCallId) === call.callId) {
     ctx.providerCallIdMap.delete(call.providerCallId);
+  }
+  try {
+    await ctx.onCallEnded?.(copyCallRecord(call));
+  } catch (error) {
+    log.warn("[voice-call] Terminal cleanup/report admission remains pending: " + String(error));
+    throw error;
   }
 }

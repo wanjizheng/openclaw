@@ -180,6 +180,9 @@ export type AnswerCallInput = CallControlInput & {
 };
 
 export type PlayTtsInput = CallControlInput & {
+  audioUrl?: string;
+  endCall?: boolean;
+  isCurrent?: () => boolean;
   text: string;
   voice?: string;
   locale?: string;

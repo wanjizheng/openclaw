@@ -68,6 +68,7 @@ describe("doctor finalize config flow", () => {
     expect(result).toEqual({
       cfg: scenario.candidate ? candidate : cfg,
       shouldWriteConfig: scenario.write,
+      allowConfigSizeDropOnWrite: false,
       confirmedConfigSource: { path: "/config.json", hash: "source-hash" },
     });
     expect(confirm).toHaveBeenCalledTimes(!scenario.repair && scenario.pending ? 1 : 0);
@@ -97,4 +98,23 @@ describe("doctor finalize config flow", () => {
       });
     },
   );
+  it.each([
+    { repair: false, pending: true, accepted: true, allowed: true },
+    { repair: false, pending: true, accepted: false, allowed: false },
+    { repair: true, pending: true, accepted: true, allowed: true },
+    { repair: true, pending: false, accepted: true, allowed: false },
+  ])("binds migration shrink authority to the final write decision: %j", async (scenario) => {
+    const result = await finalizeDoctorConfigFlow({
+      cfg: {},
+      candidate: {},
+      snapshot: { path: "/config.json", raw: "{}" },
+      pendingChanges: scenario.pending,
+      shouldRepair: scenario.repair,
+      allowConfigSizeDropOnWrite: true,
+      fixHints: [],
+      confirm: vi.fn(async () => scenario.accepted),
+      note: vi.fn(),
+    });
+    expect(result.allowConfigSizeDropOnWrite).toBe(scenario.allowed);
+  });
 });

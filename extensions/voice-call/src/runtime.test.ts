@@ -8,7 +8,8 @@ import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { VoiceCallConfig } from "./config.js";
 import { registerFastContextMemoryProvider } from "./runtime.fast-context.test-support.js";
-import { createExternalProviderConfig, createVoiceCallBaseConfig } from "./test-fixtures.js";
+import { createBaseConfig, createMockSessionRuntime } from "./runtime.test-support.js";
+import { createExternalProviderConfig } from "./test-fixtures.js";
 import type { RealtimeCallHandler } from "./webhook/realtime-handler.js";
 
 const mocks = vi.hoisted(() => ({
@@ -17,6 +18,13 @@ const mocks = vi.hoisted(() => ({
   resolveTwilioAuthToken: vi.fn(),
   validateProviderConfig: vi.fn(),
   managerInitialize: vi.fn(),
+  managerSetOnCallEnded: vi.fn(),
+  managerSetBeforeCallFinalized: vi.fn(),
+  cleanupPrepare: vi.fn(),
+  cleanupEnqueue: vi.fn(),
+  cleanupRun: vi.fn(),
+  cleanupStart: vi.fn(),
+  cleanupStop: vi.fn(),
   managerStop: vi.fn(),
   managerGetCall: vi.fn(),
   webhookStart: vi.fn(),
@@ -83,9 +91,22 @@ vi.mock("./config.js", () => ({
   validateProviderConfig: mocks.validateProviderConfig,
 }));
 
+vi.mock("./call-cleanup.js", () => ({
+  createCallCleanup: () => ({
+    prepare: mocks.cleanupPrepare,
+    enqueue: mocks.cleanupEnqueue,
+    run: mocks.cleanupRun,
+    start: mocks.cleanupStart,
+    stop: mocks.cleanupStop,
+  }),
+}));
+
 vi.mock("./manager.js", () => ({
+  resolveVoiceCallStoreBase: () => "/synthetic/voice-calls",
   CallManager: class {
     initialize = mocks.managerInitialize;
+    setOnCallEnded = mocks.managerSetOnCallEnded;
+    setBeforeCallFinalized = mocks.managerSetBeforeCallFinalized;
     stop = mocks.managerStop;
     getCall = mocks.managerGetCall;
   },
@@ -139,48 +160,6 @@ vi.mock("./webhook/tailscale.js", () => ({
 
 import { createVoiceCallRuntime } from "./runtime.js";
 
-function createBaseConfig(): VoiceCallConfig {
-  return createVoiceCallBaseConfig({ tunnelProvider: "ngrok" });
-}
-
-type MockSessionEntry = {
-  sessionId?: string;
-  updatedAt?: number;
-  [key: string]: unknown;
-};
-
-function createMockSessionRuntime(sessionStore: Record<string, unknown>) {
-  return {
-    resolveStorePath: vi.fn(() => "/tmp/sessions.json"),
-    loadSessionStore: vi.fn(() => sessionStore),
-    saveSessionStore: vi.fn(async () => {}),
-    updateSessionStore: vi.fn(async (_storePath, mutator: (store: never) => unknown) =>
-      mutator(sessionStore as never),
-    ),
-    getSessionEntry: vi.fn(
-      ({ sessionKey }: { sessionKey: string }) => sessionStore[sessionKey] as MockSessionEntry,
-    ),
-    patchSessionEntry: vi.fn(
-      async ({
-        sessionKey,
-        fallbackEntry,
-        update,
-      }: {
-        sessionKey: string;
-        fallbackEntry: MockSessionEntry;
-        update: (entry: MockSessionEntry) => Promise<MockSessionEntry> | MockSessionEntry;
-      }) => {
-        const current = (sessionStore[sessionKey] as MockSessionEntry | undefined) ?? fallbackEntry;
-        const patch = await update(current);
-        const next = { ...current, ...patch };
-        sessionStore[sessionKey] = next;
-        return next;
-      },
-    ),
-    resolveSessionFilePath: vi.fn(() => "/tmp/session.json"),
-  };
-}
-
 const requireRecord = createRequireRecord("record", "expected-label-record");
 
 function requireRealtimeConsultToolHandler() {
@@ -205,6 +184,8 @@ describe("createVoiceCallRuntime lifecycle", () => {
     mocks.validateProviderConfig.mockReturnValue({ valid: true, errors: [] });
     mocks.managerInitialize.mockResolvedValue(undefined);
     mocks.managerStop.mockResolvedValue(undefined);
+    mocks.cleanupStart.mockReset().mockResolvedValue(undefined);
+    mocks.cleanupStop.mockReset().mockResolvedValue(undefined);
     mocks.managerGetCall.mockReset();
     mocks.webhookStart.mockResolvedValue("http://127.0.0.1:3334/voice/webhook");
     mocks.webhookStop.mockResolvedValue(undefined);
@@ -279,6 +260,37 @@ describe("createVoiceCallRuntime lifecycle", () => {
     });
     expect(runtime.config.agentId).toBe("operator");
     await runtime.stop();
+  });
+
+  it("replays cleanup before webhook admission and drains its owner after manager settlement", async () => {
+    const runtime = await createVoiceCallRuntime({
+      scheduler: createTestPluginServiceScheduler(),
+      config: createBaseConfig(),
+      coreConfig: {},
+      agentRuntime: {} as never,
+    });
+    expect(mocks.managerSetBeforeCallFinalized).toHaveBeenCalledWith(mocks.cleanupPrepare);
+    expect(mocks.cleanupStart.mock.invocationCallOrder[0]!).toBeLessThan(
+      mocks.webhookStart.mock.invocationCallOrder[0]!,
+    );
+    await runtime.stop();
+    expect(mocks.cleanupStop.mock.invocationCallOrder[0]!).toBeGreaterThan(
+      mocks.managerStop.mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it("does not admit webhook work when durable cleanup replay fails", async () => {
+    mocks.cleanupStart.mockRejectedValueOnce(new Error("cleanup state unavailable"));
+    await expect(
+      createVoiceCallRuntime({
+        scheduler: createTestPluginServiceScheduler(),
+        config: createBaseConfig(),
+        coreConfig: {},
+        agentRuntime: {} as never,
+      }),
+    ).rejects.toThrow("cleanup state unavailable");
+    expect(mocks.webhookStart).not.toHaveBeenCalled();
+    expect(mocks.cleanupStop).toHaveBeenCalledOnce();
   });
 
   it("cleans up tunnel, tailscale, and webhook server when init fails after start", async () => {

@@ -278,6 +278,11 @@ export default definePluginEntry({
           coreConfig: api.config as OpenClawConfig,
           fullConfig: api.config,
           agentRuntime: api.runtime.agent,
+          outboundRuntime: api.runtime.channel.outbound,
+          isCurrent: () =>
+            !runtimeGeneration.retired &&
+            runtimeCoordinator.current === runtimeRegistration &&
+            !scheduler.signal.aborted,
           stateRuntime: api.runtime.state,
           ttsRuntime: api.runtime.tts,
           logger: api.logger,

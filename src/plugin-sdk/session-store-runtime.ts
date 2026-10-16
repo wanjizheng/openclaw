@@ -98,7 +98,10 @@ type ReadAmbientTranscriptWatermarkParams = SessionStoreReadParams & {
 };
 
 type DeleteSessionEntryParams = SessionStoreReadParams & {
+  /** Preserve history by default; true removes live history into a durable archive. */
   archiveTranscript?: boolean;
+  /** Remove owned, unreferenced history without an archive; incompatible with archiveTranscript. */
+  deleteTranscriptWithoutArchive?: boolean;
   expectedSessionId?: string | null;
   expectedUpdatedAt?: number;
 };
@@ -308,6 +311,9 @@ export async function upsertSessionEntry(params: UpsertSessionEntryParams): Prom
 
 /** Deletes one session entry by agent/session identity. */
 export async function deleteSessionEntry(params: DeleteSessionEntryParams): Promise<boolean> {
+  if (params.archiveTranscript && params.deleteTranscriptWithoutArchive) {
+    throw new Error("Cannot combine archiveTranscript and deleteTranscriptWithoutArchive.");
+  }
   const agentId = params.agentId ?? resolveAgentIdFromSessionKey(params.sessionKey);
   const storePath =
     params.storePath ??
@@ -319,6 +325,9 @@ export async function deleteSessionEntry(params: DeleteSessionEntryParams): Prom
     ...(agentId !== undefined ? { agentId } : {}),
     ...(params.env !== undefined ? { env: params.env } : {}),
     archiveTranscript: params.archiveTranscript ?? false,
+    ...(params.deleteTranscriptWithoutArchive !== undefined
+      ? { deleteTranscriptWithoutArchive: params.deleteTranscriptWithoutArchive }
+      : {}),
     ...(params.expectedSessionId !== undefined
       ? { expectedSessionId: params.expectedSessionId }
       : {}),

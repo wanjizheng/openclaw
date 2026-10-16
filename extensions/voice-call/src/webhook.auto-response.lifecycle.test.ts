@@ -15,7 +15,12 @@ import type { NormalizedEvent, WebhookContext } from "./types.js";
 import { VoiceCallWebhookServer } from "./webhook.js";
 import { connectWs, waitForClose } from "./websocket-test-support.js";
 
-type ResponseParams = { userMessage: string; onEarlyText?: (text: string) => Promise<boolean> };
+type ResponseParams = {
+  userMessage: string;
+  from: string;
+  senderIsOwner?: boolean;
+  onEarlyText?: (text: string) => Promise<boolean>;
+};
 type ResponseResult = { text: string; deliveredEarly: boolean };
 const mocks = vi.hoisted(() => ({
   generate: vi.fn<(params: ResponseParams) => Promise<ResponseResult>>(),
@@ -75,12 +80,13 @@ const servers: VoiceCallWebhookServer[] = [];
 const pendingResponses: ReturnType<typeof createDeferred<ResponseResult>>[] = [];
 const responseCompletions: ReturnType<typeof createDeferred<void>>[] = [];
 
-async function startCall(streaming = false) {
+async function startCall(streaming = false, direction: "inbound" | "outbound" = "outbound") {
   const config = VoiceCallConfigSchema.parse({
     enabled: true,
     provider: streaming ? "twilio" : "telnyx",
     fromNumber: "+15550000000",
     skipSignatureVerification: true,
+    ...(direction === "inbound" ? { inboundPolicy: "allowlist", allowFrom: ["+15550000001"] } : {}),
     streaming: { enabled: streaming, provider: "test-transcription" },
   });
   config.serve.port = 0;
@@ -102,8 +108,28 @@ async function startCall(streaming = false) {
     };
   });
   await manager.initialize(provider, "https://example.test/voice/webhook");
-  const started = await manager.initiateCall("+15550000001", undefined, { mode: "conversation" });
-  expect(started.success).toBe(true);
+  let callId: string;
+  if (direction === "inbound") {
+    await manager.processEvent({
+      id: "inbound-call",
+      type: "call.initiated",
+      callId: "request-uuid",
+      providerCallId: "request-uuid",
+      timestamp: Date.now(),
+      direction,
+      from: "+15550000001",
+      to: "+15550000000",
+    });
+    const call = manager.getCallByProviderCallId("request-uuid");
+    if (!call) {
+      throw new Error("Expected exact-allowlist inbound call");
+    }
+    callId = call.callId;
+  } else {
+    const started = await manager.initiateCall("+15550000001", undefined, { mode: "conversation" });
+    expect(started.success).toBe(true);
+    callId = started.callId;
+  }
   const server = new VoiceCallWebhookServer(
     createTestPluginServiceScheduler(),
     config,
@@ -149,7 +175,7 @@ async function startCall(streaming = false) {
     }
     return { ws, callbacks };
   };
-  return { manager, provider, callId: started.callId, speech, openStream };
+  return { manager, provider, callId, speech, openStream };
 }
 
 async function responseAt(index: number) {
@@ -213,6 +239,21 @@ afterEach(async () => {
 });
 
 describe("automatic phone reply ownership", () => {
+  it.each(["inbound", "outbound"] as const)(
+    "resolves the remote party for %s contact context without changing caller authority",
+    async (direction) => {
+      const call = await startCall(false, direction);
+      await call.speech("synthetic contact question");
+      const response = await responseAt(0);
+      expect(mocks.generate.mock.calls[0]?.[0]).toMatchObject({
+        from: "+15550000001",
+        senderIsOwner: direction === "inbound" ? false : undefined,
+      });
+      await response.finish("current reply");
+      expect(call.provider.playTtsCalls.at(-1)?.text).toBe("current reply");
+    },
+  );
+
   it("revokes a reply waiting for persistence when partial stream speech arrives", async () => {
     const call = await startCall(true);
     const { callbacks } = await call.openStream("stream-pending-write");

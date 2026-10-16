@@ -992,6 +992,7 @@ export const databaseWorkerCoreTestFiles = [
   "src/plugin-sdk/channel-inbound.test.ts",
   "src/plugin-sdk/session-transcript-mirror-runtime.test.ts",
   "src/plugin-sdk/session-store-runtime.test.ts",
+  "src/plugin-sdk/session-store-runtime.purge.test.ts",
   "src/plugin-sdk/session-store-runtime.conversation.test.ts",
   "src/plugin-sdk/session-store-runtime.maintenance.test.ts",
   "src/plugin-sdk/session-transcript-runtime-visible-delta.test.ts",

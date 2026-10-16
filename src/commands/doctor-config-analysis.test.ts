@@ -113,6 +113,7 @@ describe("doctor config analysis helpers", () => {
     } as never);
 
     expect(result.removed).toEqual(["hooks.mappings[0].unexpected"]);
+    expect(result.removedPaths).toEqual([["hooks", "mappings", 0, "unexpected"]]);
     expect(result.config).toEqual({ hooks: { mappings: [{ id: "example" }] } });
   });
 

@@ -531,3 +531,46 @@ it("observes restore write failures while awaiting another carrier", async () =>
     { initialize: false },
   );
 });
+
+it("awaits terminal cleanup admission after stop begins during terminal persistence", async () => {
+  await withDelayedStore(async ({ manager, storePath, holdNextWrite }) => {
+    const placement = await manager.initiateCall("+15550000001");
+    const call = manager.getCall(placement.callId)!;
+    const prepared = vi.fn(async () => {});
+    const terminalEntered = createDeferred<void>();
+    const releaseTerminal = createDeferred<void>();
+    const ended = vi.fn(async () => {
+      terminalEntered.resolve();
+      await releaseTerminal.promise;
+    });
+    manager.setBeforeCallFinalized(prepared);
+    manager.setOnCallEnded(ended);
+    const gate = holdNextWrite();
+    const ending = manager.processEvent({
+      id: "terminal-during-stop",
+      type: "call.ended",
+      callId: call.callId,
+      providerCallId: call.providerCallId,
+      timestamp: Date.now(),
+      reason: "completed",
+    });
+    await gate.entered;
+    expect(prepared).toHaveBeenCalledOnce();
+    let stopped = false;
+    const stopping = manager.stop().then(() => {
+      stopped = true;
+    });
+    try {
+      gate.release();
+      await terminalEntered.promise;
+      expect(ended).toHaveBeenCalledOnce();
+      expect(stopped).toBe(false);
+    } finally {
+      gate.release();
+      releaseTerminal.resolve();
+      await Promise.all([ending, stopping]);
+    }
+    expect(stopped).toBe(true);
+    expect((await findCallInStore(storePath, call.callId))?.state).toBe("completed");
+  });
+});

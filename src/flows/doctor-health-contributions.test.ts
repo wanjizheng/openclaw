@@ -3460,7 +3460,8 @@ describe("doctor health contributions", () => {
         baseHash: "committed-revision",
         writeOptions: expect.objectContaining({
           expectedConfigPath: ctx.configPath,
-          allowConfigSizeDrop: true,
+          allowConfigSizeDrop: false,
+          authorizedDestructivePaths: [],
           preservedLegacyRootKeys: ["defaultModel"],
           skipPluginValidation: true,
         }),
@@ -3693,7 +3694,8 @@ describe("doctor health contributions", () => {
           expect.objectContaining({
             writeOptions: expect.objectContaining({
               auditOrigin: "doctor",
-              allowConfigSizeDrop: true,
+              allowConfigSizeDrop: false,
+              authorizedDestructivePaths: [],
               skipPluginValidation,
             }),
           }),
@@ -3704,6 +3706,24 @@ describe("doctor health contributions", () => {
           "Skipping doctor config write during legacy update handoff.",
         );
       }
+    });
+
+    it("retains only named migration shrink authority during an update", async () => {
+      const ctx = buildWriteConfigCtx({
+        OPENCLAW_UPDATE_IN_PROGRESS: "1",
+        OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE: "1",
+      });
+      ctx.configResult.allowConfigSizeDropOnWrite = true;
+      ctx.configResult.authorizedDestructivePaths = [["channels", "legacy.name"]];
+      await writeConfigContribution.run(ctx);
+      expect(mocks.replaceConfigFile).toHaveBeenCalledWith(
+        expect.objectContaining({
+          writeOptions: expect.objectContaining({
+            allowConfigSizeDrop: true,
+            authorizedDestructivePaths: [["channels", "legacy.name"]],
+          }),
+        }),
+      );
     });
 
     it("preserves source config version for legacy parent writable update doctor writes", async () => {

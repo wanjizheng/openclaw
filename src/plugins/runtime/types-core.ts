@@ -362,6 +362,8 @@ export type PluginRuntimeCore = {
     resolveAgentDir: typeof import("../../agents/agent-scope.js").resolveAgentDir;
     resolveAgentWorkspaceDir: typeof import("../../agents/agent-scope.js").resolveAgentWorkspaceDir;
     resolveAgentIdentity: typeof import("../../agents/identity.js").resolveAgentIdentity;
+    /** Agent display identity using the canonical configured/workspace identity resolver. */
+    resolveAgentDisplayIdentity: typeof import("../../gateway/assistant-identity.js").resolveAssistantIdentity;
     /** Resolve an allowed catalog create target through canonical agent model/runtime policy. */
     resolveSessionCatalogCreateTarget: typeof import("./runtime-agent-session-catalog.js").resolveAgentCatalogCreateTarget;
     resolveThinkingDefault: (params: {

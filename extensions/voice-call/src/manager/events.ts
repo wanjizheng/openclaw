@@ -5,6 +5,11 @@ import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import { createSubsystemLogger } from "openclaw/plugin-sdk/runtime-env";
 import { isAllowlistedCaller, normalizePhoneNumber } from "../allowlist.js";
 import { resolveVoiceCallEffectiveConfig, resolveVoiceCallSessionKey } from "../config.js";
+import {
+  loadContactsFileAsync,
+  resolveInboundGreeting,
+  type ParsedContact,
+} from "../contact-file.js";
 import { TerminalStates, type CallRecord, type NormalizedEvent } from "../types.js";
 import type { CallManagerContext } from "./context.js";
 import { finalizeCall } from "./lifecycle.js";
@@ -31,12 +36,15 @@ type EventContext = Pick<
   | "provider"
   | "config"
   | "coreSession"
+  | "resolveAgentWorkspaceDir"
   | "storePath"
   | "stateRuntime"
   | "transcriptWaiters"
   | "maxDurationTimers"
   | "notifyHangupTimers"
   | "endCallOperations"
+  | "onCallEnded"
+  | "beforeCallFinalized"
   | "onCallAnswered"
   | "onCallerSpeech"
   | "streamSessionIssuer"
@@ -98,6 +106,27 @@ async function createWebhookCall(params: {
     params.direction === "inbound" ? params.to : undefined,
   );
 
+  const agentId = normalizeAgentId(effectiveConfig.agentId);
+  let initialMessage: string | undefined;
+  if (params.direction === "inbound") {
+    let contacts: ParsedContact[] = [];
+    if (params.ctx.resolveAgentWorkspaceDir) {
+      try {
+        contacts = await loadContactsFileAsync({
+          workspaceDir: params.ctx.resolveAgentWorkspaceDir(agentId),
+        });
+      } catch {
+        // Optional contact context must not prevent answering an admitted call.
+        log.warn("Inbound contact greeting unavailable; using configured default greeting");
+      }
+    }
+    initialMessage = resolveInboundGreeting(
+      params.from,
+      effectiveConfig.inboundGreeting || undefined,
+      contacts,
+    ).greeting;
+  }
+
   const callRecord: CallRecord = {
     callId,
     providerCallId: params.providerCallId,
@@ -112,15 +141,12 @@ async function createWebhookCall(params: {
       phone: params.direction === "outbound" ? params.to : params.from,
       coreSession: params.ctx.coreSession,
     }),
-    agentId: normalizeAgentId(effectiveConfig.agentId),
+    agentId,
     startedAt: Date.now(),
     transcript: [],
     processedEventIds: [],
     metadata: {
-      initialMessage:
-        params.direction === "inbound"
-          ? effectiveConfig.inboundGreeting || "Hello! How can I help you today?"
-          : undefined,
+      initialMessage,
       ...(numberRouteKey ? { numberRouteKey } : {}),
     },
   };

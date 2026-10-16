@@ -569,10 +569,14 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
     note(unknownStep.warnings.join("\n"), "Doctor warnings");
   }
 
+  // Legacy migration and schema-key cleanup alone grant shrink authority.
+  // Other repairs and later health checks cannot enlarge this set.
+  const authorizedDestructivePaths = [...legacyStep.removedPaths, ...unknownStep.removedPaths];
   const finalized = await finalizeDoctorConfigFlow({
     ...state,
     snapshot,
     shouldRepair,
+    allowConfigSizeDropOnWrite: authorizedDestructivePaths.length > 0,
     confirm: params.confirm,
     note,
   });
@@ -639,6 +643,9 @@ export async function loadAndMaybeMigrateDoctorConfig(params: {
     ...(configRepairWarnings.length ? { warnings: [...new Set(configRepairWarnings)] } : {}),
     ...(shouldWriteConfig && pendingChangePanels.length > 0 ? { pendingChangePanels } : {}),
     sourceConfigValid: snapshot.valid,
+    ...(shouldWriteConfig && finalized.allowConfigSizeDropOnWrite
+      ? { allowConfigSizeDropOnWrite: true, authorizedDestructivePaths }
+      : {}),
     ...(legacyStep.partiallyValid === true ? { skipPluginValidationOnWrite: true } : {}),
     ...(shouldWriteConfig && explicitSetPaths.length > 0 ? { explicitSetPaths } : {}),
     ...(shouldWriteConfig && persistCanonicalAgentRoster

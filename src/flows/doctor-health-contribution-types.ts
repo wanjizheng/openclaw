@@ -35,6 +35,9 @@ type DoctorConfigResult = {
   sourceConfigValid?: boolean;
   sourceLastTouchedVersion?: string;
   skipPluginValidationOnWrite?: boolean;
+  /** Authority belongs to named migrations, never generic Doctor writes/updates. */
+  allowConfigSizeDropOnWrite?: boolean;
+  authorizedDestructivePaths?: readonly (readonly (string | number)[])[];
   explicitSetPaths?: readonly (readonly string[])[];
   persistCanonicalAgentRoster?: boolean;
   skipWizardMetadataForIncludeWrite?: boolean;

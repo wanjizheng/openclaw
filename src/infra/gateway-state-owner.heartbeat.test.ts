@@ -16,6 +16,7 @@ import { startGatewayStateOwnerHeartbeat } from "./gateway-state-owner-heartbeat
 import type { GatewayStateOwnerHeartbeatData } from "./gateway-state-owner-heartbeat.runtime.js";
 import {
   acquireStateDatabaseSchemaLease,
+  assertStateDatabaseAccessAllowed,
   captureGatewayStateOwner,
 } from "./gateway-state-owner.js";
 import { withRuntimeWorkerGeneration } from "./runtime-worker-generation.js";
@@ -35,12 +36,13 @@ afterEach(() => {
 function observeHeartbeatWorkers(
   fault?: "EIO" | "clock origin" | SharedArrayBuffer,
   legacy = false,
+  workerModule = workerCpu,
 ) {
   const workers: Worker[] = [];
   const ready: Promise<unknown>[] = [];
   const beats: BigInt64Array<SharedArrayBuffer>[] = [];
-  const createWorker = workerCpu.createCpuTrackedWorker;
-  vi.spyOn(workerCpu, "createCpuTrackedWorker").mockImplementation((url, options) => {
+  const createWorker = workerModule.createCpuTrackedWorker;
+  vi.spyOn(workerModule, "createCpuTrackedWorker").mockImplementation((url, options) => {
     const data: unknown = options?.workerData;
     if (!isRecord(data) || !(data.lastBeat instanceof SharedArrayBuffer)) {
       throw new Error("Expected shared heartbeat observation");
@@ -110,6 +112,40 @@ it.each([false, true])("keeps custody across worker clock origins (legacy=%s)", 
   } finally {
     await gateway.release();
     await Promise.all(workers.map((worker) => worker.terminate()));
+  }
+});
+
+it("keeps native custody across repeated fake Date module lifecycles", async () => {
+  const realEpoch = Date.now();
+  for (const importedAt of [realEpoch - 10_000, realEpoch - 86_400_000, realEpoch + 86_400_000]) {
+    vi.resetModules();
+    vi.useFakeTimers({ toFake: ["Date"], now: importedAt });
+    // Load in a business clock, then retire that Date before native custody begins.
+    const ownerModule = await import("./gateway-state-owner.js");
+    const workerModule = await import("./worker-cpu.js");
+    vi.useRealTimers();
+    const { workers, ready } = observeHeartbeatWorkers(undefined, false, workerModule);
+    const root = tempDirs.make("openclaw-owner-retired-fake-date-");
+    const databasePath = path.join(root, "state", "openclaw.sqlite");
+    const owner = ownerModule.acquireGatewayStateOwner({ databasePath });
+    try {
+      await Promise.all(ready);
+      expect(() =>
+        owner.run(() => ownerModule.assertStateDatabaseAccessAllowed(databasePath)),
+      ).not.toThrow();
+      expect(() => owner.assertCurrent()).not.toThrow();
+      // A later, unrelated business clock must not enter the worker's epoch domain either.
+      vi.useFakeTimers({ toFake: ["Date"], now: importedAt - 86_400_000 });
+      expect(() =>
+        owner.run(() => ownerModule.assertStateDatabaseAccessAllowed(databasePath)),
+      ).not.toThrow();
+      expect(() => owner.assertCurrent()).not.toThrow();
+    } finally {
+      vi.useRealTimers();
+      owner.release();
+      await Promise.all(workers.map((worker) => worker.terminate()));
+      vi.restoreAllMocks();
+    }
   }
 });
 
@@ -452,10 +488,14 @@ it("never publishes renewed custody after a partial failure across clock rollbac
   }
 });
 
-it("fences state admission with a visible reason when renewal still fails after the deadline", async () => {
+it.each(
+  (["EIO", "worker exit", "clock rollback", "replacement"] as const).flatMap((fault) =>
+    [1, 2, 3].map((repetition) => [fault, repetition] as const),
+  ),
+)("rechecks physical custody after %s (same-process run %i)", async (fault) => {
   const root = tempDirs.make("openclaw-owner-heartbeat-lost-");
   const databasePath = path.join(root, "state", "openclaw.sqlite");
-  const { workers, ready, beats } = observeHeartbeatWorkers("EIO");
+  const { workers, ready, beats } = observeHeartbeatWorkers(fault === "EIO" ? fault : undefined);
   const gateway = await acquireGatewayLock({
     allowInTests: true,
     env: { OPENCLAW_STATE_DIR: root },
@@ -475,17 +515,88 @@ it("fences state admission with a visible reason when renewal still fails after 
     if (!worker || !lastBeat) {
       throw new Error("Expected one heartbeat worker and its shared observation");
     }
-    vi.spyOn(fs, "futimesSync").mockImplementation(() => {
-      throw Object.assign(new Error("synthetic EIO"), { code: "EIO" });
-    });
+    // Freeze worker progress so only the parent's physical-custody recovery can renew.
+    await worker.terminate();
     expect(() => gateway.assertCurrent()).not.toThrow();
-    Atomics.store(lastBeat, 0, BigInt(Date.now() - 60_001));
-    const reason = "synthetic EIO";
+    if (fault === "EIO") {
+      vi.spyOn(fs, "futimesSync").mockImplementation(() => {
+        throw Object.assign(new Error("synthetic EIO"), { code: "EIO" });
+      });
+    } else if (fault === "replacement") {
+      fs.renameSync(gateway.lockPath, `${gateway.lockPath}.retired`);
+      fs.copyFileSync(`${gateway.lockPath}.retired`, gateway.lockPath);
+    }
+    Atomics.store(
+      lastBeat,
+      0,
+      BigInt(Date.now() + (fault === "clock rollback" ? 60_001 : -60_001)),
+    );
+    if (fault === "worker exit" || fault === "clock rollback") {
+      expect(() => gateway.assertCurrent()).not.toThrow();
+      expect(Date.now() - Number(Atomics.load(lastBeat, 0))).toBeLessThan(1_000);
+      expect(owner.signal.aborted).toBe(false);
+      expect(() => assertStateDatabaseAccessAllowed(databasePath)).not.toThrow();
+      return;
+    }
+    const reason = fault === "EIO" ? "synthetic EIO" : "owner lock was removed or replaced";
     expect(() => gateway.assertCurrent()).toThrow(reason);
     expect(owner.signal.aborted).toBe(true);
     expect(owner.signal.reason).toMatchObject({
       message: expect.stringContaining(gateway.lockPath),
     });
+    let admissionError: Error | undefined;
+    try {
+      assertStateDatabaseAccessAllowed(databasePath);
+    } catch (error) {
+      admissionError = error as Error;
+    }
+    expect(admissionError?.message).toMatch(
+      /^OpenClaw state ownership at .* could not be verified;/,
+    );
+    expect(admissionError?.cause).toMatchObject({
+      name: "GatewayStateOwnerDiagnosticError",
+      code: "GATEWAY_STATE_OWNER_UNVERIFIED",
+      cause: owner.signal.reason,
+    });
+    const diagnostic = admissionError?.cause as Error;
+    const facts = JSON.parse(
+      diagnostic.message.slice("Gateway state ownership diagnostic: ".length),
+    );
+    expect(facts.originalReason).toMatchObject({
+      name: "Error",
+      message: expect.stringContaining(reason),
+    });
+    expect(facts).toMatchObject({
+      kind: "process",
+      accepting: true,
+      heartbeat: {
+        observation: {
+          clock: "epoch",
+          clockSource: "isolated-realm-Date.now",
+          ambientDateIsFakeAtImport: false,
+          ambientDateNameAtImport: "Date",
+          globalNow: expect.any(Number),
+          now: expect.any(Number),
+          performanceNow: expect.any(Number),
+          lastBeat: expect.any(String),
+          ageMs: expect.any(Number),
+          remainingMs: expect.any(Number),
+        },
+        locks: expect.arrayContaining([
+          expect.objectContaining({
+            exists: true,
+            dev: expect.any(String),
+            ino: expect.any(String),
+            payloadMatches: true,
+            payloadSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+          }),
+        ]),
+      },
+    });
+    const originalDiagnostic = diagnostic.message;
+    Atomics.store(lastBeat, 0, BigInt(Date.now()));
+    expect(() => assertStateDatabaseAccessAllowed(databasePath)).toThrow(originalDiagnostic);
+    expect(diagnostic.message).toBe(originalDiagnostic);
     expect(() => owner.assertCurrent()).toThrow(reason);
     expect(() => acquireStateDatabaseSchemaLease(databasePath)).toThrow(
       expect.objectContaining({

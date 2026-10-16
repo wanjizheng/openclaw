@@ -14,6 +14,7 @@ import {
 } from "openclaw/plugin-sdk/realtime-voice";
 import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import type { OpenClawPluginApi } from "../api.js";
+import { createCallCleanup, type CallCleanup } from "./call-cleanup.js";
 import type { VoiceCallConfig } from "./config.js";
 import {
   resolveVoiceCallEffectiveConfig,
@@ -24,7 +25,8 @@ import {
   resolveVoiceCallConfig,
   validateProviderConfig,
 } from "./config.js";
-import { CallManager } from "./manager.js";
+import { CallManager, resolveVoiceCallStoreBase } from "./manager.js";
+import { buildOnCallEndedHandler } from "./post-call-pipeline.js";
 import type { VoiceCallProvider } from "./providers/base.js";
 import type { TwilioProvider } from "./providers/twilio.js";
 import { buildRealtimeVoiceInstructions } from "./realtime-agent-context.js";
@@ -99,6 +101,7 @@ function createRuntimeResourceLifecycle(params: {
   config: VoiceCallConfig;
   webhookServer: VoiceCallWebhookServer;
   manager: CallManager;
+  cleanup: CallCleanup;
 }): {
   setTunnelResult: (result: TunnelResult | null) => void;
   stop: (opts?: { suppressErrors?: boolean }) => Promise<void>;
@@ -124,6 +127,7 @@ function createRuntimeResourceLifecycle(params: {
           () => cleanupTailscaleExposure(params.config),
           () => params.webhookServer.stop(),
           () => params.manager.stop(),
+          () => params.cleanup.stop(),
         ]) {
           try {
             await step();
@@ -173,6 +177,8 @@ async function resolveProvider(config: VoiceCallConfig): Promise<VoiceCallProvid
           publicUrl: config.publicUrl,
           skipVerification: config.skipSignatureVerification,
           streamPath: config.streaming?.enabled ? config.streaming.streamPath : undefined,
+          hybridMode: config.streaming.hybridMode,
+          crPath: config.streaming.crPath,
           webhookSecurity: config.webhookSecurity,
         },
       );
@@ -255,6 +261,8 @@ export async function createVoiceCallRuntime(params: {
   coreConfig: OpenClawConfig;
   fullConfig?: OpenClawConfig;
   agentRuntime: OpenClawPluginApi["runtime"]["agent"];
+  outboundRuntime?: OpenClawPluginApi["runtime"]["channel"]["outbound"];
+  isCurrent?: () => boolean;
   stateRuntime?: VoiceCallStateRuntime["state"];
   ttsRuntime?: TelephonyTtsRuntime;
   logger?: PluginLogger;
@@ -296,10 +304,38 @@ export async function createVoiceCallRuntime(params: {
   }
 
   const provider = await resolveProvider(config);
+  if (provider.name === "twilio") {
+    (provider as TwilioProvider).setLifecycleGuard(
+      () => !params.scheduler.signal.aborted && (params.isCurrent?.() ?? true),
+    );
+  }
   if (stateRuntime) {
     setVoiceCallStateRuntime({ state: stateRuntime });
   }
-  const manager = new CallManager(config, undefined, cfg.session, stateRuntime);
+  const manager = new CallManager(config, undefined, cfg.session, stateRuntime, (agentId) =>
+    agentRuntime.resolveAgentWorkspaceDir(cfg, agentId),
+  );
+  const cleanup = createCallCleanup({
+    stateRuntime,
+    storePath: resolveVoiceCallStoreBase(config),
+    agentRuntime,
+    coreConfig: cfg,
+    logger: log,
+    scheduler: params.scheduler,
+  });
+  manager.setBeforeCallFinalized(cleanup.prepare);
+  manager.setOnCallEnded(
+    buildOnCallEndedHandler({
+      scheduler: params.scheduler,
+      cleanup,
+      config,
+      coreConfig: cfg,
+      agentRuntime,
+      outboundRuntime: params.outboundRuntime,
+      logger: log,
+      isCurrent: params.isCurrent ?? (() => !params.scheduler.signal.aborted),
+    }),
+  );
   const realtimeVoiceRuntime = config.realtime.enabled ? await loadRealtimeVoiceRuntime() : null;
   const webhookServer = new VoiceCallWebhookServer(
     params.scheduler,
@@ -451,15 +487,12 @@ export async function createVoiceCallRuntime(params: {
     }
     webhookServer.setRealtimeHandler(realtimeHandler);
   }
-  const lifecycle = createRuntimeResourceLifecycle({ config, webhookServer, manager });
+  const lifecycle = createRuntimeResourceLifecycle({ config, webhookServer, manager, cleanup });
 
-  const localUrl = await webhookServer.start();
-
-  // Wrap remaining initialization in try/catch so the webhook server is
-  // properly stopped if any subsequent step fails.  Without this, the server
-  // keeps the port bound while the runtime promise rejects, causing
-  // EADDRINUSE on the next attempt.  See: #32387
+  // Replay cleanup before new webhook admission, and unwind every provisioned owner on failure.
   try {
+    await cleanup.start();
+    const localUrl = await webhookServer.start();
     // Determine public URL - priority: config.publicUrl > tunnel > legacy tailscale
     let publicUrl: string | null = config.publicUrl ?? null;
 

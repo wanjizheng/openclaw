@@ -1,4 +1,5 @@
 // Voice Call tests cover twilio plugin behavior.
+import crypto from "node:crypto";
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -11,7 +12,7 @@ vi.mock("./shared/guarded-json-api.js", async (importOriginal) => ({
   guardedJsonApiRequest: guardedJsonApiRequestMock,
 }));
 
-import type { WebhookContext } from "../types.js";
+import { CallRecordSchema, type WebhookContext } from "../types.js";
 import { TwilioProvider } from "./twilio.js";
 import { TwilioApiError } from "./twilio/api.js";
 
@@ -743,4 +744,90 @@ describe("TwilioProvider", () => {
     );
     expectStreamingTwiml(requireResponseBody(nextCall.providerResponseBody));
   });
+});
+
+describe("custom hybrid transport", () => {
+  it("emits an authenticated inbound STT fork alongside ConversationRelay", () => {
+    const provider = new TwilioProvider(
+      { accountSid: "AC123", authToken: "synthetic-token" },
+      {
+        publicUrl: "https://example.test/voice",
+        streamPath: "/voice/stream",
+        hybridMode: true,
+        crPath: "/voice/cr",
+      },
+    );
+    provider.hybridCr.bind((sid) =>
+      sid === "CA123"
+        ? CallRecordSchema.parse({
+            callId: "call-1",
+            providerCallId: sid,
+            provider: "twilio",
+            direction: "outbound",
+            state: "listening",
+            from: "+15550000001",
+            to: "+15550000002",
+            startedAt: 1,
+            transcript: [],
+            processedEventIds: [],
+          })
+        : undefined,
+    );
+    const parsed = provider.parseWebhookEvent(
+      createContext("CallStatus=in-progress&Direction=outbound-api&CallSid=CA123", {
+        callId: "call-1",
+      }),
+    );
+    expect(parsed.providerResponseBody).toContain("<Start>");
+    expect(parsed.providerResponseBody).toContain('track="inbound_track"');
+    expect(parsed.providerResponseBody).toContain('<Parameter name="token"');
+    expect(parsed.providerResponseBody).toContain("<ConversationRelay");
+    expect(parsed.providerResponseBody).toContain("wss://example.test/voice/cr");
+  });
+  it("never emits hybrid streaming XML for a terminal status callback", () => {
+    const provider = new TwilioProvider(
+      { accountSid: "AC123", authToken: "synthetic-token" },
+      { publicUrl: "https://example.test/voice", streamPath: "/voice/stream", hybridMode: true },
+    );
+    const parsed = provider.parseWebhookEvent(
+      createContext("CallStatus=completed&Direction=outbound-api&CallSid=CA123", {
+        callId: "call-1",
+        type: "status",
+      }),
+    );
+    expect(parsed.providerResponseBody).not.toContain("<ConversationRelay");
+    expect(parsed.providerResponseBody).not.toContain("<Stream");
+  });
+});
+
+it("validates ConversationRelay GET signatures against the exact WSS CR URL", () => {
+  const token = "synthetic-cr-auth-token";
+  const provider = new TwilioProvider(
+    { accountSid: "AC123", authToken: token },
+    {
+      publicUrl: "https://example.test/voice/webhook",
+      streamPath: "/voice/stream",
+      hybridMode: true,
+      crPath: "/voice/cr",
+    },
+  );
+  const url = "https://example.test/voice/cr?callId=call-1&crCallSid=CA123&crToken=synthetic-grant";
+  const signedUrl = url.replace(/^https:/, "wss:");
+  const signature = crypto.createHmac("sha1", token).update(signedUrl).digest("base64");
+  expect(
+    provider.verifyWebhook({
+      headers: { "x-twilio-signature": signature },
+      rawBody: "",
+      url,
+      method: "GET",
+    }).ok,
+  ).toBe(true);
+  expect(
+    provider.verifyWebhook({
+      headers: { "x-twilio-signature": "invalid" },
+      rawBody: "",
+      url,
+      method: "GET",
+    }).ok,
+  ).toBe(false);
 });

@@ -1,10 +1,20 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 // Voice Call tests cover response generator plugin behavior.
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "../api.js";
 import { VoiceCallConfigSchema } from "./config.js";
+import type { ParsedContact } from "./contact-file.js";
 import { generateVoiceResponse } from "./response-generator.js";
+
+const contacts = vi.hoisted(() => ({
+  load: vi.fn(async (_options?: unknown) => [] as ParsedContact[]),
+}));
+vi.mock("./contact-file.js", () => ({
+  loadContactsFileAsync: contacts.load,
+  findContactByPhone: (_phone: string, entries: ParsedContact[]) => entries[0],
+}));
+beforeEach(() => contacts.load.mockReset().mockResolvedValue([]));
 
 type TestSessionEntry = {
   sessionId: string;
@@ -111,10 +121,7 @@ function createAgentRuntime(
       args.onBlockReply?.(payload, { assistantMessageIndex: 0 });
     }
     await args.onBlockReplyFlush?.({ reason: "pre_compaction", attemptAccepted: true });
-    return {
-      payloads,
-      meta: { durationMs: 12, aborted: false },
-    };
+    return { payloads, meta: { durationMs: 12, aborted: false } };
   });
   const runWithWorkAdmission = vi.fn(
     async (
@@ -122,22 +129,25 @@ function createAgentRuntime(
       run: (signal: AbortSignal) => Promise<unknown>,
     ) => await run(new AbortController().signal),
   );
-  const resolveAgentDir = vi.fn((_cfg: OpenClawConfig, agentId: string) => {
-    return `/tmp/openclaw/agents/${agentId}`;
-  });
-  const resolveAgentWorkspaceDir = vi.fn((_cfg: OpenClawConfig, agentId: string) => {
-    return `/tmp/openclaw/workspace/${agentId}`;
-  });
+  const resolveAgentDir = vi.fn(
+    (_cfg: OpenClawConfig, agentId: string) => `/tmp/openclaw/agents/${agentId}`,
+  );
+  const resolveAgentWorkspaceDir = vi.fn(
+    (_cfg: OpenClawConfig, agentId: string) => `/tmp/openclaw/workspace/${agentId}`,
+  );
   const resolveAgentIdentity = vi.fn((_cfg: OpenClawConfig, agentId: string) => ({
     name: `${agentId} tester`,
   }));
-  const resolveStorePath = vi.fn((_store: string | undefined, params: { agentId?: string }) => {
-    return `/tmp/openclaw/${params.agentId ?? "main"}/sessions.json`;
-  });
+  const resolveAgentDisplayIdentity = vi.fn(async () => ({
+    name: "Canonical Workspace Assistant",
+  }));
+  const resolveStorePath = vi.fn(
+    (_store: string | undefined, params: { agentId?: string }) =>
+      `/tmp/openclaw/${params.agentId ?? "main"}/sessions.json`,
+  );
   const resolveSessionFilePath = vi.fn(
-    (_sessionId: string, _entry: unknown, params: { agentId?: string }) => {
-      return `/tmp/openclaw/${params.agentId ?? "main"}/sessions/session.jsonl`;
-    },
+    (_sessionId: string, _entry: unknown, params: { agentId?: string }) =>
+      `/tmp/openclaw/${params.agentId ?? "main"}/sessions/session.jsonl`,
   );
 
   const runtime = {
@@ -148,6 +158,7 @@ function createAgentRuntime(
     resolveAgentDir,
     resolveAgentWorkspaceDir,
     resolveAgentIdentity,
+    resolveAgentDisplayIdentity,
     resolveThinkingDefault: () => "off",
     resolveAgentTimeoutMs: () => 30_000,
     ensureAgentWorkspace: async () => {},
@@ -175,7 +186,7 @@ function createAgentRuntime(
     sessionStore,
     resolveAgentDir,
     resolveAgentWorkspaceDir,
-    resolveAgentIdentity,
+    resolveAgentDisplayIdentity,
     resolveStorePath,
     resolveSessionFilePath,
   };
@@ -927,17 +938,24 @@ describe("generateVoiceResponse", () => {
   });
 
   it.each([
-    { configuredAgentId: "voice", agentId: "main" },
-    { configuredAgentId: undefined, agentId: "voice" },
+    { configuredAgentId: "voice", agentId: "main", responseSystemPrompt: undefined },
+    { configuredAgentId: undefined, agentId: "voice", responseSystemPrompt: undefined },
+    { configuredAgentId: "voice", agentId: "main", responseSystemPrompt: "Explicit persona" },
   ])(
     "uses recorded owner $agentId with config agentId=$configuredAgentId",
-    async ({ configuredAgentId, agentId }) => {
+    async ({ configuredAgentId, agentId, responseSystemPrompt }) => {
+      const workspaceDir = `/tmp/openclaw/workspace/${agentId}`;
+      contacts.load.mockImplementation(async (options) =>
+        (options as { workspaceDir?: string } | undefined)?.workspaceDir === workspaceDir
+          ? [{ name: "演示联系人", phone: "+15550001111", info: "有效工作区背景" }]
+          : [],
+      );
       const {
         runtime,
         runEmbeddedAgent,
         resolveAgentDir,
         resolveAgentWorkspaceDir,
-        resolveAgentIdentity,
+        resolveAgentDisplayIdentity,
         resolveStorePath,
         sessionStore,
       } = createAgentRuntime([{ text: '{"spoken":"Voice agent."}' }]);
@@ -946,6 +964,7 @@ describe("generateVoiceResponse", () => {
       const result = await generateVoiceResponse({
         voiceConfig: VoiceCallConfigSchema.parse({
           agentId: configuredAgentId,
+          responseSystemPrompt,
           responseTimeoutMs: 5000,
         }),
         coreConfig,
@@ -962,10 +981,23 @@ describe("generateVoiceResponse", () => {
       expect(resolveStorePath).toHaveBeenCalledWith(undefined, { agentId });
       expect(resolveAgentDir).toHaveBeenCalledWith(coreConfig, agentId);
       expect(resolveAgentWorkspaceDir).toHaveBeenCalledWith(coreConfig, agentId);
-      expect(resolveAgentIdentity).toHaveBeenCalledWith(coreConfig, agentId);
       const sessionKey = `agent:${agentId}:voice:15550001111`;
       const sessionEntry = expectDefined(sessionStore[sessionKey], "voice session entry");
       const args = requireEmbeddedAgentArgs(runEmbeddedAgent);
+      expect(args.extraSystemPrompt).toMatch(/Known caller: 演示联系人[\s\S]*有效工作区背景/);
+      if (responseSystemPrompt) {
+        expect(args.extraSystemPrompt).toContain(responseSystemPrompt);
+        expect(args.extraSystemPrompt).not.toContain("Canonical Workspace Assistant");
+        expect(resolveAgentDisplayIdentity).not.toHaveBeenCalled();
+      } else {
+        expect(args.extraSystemPrompt).toContain("You are Canonical Workspace Assistant,");
+        expect(args.extraSystemPrompt).not.toContain(`You are ${agentId} tester,`);
+        expect(resolveAgentDisplayIdentity).toHaveBeenCalledWith({
+          cfg: coreConfig,
+          agentId,
+          workspaceDir,
+        });
+      }
       expect(args.agentDir).toBe(`/tmp/openclaw/agents/${agentId}`);
       expect(args.agentId).toBe(agentId);
       expect(args.sessionKey).toBe(sessionKey);

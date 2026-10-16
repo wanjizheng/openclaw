@@ -4,7 +4,9 @@ import { sleepWithAbort } from "openclaw/plugin-sdk/runtime-env";
 import { safeEqualSecret } from "openclaw/plugin-sdk/security-runtime";
 import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { WebhookSecurityConfig } from "../config.js";
-import { getHeader } from "../http-headers.js";
+import { HybridCrAdmission } from "../hybrid/cr-admission.js";
+import { HybridPlayQueue, type CallUpdateApi } from "../hybrid/play-queue.js";
+import { buildHybridInitialTwiml } from "../hybrid/twiml.js";
 import { generateDtmfRedirectTwiml } from "../manager/twiml.js";
 import type { MediaStreamHandler } from "../media-stream.js";
 import type { TelephonyTtsProvider } from "../telephony-tts.js";
@@ -35,8 +37,15 @@ import {
 import { guardedJsonApiRequest, readProviderCallStatus } from "./shared/guarded-json-api.js";
 import { resolveTwilioApiBaseUrl, type TwilioRegion } from "./twilio-region.js";
 import { TwilioApiError, twilioApiRequest } from "./twilio/api.js";
+import {
+  buildHybridPlayNextUrl,
+  createTwilioRequestDedupeKey,
+  resolveTwilioWebSocketUrl,
+} from "./twilio/webhook-routing.js";
 
 export interface TwilioProviderOptions {
+  hybridMode?: boolean;
+  crPath?: string;
   /** Allow ngrok free tier compatibility mode (loopback only, less secure) */
   allowNgrokFreeTierLoopbackBypass?: boolean;
   /** Override public URL for signature verification */
@@ -51,27 +60,6 @@ export interface TwilioProviderOptions {
 
 const TWILIO_CALL_NOT_IN_PROGRESS_CODE = 21220;
 const TWILIO_CALL_UPDATE_RETRY_DELAYS_MS = [250, 750] as const;
-
-function createTwilioRequestDedupeKey(ctx: WebhookContext, verifiedRequestKey?: string): string {
-  if (verifiedRequestKey) {
-    return verifiedRequestKey;
-  }
-
-  const signature = getHeader(ctx.headers, "x-twilio-signature") ?? "";
-  const params = new URLSearchParams(ctx.rawBody);
-  const callSid = params.get("CallSid") ?? "";
-  const callStatus = params.get("CallStatus") ?? "";
-  const direction = params.get("Direction") ?? "";
-  const callId = normalizeOptionalString(ctx.query?.callId) ?? "";
-  const flow = normalizeOptionalString(ctx.query?.flow) ?? "";
-  const turnToken = normalizeOptionalString(ctx.query?.turnToken) ?? "";
-  return `twilio:fallback:${crypto
-    .createHash("sha256")
-    .update(
-      `${signature}\n${callSid}\n${callStatus}\n${direction}\n${callId}\n${flow}\n${turnToken}\n${ctx.rawBody}`,
-    )
-    .digest("hex")}`;
-}
 
 type TwilioProviderConfig = {
   accountSid?: string;
@@ -95,6 +83,12 @@ export class TwilioProvider implements VoiceCallProvider {
 
   private mediaStreamHandler: MediaStreamHandler | null = null;
   private playbackMarkSequence = 0;
+  private hybridQueue: HybridPlayQueue | null = null;
+  private isCurrentOwner: () => boolean = () => true;
+  readonly hybridCr = new HybridCrAdmission(() => this.isCurrentOwner());
+  setLifecycleGuard(guard: () => boolean): void {
+    this.isCurrentOwner = guard;
+  }
 
   private readonly callStreamMap = new Map<string, string>();
   /** Per-call tokens for media stream authentication */
@@ -121,6 +115,8 @@ export class TwilioProvider implements VoiceCallProvider {
     if (resolvedCallId) {
       this.twimlStorage.delete(resolvedCallId);
     }
+    this.hybridCr.revoke(providerCallId);
+    this.hybridQueue?.clear(providerCallId);
     this.callWebhookUrls.delete(providerCallId);
     this.callStreamMap.delete(providerCallId);
     this.streamAuthTokens.delete(providerCallId);
@@ -142,13 +138,77 @@ export class TwilioProvider implements VoiceCallProvider {
     });
     this.options = options;
 
-    if (options.publicUrl) {
-      this.currentPublicUrl = options.publicUrl;
-    }
+    this.currentPublicUrl = options.publicUrl || null;
   }
 
   setPublicUrl(url: string): void {
     this.currentPublicUrl = url;
+  }
+
+  getPublicUrl(): string | null {
+    return this.currentPublicUrl;
+  }
+
+  // ── Hybrid mode ─────────────────────────────────────────────────────────
+
+  get isHybridMode(): boolean {
+    return this.options.hybridMode === true;
+  }
+
+  /** Lazily-constructed hybrid play queue (null when hybrid disabled). */
+  getHybridQueue(): HybridPlayQueue | null {
+    if (!this.isHybridMode) {
+      return null;
+    }
+    if (!this.hybridQueue) {
+      const api: CallUpdateApi = {
+        updateCallTwiml: (sid, twiml, isCurrent) => this.updateCallTwiml(sid, twiml, isCurrent),
+        getPlayNextUrl: (_sid, cid) => buildHybridPlayNextUrl(this.currentPublicUrl, cid),
+        getConversationRelayOptions: (sid) =>
+          this.hybridCr.issue(this.currentPublicUrl, this.options.crPath, sid),
+      };
+      this.hybridQueue = new HybridPlayQueue(api);
+    }
+    return this.hybridQueue;
+  }
+
+  /** Whether a hybrid play queue is active for this call SID. */
+  hasActiveHybridQueue(callSid: string): boolean {
+    return this.hybridQueue?.has(callSid) ?? false;
+  }
+
+  /** Abort hybrid playback (used by webhook on barge-in). */
+  abortHybridPlay(callSid: string): Promise<void> {
+    return this.hybridQueue?.abort(callSid) ?? Promise.resolve();
+  }
+
+  /** Mark hybrid sentences done for a call (no more queued; resume CR after drain). */
+  markHybridSentencesDone(callSid: string, endCall = false): void {
+    this.hybridQueue?.markDone(callSid, endCall);
+  }
+
+  /** Handle the playAction redirect callback. */
+  handlePlayNextAction(callSid: string, callId?: string, token?: string, step?: number): string {
+    const q = this.getHybridQueue();
+    if (!q) {
+      return TwilioProvider.PAUSE_TWIML;
+    }
+    return q.handlePlayNextAction(callSid, callId, token, step);
+  }
+
+  /** Update a live call's TwiML via Twilio Calls API. */
+  async updateCallTwiml(callSid: string, twiml: string, isCurrent?: () => boolean): Promise<void> {
+    await this.updateLiveCallTwiml(
+      callSid,
+      twiml,
+      "hybrid playback",
+      () =>
+        this.isCurrentOwner() && this.callWebhookUrls.has(callSid) && (!isCurrent || isCurrent()),
+    );
+  }
+
+  reconnectHybridRelay(url: URL, callSid: string) {
+    return this.hybridCr.reconnect(url, callSid, this.currentPublicUrl, this.options.crPath);
   }
 
   setTTSProvider(provider: TelephonyTtsProvider): void {
@@ -177,7 +237,10 @@ export class TwilioProvider implements VoiceCallProvider {
   }
 
   isConversationStreamConnectEnabled(): boolean {
-    return Boolean(this.mediaStreamHandler && this.getStreamUrl());
+    return Boolean(
+      this.mediaStreamHandler &&
+      resolveTwilioWebSocketUrl(this.currentPublicUrl, this.options.streamPath),
+    );
   }
 
   isValidStreamToken(callSid: string, token?: string): boolean {
@@ -216,25 +279,38 @@ export class TwilioProvider implements VoiceCallProvider {
     providerCallId: string,
     twiml: string,
     operation: string,
+    isCurrent?: () => boolean,
   ): Promise<void> {
-    await retryAsync(() => this.apiRequest(`/Calls/${providerCallId}.json`, { Twiml: twiml }), {
-      attempts: TWILIO_CALL_UPDATE_RETRY_DELAYS_MS.length + 1,
-      minDelayMs: 0,
-      shouldRetry: (err) =>
-        err instanceof TwilioApiError && err.twilioCode === TWILIO_CALL_NOT_IN_PROGRESS_CODE,
-      delayMs: ({ attempt }) => TWILIO_CALL_UPDATE_RETRY_DELAYS_MS[attempt - 1] ?? 0,
-      onRetry: ({ delayMs }) => {
-        console.warn(
-          `[voice-call] Twilio ${operation} update hit call state race (21220); retrying in ${delayMs}ms`,
-        );
+    await retryAsync(
+      () => {
+        if (isCurrent && !isCurrent()) {
+          throw new Error("Hybrid playback superseded or service stopped");
+        }
+        return this.apiRequest(`/Calls/${providerCallId}.json`, { Twiml: twiml });
       },
-      sleep: (delayMs) => sleepWithAbort(delayMs),
-    });
+      {
+        attempts: TWILIO_CALL_UPDATE_RETRY_DELAYS_MS.length + 1,
+        minDelayMs: 0,
+        shouldRetry: (err) =>
+          err instanceof TwilioApiError && err.twilioCode === TWILIO_CALL_NOT_IN_PROGRESS_CODE,
+        delayMs: ({ attempt }) => TWILIO_CALL_UPDATE_RETRY_DELAYS_MS[attempt - 1] ?? 0,
+        onRetry: ({ delayMs }) => {
+          console.warn(
+            `[voice-call] Twilio ${operation} update hit call state race (21220); retrying in ${delayMs}ms`,
+          );
+        },
+        sleep: (delayMs) => sleepWithAbort(delayMs),
+      },
+    );
   }
 
   verifyWebhook(ctx: WebhookContext): WebhookVerificationResult {
     const result = verifyTwilioWebhook(ctx, this.authToken, {
-      publicUrl: this.currentPublicUrl || undefined,
+      publicUrl:
+        ctx.method === "GET" && this.isHybridMode
+          ? (resolveTwilioWebSocketUrl(this.currentPublicUrl, this.options.crPath ?? "/voice/cr") ??
+            undefined)
+          : this.currentPublicUrl || undefined,
       allowNgrokFreeTierLoopbackBypass: this.options.allowNgrokFreeTierLoopbackBypass ?? false,
       skipVerification: this.options.skipVerification,
       allowedHosts: this.options.webhookSecurity?.allowedHosts,
@@ -384,7 +460,7 @@ export class TwilioProvider implements VoiceCallProvider {
   <Enqueue waitUrl="/voice/hold-music">hold-queue</Enqueue>
 </Response>`;
 
-  private generateTwimlResponse(ctx: WebhookContext): string {
+  generateTwimlResponse(ctx: WebhookContext): string {
     const params = new URLSearchParams(ctx.rawBody);
     const isStatusCallback = normalizeOptionalString(ctx.query?.type) === "status";
     const callId = normalizeOptionalString(ctx.query?.callId);
@@ -393,7 +469,9 @@ export class TwilioProvider implements VoiceCallProvider {
     const callSid = params.get("CallSid") || undefined;
     const storedTwiml = callId ? this.twimlStorage.get(callId) : undefined;
     // Preserve eager URL validation even for callbacks that return non-streaming TwiML.
-    const streamUrl = callSid ? this.getStreamUrl() : null;
+    const streamUrl = callSid
+      ? resolveTwilioWebSocketUrl(this.currentPublicUrl, this.options.streamPath)
+      : null;
 
     if (callId && !isStatusCallback && storedTwiml) {
       this.twimlStorage.delete(callId);
@@ -415,6 +493,13 @@ export class TwilioProvider implements VoiceCallProvider {
     }
     const url = new URL(streamUrl);
     url.searchParams.set("token", this.getStreamAuthToken(callSid));
+    if (this.isHybridMode) {
+      const cr = this.hybridCr.issue(this.currentPublicUrl, this.options.crPath, callSid);
+      if (cr) {
+        return buildHybridInitialTwiml({ streamUrl: url.toString(), cr });
+      }
+      return TwilioProvider.PAUSE_TWIML;
+    }
     return this.getStreamConnectXml(url.toString());
   }
 
@@ -435,23 +520,6 @@ export class TwilioProvider implements VoiceCallProvider {
       `[voice-call] Twilio initial TwiML consumed for call ${callId} (kind=pre-connect, callSid=${callSid ?? "unknown"})`,
     );
     return storedTwiml;
-  }
-
-  private getStreamUrl(): string | null {
-    if (!this.currentPublicUrl || !this.options.streamPath) {
-      return null;
-    }
-
-    const url = new URL(this.currentPublicUrl);
-    const origin = url.origin;
-
-    const wsOrigin = origin.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://");
-
-    const path = this.options.streamPath.startsWith("/")
-      ? this.options.streamPath
-      : `/${this.options.streamPath}`;
-
-    return `${wsOrigin}${path}`;
   }
 
   private getStreamAuthToken(callSid: string): string {
@@ -549,6 +617,19 @@ export class TwilioProvider implements VoiceCallProvider {
    * 2. TwiML <Say>: fallback only when there is no active stream for the call.
    */
   async playTts(input: PlayTtsInput): Promise<void> {
+    if (input.isCurrent && !input.isCurrent()) {
+      throw new Error("Automatic reply superseded");
+    }
+    if (this.isHybridMode && input.audioUrl) {
+      const queue = this.getHybridQueue()!;
+      const wasEmpty = !queue.has(input.providerCallId);
+      queue.enqueue(input.providerCallId, input.audioUrl, input.callId, input.isCurrent);
+      queue.markDone(input.providerCallId, input.endCall === true);
+      if (wasEmpty) {
+        await queue.triggerFirst(input.providerCallId);
+      }
+      return;
+    }
     const streamSid = this.callStreamMap.get(input.providerCallId);
     if (streamSid) {
       if (!this.ttsProvider || !this.mediaStreamHandler) {
