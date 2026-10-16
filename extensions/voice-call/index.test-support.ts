@@ -47,7 +47,7 @@ export function createVoiceCallCliTestHarness(logger: OpenClawPluginApi["logger"
     if (!registrar) {
       throw new Error("voice-call CLI registrar was not registered");
     }
-    await registrar({ program, config: {}, workspaceDir: undefined, logger });
+    await registrar({ program, parentPath: [], config: {}, workspaceDir: undefined, logger });
   }
 
   async function runVoiceCallCli(
