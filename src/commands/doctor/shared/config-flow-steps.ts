@@ -8,6 +8,7 @@ import {
 import { restoreEnvVarRefsFromResolved } from "../../../config/env-preserve.js";
 import {
   collectDestructiveChanges,
+  parseConfigPathKey,
   type ConfigPath,
 } from "../../../config/io.destructive-paths.js";
 import { coerceConfig } from "../../../config/io.read-helpers.js";
@@ -126,7 +127,7 @@ export function applyLegacyCompatibilityStep(params: {
     },
     issueLines: [...issueLines, ...(warnings ?? [])],
     changeLines: changes,
-    removedPaths: [...destructive].map((key) => JSON.parse(key) as ConfigPath),
+    removedPaths: [...destructive].map((key) => parseConfigPathKey(key)),
     partiallyValid: partiallyValid === true ? true : undefined,
   };
 }

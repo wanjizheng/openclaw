@@ -595,7 +595,9 @@ it.each(
     });
     const originalDiagnostic = diagnostic.message;
     Atomics.store(lastBeat, 0, BigInt(Date.now()));
-    expect(() => assertStateDatabaseAccessAllowed(databasePath)).toThrow(originalDiagnostic);
+    expect(() => assertStateDatabaseAccessAllowed(databasePath)).toThrow(
+      expect.objectContaining({ cause: diagnostic }),
+    );
     expect(diagnostic.message).toBe(originalDiagnostic);
     expect(() => owner.assertCurrent()).toThrow(reason);
     expect(() => acquireStateDatabaseSchemaLease(databasePath)).toThrow(

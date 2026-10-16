@@ -47,6 +47,7 @@ import {
   formatConfig,
   writeConfigFixture,
 } from "./io.write-config.test-support.js";
+import { registerConfigWriteDestructiveAuthorityTests } from "./io.write-destructive-authority.test-support.js";
 import { registerConfigWritePreflightTests } from "./io.write-preflight.test-support.js";
 import { replaceConfigFile, transformConfigFile, transformConfigFileWithRetry } from "./mutate.js";
 import { ConfigMutationConflictError } from "./mutation-conflict.js";
@@ -1068,91 +1069,12 @@ describe("config io write", () => {
     await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(malformedRaw);
   });
 
-  itWithHome("bounds migration size-drop authority to its exact paths", async (home) => {
-    const original = {
-      gateway: { mode: "local" as const },
-      channels: {
-        telegram: {
-          enabled: true,
-          allowFrom: Array.from({ length: 80 }, (_, i) => `telegram:${i}`),
-        },
-      },
-      tools: { allow: ["exec", "read", "write"] },
-    };
-    await writeConfigFixture(home, original);
-    const configPath = configPathForHome(home);
-    const originalRaw = await fs.readFile(configPath, "utf-8");
-    const io = createHomeConfigIO(home, { env: { VITEST: "true" } as NodeJS.ProcessEnv });
-    const candidate = { gateway: original.gateway, tools: original.tools };
-    await expectConfigWriteRejected(
-      io.writeConfigFile(candidate, {
-        allowConfigSizeDrop: true,
-        authorizedDestructivePaths: [["channels", "telegram"]],
-      }),
-    );
-    await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(originalRaw);
-    await expectConfigWriteRejected(
-      io.writeConfigFile(
-        { gateway: original.gateway },
-        {
-          allowConfigSizeDrop: true,
-          authorizedDestructivePaths: [["channels"]],
-        },
-      ),
-    );
-    await expect(fs.readFile(configPath, "utf-8")).resolves.toBe(originalRaw);
-    await io.writeConfigFile(candidate, {
-      allowConfigSizeDrop: true,
-      authorizedDestructivePaths: [["channels"]],
-    });
-    const persisted = JSON.parse(await fs.readFile(configPath, "utf-8"));
-    expect(persisted.channels).toBeUndefined();
-    expect(persisted.tools).toEqual(original.tools);
+  registerConfigWriteDestructiveAuthorityTests({
+    itWithHome,
+    createHomeConfigIO,
+    createExistingConfigSnapshot,
+    expectConfigWriteRejected,
   });
-
-  itWithHome(
-    "allows intentional size-drop writes without disabling gateway-mode protection",
-    async (home) => {
-      const configPath = configPathForHome(home);
-      await fs.mkdir(path.dirname(configPath), { recursive: true });
-      const original = {
-        meta: { lastTouchedVersion: "2026.4.30" },
-        gateway: { mode: "local" },
-        channels: {
-          telegram: {
-            enabled: true,
-            allowFrom: Array.from({ length: 80 }, (_, index) => `telegram:${index}`),
-          },
-        },
-      } satisfies ConfigFileSnapshot["config"];
-      const originalRaw = formatConfig(original);
-      await fs.writeFile(configPath, originalRaw, "utf-8");
-      const io = createHomeConfigIO(home, {
-        env: { VITEST: "true" } as NodeJS.ProcessEnv,
-      });
-      const baseSnapshot = createExistingConfigSnapshot(configPath, original, originalRaw);
-
-      const acceptedWrite = await io.writeConfigFile(
-        { meta: original.meta, gateway: { mode: "local" } },
-        {
-          allowConfigSizeDrop: true,
-          baseSnapshot,
-        },
-      );
-      expect(acceptedWrite.persistedConfig.gateway).toEqual({ mode: "local" });
-      const acceptedSnapshot = await io.readConfigFileSnapshot();
-
-      await expectConfigWriteRejected(
-        io.writeConfigFile(
-          { meta: original.meta },
-          {
-            allowConfigSizeDrop: true,
-            baseSnapshot: acceptedSnapshot,
-          },
-        ),
-      );
-    },
-  );
 
   itWithHome(
     "returns the read-time environment snapshot when invalid reads fall back after resolution",

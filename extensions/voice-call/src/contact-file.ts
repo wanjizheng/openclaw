@@ -28,6 +28,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { normalizePhoneNumber } from "./allowlist.js";
 
 export type ParsedContact = {
@@ -164,7 +165,8 @@ export async function loadContactsFileAsync(
     if (
       typeof source !== "string" &&
       filePath !== DEFAULT_CONTACTS_PATH &&
-      (error as NodeJS.ErrnoException).code === "ENOENT"
+      isRecord(error) &&
+      error.code === "ENOENT"
     ) {
       return loadContactsFileAsync(DEFAULT_CONTACTS_PATH);
     }

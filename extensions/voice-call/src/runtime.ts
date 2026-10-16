@@ -305,6 +305,7 @@ export async function createVoiceCallRuntime(params: {
 
   const provider = await resolveProvider(config);
   if (provider.name === "twilio") {
+    // SAFETY: resolveProvider constructs TwilioProvider for the twilio discriminator checked above.
     (provider as TwilioProvider).setLifecycleGuard(
       () => !params.scheduler.signal.aborted && (params.isCurrent?.() ?? true),
     );

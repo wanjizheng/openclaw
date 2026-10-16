@@ -1,19 +1,10 @@
 import http from "node:http";
 import { URL } from "node:url";
-import { pruneMapToMaxSize } from "openclaw/plugin-sdk/collection-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { createLazyRuntimeModule } from "openclaw/plugin-sdk/lazy-runtime";
-import {
-  asDateTimestampMs,
-  resolveExpiresAtMsFromDurationMs,
-} from "openclaw/plugin-sdk/number-runtime";
 import type { PluginLogger, PluginServiceSchedulerV1 } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfiguredCapabilityProvider } from "openclaw/plugin-sdk/provider-selection-runtime";
-import type { TalkEvent } from "openclaw/plugin-sdk/realtime-voice";
-import {
-  normalizeOptionalString,
-  normalizeStringEntries,
-} from "openclaw/plugin-sdk/string-coerce-runtime";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   createWebhookInFlightLimiter,
   normalizeWebhookPath,
@@ -43,16 +34,23 @@ import { MediaStreamHandler } from "./media-stream.js";
 import type { VoiceCallProvider } from "./providers/base.js";
 import { isProviderStatusTerminal } from "./providers/shared/call-status.js";
 import type { TwilioProvider } from "./providers/twilio.js";
-import { normalizeProxyIp } from "./proxy-ip.js";
+import { normalizeProxyIp, resolveForwardedClientIp } from "./proxy-ip.js";
 import { resolveCallAgentId } from "./resolve-call-agent-id.js";
 import type { CallRecord, NormalizedEvent, WebhookContext } from "./types.js";
 import type { WebhookResponsePayload } from "./webhook.types.js";
 import type { RealtimeCallHandler } from "./webhook/realtime-handler.js";
+import {
+  buildRealtimeRejectedTwiML,
+  buildTwilioReplayTwiML,
+  normalizeWebhookResponse,
+  WebhookResponseCache,
+} from "./webhook/response-cache.js";
 import { startStaleCallReaper } from "./webhook/stale-call-reaper.js";
 import {
   StreamDisconnectGrace,
   type StreamDisconnectLifecycle,
 } from "./webhook/stream-disconnect-grace.js";
+import { appendRecentTalkEventMetadata } from "./webhook/talk-event-metadata.js";
 
 const MAX_WEBHOOK_BODY_BYTES = WEBHOOK_BODY_READ_DEFAULTS.preAuth.maxBytes;
 const WEBHOOK_BODY_TIMEOUT_MS = WEBHOOK_BODY_READ_DEFAULTS.preAuth.timeoutMs;
@@ -66,100 +64,8 @@ const loadResponseGeneratorModule = createLazyRuntimeModule(
   () => import("./response-generator.js"),
 );
 
-function appendRecentTalkEventMetadata(
-  metadata: CallRecord["metadata"],
-  event: TalkEvent,
-): CallRecord["metadata"] {
-  const previous = metadata ?? {};
-  const recent = Array.isArray(previous.recentTalkEvents)
-    ? previous.recentTalkEvents.filter(
-        (entry): entry is { at: string; type: string; sessionId: string; turnId?: string } =>
-          Boolean(entry) && typeof entry === "object" && !Array.isArray(entry),
-      )
-    : [];
-  recent.push({
-    at: event.timestamp,
-    type: event.type,
-    sessionId: event.sessionId,
-    turnId: event.turnId,
-  });
-  return {
-    ...previous,
-    lastTalkEventAt: event.timestamp,
-    lastTalkEventType: event.type,
-    recentTalkEvents: recent.slice(-10),
-  };
-}
-
 function buildRequestUrl(requestUrl: string | undefined): URL {
   return new URL(requestUrl ?? "/", "http://localhost");
-}
-
-function resolveForwardedClientIp(
-  request: http.IncomingMessage,
-  normalizedTrustedProxyIps: ReadonlySet<string>,
-): string | undefined {
-  const forwardedFor = getHeader(request.headers, "x-forwarded-for");
-  if (forwardedFor) {
-    const forwardedIps = normalizeStringEntries(forwardedFor.split(","));
-    if (forwardedIps.length > 0) {
-      for (let index = forwardedIps.length - 1; index >= 0; index -= 1) {
-        const hop = forwardedIps[index];
-        if (!normalizedTrustedProxyIps.has(normalizeProxyIp(hop) ?? "")) {
-          return hop;
-        }
-      }
-      return forwardedIps[0];
-    }
-  }
-
-  const realIp = getHeader(request.headers, "x-real-ip")?.trim();
-  return realIp || undefined;
-}
-
-function normalizeWebhookResponse(parsed: {
-  statusCode?: number;
-  providerResponseHeaders?: Record<string, string>;
-  providerResponseBody?: string;
-}): WebhookResponsePayload {
-  return {
-    statusCode: parsed.statusCode ?? 200,
-    headers: parsed.providerResponseHeaders,
-    body: parsed.providerResponseBody ?? "OK",
-  };
-}
-
-function buildRealtimeRejectedTwiML(): WebhookResponsePayload {
-  return {
-    statusCode: 200,
-    headers: { "Content-Type": "text/xml" },
-    body: '<?xml version="1.0" encoding="UTF-8"?><Response><Reject reason="rejected" /></Response>',
-  };
-}
-
-function buildTwilioReplayTwiML(): WebhookResponsePayload {
-  return {
-    statusCode: 200,
-    headers: { "Content-Type": "text/xml" },
-    body: '<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
-  };
-}
-
-const WEBHOOK_REPLAY_RESPONSE_TTL_MS = 10 * 60 * 1000;
-const WEBHOOK_REPLAY_RESPONSE_MAX_ENTRIES = 10_000;
-const WEBHOOK_REPLAY_RESPONSE_PRUNE_INTERVAL = 64;
-
-type CachedWebhookResponse = {
-  expiresAt: number;
-  response: Promise<WebhookResponsePayload>;
-};
-
-function cloneWebhookResponsePayload(payload: WebhookResponsePayload): WebhookResponsePayload {
-  return {
-    statusCode: payload.statusCode,
-    headers: payload.headers ? { ...payload.headers } : undefined,
-    body: payload.body,
-  };
 }
 
 export class VoiceCallWebhookServer {
@@ -177,8 +83,7 @@ export class VoiceCallWebhookServer {
   // Revoke pending transcript replies before persistence has created a response guard.
   private readonly streamSpeechGenerations = new WeakMap<CallRecord, symbol>();
   private realtimeHandler: RealtimeCallHandler | null = null;
-  private replayResponses = new Map<string, CachedWebhookResponse>();
-  private replayResponseCacheCalls = 0;
+  private readonly replayResponses: WebhookResponseCache;
 
   constructor(
     private readonly scheduler: PluginServiceSchedulerV1,
@@ -191,7 +96,9 @@ export class VoiceCallWebhookServer {
     logger?: PluginLogger,
   ) {
     this.config = normalizeVoiceCallConfig(config);
+    this.replayResponses = new WebhookResponseCache(provider.name);
     if (provider.name === "twilio" && this.config.streaming.hybridMode) {
+      // SAFETY: the provider factory binds the twilio name to TwilioProvider; callers check that name before using this capability.
       (provider as TwilioProvider).hybridCr.bind((sid) => manager.getCallByProviderCallId(sid));
     }
     const rawLogger = logger ?? {
@@ -299,6 +206,7 @@ export class VoiceCallWebhookServer {
     if (this.provider.name !== "twilio") {
       return undefined;
     }
+    // SAFETY: the provider factory binds the twilio name to TwilioProvider; callers check that name before using this capability.
     const provider = this.provider as TwilioProvider;
     const call = this.manager.getCallByProviderCallId(providerCallId);
     return call && provider.hasRegisteredStream(providerCallId, streamSid)
@@ -384,6 +292,7 @@ export class VoiceCallWebhookServer {
         if (!call) {
           return false;
         }
+        // SAFETY: the provider factory binds the twilio name to TwilioProvider; callers check that name before using this capability.
         const twilio = this.provider as TwilioProvider;
         if (!twilio.isValidStreamToken(callId, token)) {
           this.logger.warn(`Rejecting media stream: invalid token for ${callId}`);
@@ -458,6 +367,7 @@ export class VoiceCallWebhookServer {
         }
 
         if (this.provider.name === "twilio") {
+          // SAFETY: the provider factory binds the twilio name to TwilioProvider; callers check that name before using this capability.
           (this.provider as TwilioProvider).registerCallStream(callId, streamSid);
         }
       },
@@ -472,6 +382,7 @@ export class VoiceCallWebhookServer {
       onDisconnect: (callId, streamSid) => {
         this.logger.info(`Media stream disconnected: ${callId} (${streamSid})`);
         if (this.provider.name === "twilio") {
+          // SAFETY: the provider factory binds the twilio name to TwilioProvider; callers check that name before using this capability.
           const twilio = this.provider as TwilioProvider;
           twilio.unregisterCallStream(callId, streamSid);
           const call = this.manager.getCallByProviderCallId(callId);
@@ -496,6 +407,7 @@ export class VoiceCallWebhookServer {
       this.crHandler = new HybridCrHandler({
         manager: this.manager,
         scheduler: this.scheduler,
+        // SAFETY: the provider factory binds the twilio name to TwilioProvider; callers check that name before using this capability.
         admission: (this.provider as TwilioProvider).hybridCr,
         speakInitialMessage: (sid) => this.manager.speakInitialMessage(sid),
       });
@@ -544,6 +456,7 @@ export class VoiceCallWebhookServer {
             this.provider.name === "twilio" &&
             path === this.config.streaming.crPath
           ) {
+            // SAFETY: the provider factory binds the twilio name to TwilioProvider; callers check that name before using this capability.
             const origin = (this.provider as TwilioProvider).getPublicUrl();
             if (
               !origin ||
@@ -559,6 +472,7 @@ export class VoiceCallWebhookServer {
               rejectWebSocketUpgrade(socket, { status: 401 });
               return;
             }
+            // SAFETY: the provider factory binds the twilio name to TwilioProvider; callers check that name before using this capability.
             const admission = (this.provider as TwilioProvider).hybridCr.claim(
               new URL(request.url ?? "/", origin),
             );
@@ -636,6 +550,7 @@ export class VoiceCallWebhookServer {
     this.crHandler?.close();
     this.crHandler = null;
     if (this.provider.name === "twilio" && this.config.streaming.hybridMode) {
+      // SAFETY: the provider factory binds the twilio name to TwilioProvider; callers check that name before using this capability.
       (this.provider as TwilioProvider).hybridCr.invalidateAll();
     }
     this.streamDisconnectGrace.close();
@@ -797,7 +712,7 @@ export class VoiceCallWebhookServer {
       const isReplay = Boolean(verification.isReplay);
       if (isReplay) {
         this.logger.warn("Replay detected; skipping event side effects");
-        const cachedResponse = await this.getCachedReplayResponse(verification.verifiedRequestKey);
+        const cachedResponse = await this.replayResponses.get(verification.verifiedRequestKey);
         if (cachedResponse) {
           return cachedResponse;
         }
@@ -814,7 +729,8 @@ export class VoiceCallWebhookServer {
         ) {
           const sid = new URLSearchParams(ctx.rawBody).get("CallSid") ?? "";
           const cr = !this.scheduler.signal.aborted
-            ? (this.provider as TwilioProvider).reconnectHybridRelay(new URL(ctx.url), sid)
+            ? // SAFETY: the provider factory binds the twilio name to TwilioProvider; callers check that name before using this capability.
+              (this.provider as TwilioProvider).reconnectHybridRelay(new URL(ctx.url), sid)
             : null;
           return cr
             ? {
@@ -844,6 +760,7 @@ export class VoiceCallWebhookServer {
           return {
             statusCode: 200,
             headers: { "Content-Type": "application/xml" },
+            // SAFETY: the provider factory binds the twilio name to TwilioProvider; callers check that name before using this capability.
             body: (this.provider as TwilioProvider).handlePlayNextAction(
               sid,
               call.callId,
@@ -891,6 +808,7 @@ export class VoiceCallWebhookServer {
 
         if (this.config.streaming.hybridMode && this.provider.name === "twilio") {
           // Inbound manager IDs are allocated while processing events. Issue only after exact admission.
+          // SAFETY: the provider factory binds the twilio name to TwilioProvider; callers check that name before using this capability.
           parsed.providerResponseBody = (this.provider as TwilioProvider).generateTwimlResponse(
             ctx,
           );
@@ -902,7 +820,7 @@ export class VoiceCallWebhookServer {
         return await buildResponse();
       }
 
-      return await this.cacheReplayResponse(
+      return await this.replayResponses.cache(
         verification.verifiedRequestKey,
         buildResponse,
         verification.releaseReplay,
@@ -917,80 +835,6 @@ export class VoiceCallWebhookServer {
     } finally {
       this.webhookInFlightLimiter.release(inFlightKey);
     }
-  }
-
-  private pruneReplayResponses(rawNow: number): void {
-    const now = asDateTimestampMs(rawNow);
-    if (now !== undefined) {
-      for (const [key, entry] of this.replayResponses) {
-        if (entry.expiresAt <= now) {
-          this.replayResponses.delete(key);
-        }
-      }
-    }
-    pruneMapToMaxSize(this.replayResponses, WEBHOOK_REPLAY_RESPONSE_MAX_ENTRIES);
-  }
-
-  private async getCachedReplayResponse(key: string): Promise<WebhookResponsePayload | null> {
-    const now = asDateTimestampMs(Date.now());
-    const entry = this.replayResponses.get(key);
-    if (!entry || now === undefined) {
-      return null;
-    }
-    if (entry.expiresAt <= now) {
-      this.replayResponses.delete(key);
-      return null;
-    }
-    return cloneWebhookResponsePayload(await entry.response);
-  }
-
-  private async cacheReplayResponse(
-    key: string,
-    buildResponse: () => Promise<WebhookResponsePayload>,
-    releaseReplay?: () => void,
-    replayPolicy: "token-free" | "exact-cr-action" = "token-free",
-  ): Promise<WebhookResponsePayload> {
-    const now = Date.now();
-    const expiresAt = resolveExpiresAtMsFromDurationMs(WEBHOOK_REPLAY_RESPONSE_TTL_MS, {
-      nowMs: now,
-    });
-    this.replayResponseCacheCalls += 1;
-    if (this.replayResponseCacheCalls % WEBHOOK_REPLAY_RESPONSE_PRUNE_INTERVAL === 0) {
-      this.pruneReplayResponses(now);
-    }
-
-    let cachedEntry: CachedWebhookResponse | undefined;
-    const ownerResponse = buildResponse()
-      .then(cloneWebhookResponsePayload)
-      .catch((err: unknown) => {
-        if (cachedEntry && this.replayResponses.get(key) === cachedEntry) {
-          this.replayResponses.delete(key);
-        }
-        releaseReplay?.();
-        throw err;
-      });
-    // Only the authenticated CR action branch returns CR-only reconnect instructions.
-    // Retrying its lost HTTP response reuses the SAME grant, without minting or extending it.
-    // Initial/media TwiML remains token-free for replay waiters.
-    const response = ownerResponse.then((payload) =>
-      this.provider.name === "twilio" &&
-      !(replayPolicy === "exact-cr-action" && payload.statusCode === 200)
-        ? buildTwilioReplayTwiML()
-        : cloneWebhookResponsePayload(payload),
-    );
-    // Preserve rejection for concurrent waiters without creating an orphaned rejection.
-    void response.catch(() => {});
-    if (expiresAt !== undefined) {
-      cachedEntry = {
-        expiresAt,
-        response,
-      };
-      this.replayResponses.set(key, cachedEntry);
-    }
-    if (this.replayResponses.size > WEBHOOK_REPLAY_RESPONSE_MAX_ENTRIES) {
-      this.pruneReplayResponses(now);
-    }
-    return cloneWebhookResponsePayload(await ownerResponse);
   }
 
   private verifyPreAuthWebhookHeaders(headers: http.IncomingHttpHeaders): string | undefined {

@@ -15,6 +15,22 @@ export function configPathKey(path: ConfigPath): string {
   return JSON.stringify(path);
 }
 
+/** Decode only the structural path encoding emitted by configPathKey. */
+export function parseConfigPathKey(key: string): ConfigPath {
+  const components: unknown = JSON.parse(key);
+  if (
+    !Array.isArray(components) ||
+    !components.every(
+      (component: unknown): component is string | number =>
+        typeof component === "string" ||
+        (typeof component === "number" && Number.isSafeInteger(component) && component >= 0),
+    )
+  ) {
+    throw new Error("Invalid structural config path encoding");
+  }
+  return components;
+}
+
 export function configPathHasPrefix(path: ConfigPath, prefix: ConfigPath): boolean {
   if (prefix.length > path.length) {
     return false;
@@ -98,7 +114,7 @@ export function resolveWriterManagedConfigPathsForWrite(snapshot: unknown): Conf
   collectDestructiveChanges(snapshot, managedOnlyOutput, [], destructive);
   const out: ConfigPath[] = [];
   for (const key of destructive) {
-    out.push(JSON.parse(key) as ConfigPath);
+    out.push(parseConfigPathKey(key));
   }
   return out;
 }
@@ -118,7 +134,7 @@ export function collectUnauthorizedDestructivePaths(params: {
     ...resolveWriterManagedConfigPathsForWrite(params.before),
   ];
   return [...destructive].filter((key) => {
-    const path = JSON.parse(key) as ConfigPath;
+    const path = parseConfigPathKey(key);
     return !authorized.some((prefix) => configPathHasPrefix(path, prefix));
   });
 }
@@ -130,17 +146,18 @@ export function collectUnauthorizedDestructivePathsForWrite(
   options: Pick<ConfigWriteOptions, "lastTouchedVersionOverride" | "authorizedDestructivePaths">,
   env: NodeJS.ProcessEnv,
 ): string[] {
-  if (!snapshot.exists) {
+  if (!snapshot.exists || options.authorizedDestructivePaths === undefined) {
+    return [];
+  }
+  const parsed = snapshot.parsed;
+  if (!isRecord(parsed)) {
+    // Invalid roots belong to the writer's existing rejection/audit and explicit
+    // repair flow, not to structural path authority for valid config objects.
     return [];
   }
   return collectUnauthorizedDestructivePaths({
     // A canonical version change (e.g. 2026.7.1-2 -> 2026.10.3) is writer-owned.
-    before: stampConfigWriteMetadata(
-      snapshot.parsed as OpenClawConfig,
-      options.lastTouchedVersionOverride,
-      undefined,
-      env,
-    ),
+    before: stampConfigWriteMetadata(parsed, options.lastTouchedVersionOverride, undefined, env),
     after: output,
     authorizedPaths: options.authorizedDestructivePaths,
   });

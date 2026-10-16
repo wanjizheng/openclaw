@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { PluginLogger, PluginServiceSchedulerV1 } from "openclaw/plugin-sdk/plugin-entry";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { OpenClawPluginApi } from "../api.js";
 import type { CallCleanup } from "./call-cleanup.js";
 import type { VoiceCallConfig } from "./config.js";
@@ -96,7 +97,7 @@ async function runPostCallReport(
     await fs.access(reportPath);
     reportExists = true;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+    if (!isRecord(error) || error.code !== "ENOENT") {
       throw error;
     }
   }
@@ -197,7 +198,7 @@ async function runPostCallReport(
     try {
       await fs.link(temporaryPath, reportPath);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      if (isRecord(error) && error.code === "EEXIST") {
         await syncReportDirectories(logsDir, firstCreatedDirectory ?? logsDir);
         return;
       }

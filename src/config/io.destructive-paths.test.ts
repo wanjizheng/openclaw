@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { collectUnauthorizedDestructivePaths } from "./io.destructive-paths.js";
+import {
+  collectUnauthorizedDestructivePaths,
+  configPathKey,
+  parseConfigPathKey,
+} from "./io.destructive-paths.js";
 
 describe("migration destructive path authority", () => {
   it.each([
@@ -50,4 +54,17 @@ describe("migration destructive path authority", () => {
       refused,
     );
   });
+});
+
+describe("structural destructive path decoding", () => {
+  it("retains dotted keys and numeric indexes without coercion", () => {
+    const path = ["channels", "legacy.name", 1];
+    expect(parseConfigPathKey(configPathKey(path))).toEqual(path);
+  });
+  it.each(["{}", '"channels"', '["channels",null]', '["channels",-1]', '["channels",1.5]'])(
+    "rejects invalid structural paths: %s",
+    (key) => {
+      expect(() => parseConfigPathKey(key)).toThrow("Invalid structural config path encoding");
+    },
+  );
 });

@@ -999,7 +999,7 @@ extensions/voice-call/src/media-stream.ts	1
 extensions/voice-call/src/providers/shared/guarded-json-api.ts	2
 extensions/voice-call/src/response-generator.ts	2
 extensions/voice-call/src/runtime.ts	1
-extensions/voice-call/src/webhook.ts	7
+extensions/voice-call/src/webhook.ts	4
 extensions/voyage/embedding-batch.ts	1
 extensions/web-readability/web-content-extractor.ts	2
 extensions/whatsapp/src/account-config.ts	1
