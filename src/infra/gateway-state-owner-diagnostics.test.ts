@@ -4,7 +4,6 @@ import { describe, expect, it } from "vitest";
 import { withTempDir } from "../test-utils/temp-dir.js";
 import {
   capture,
-  createGatewayStateOwnerDiagnostic,
   unavailable,
   type DiagnosticOwner,
   observeGatewayStateOwnerLocks,
@@ -36,8 +35,8 @@ describe("Gateway ownership failure diagnostics", () => {
       new Error('synthetic EIO: token="private-custody" ' + "x".repeat(3_000)),
       { code: "EIO" },
     );
-    const diagnostic = createGatewayStateOwnerDiagnostic(
-      { kind: "schema", accepting: true },
+    const diagnostic = capture(
+      { kind: "schema", accepting: true, lost: new AbortController() },
       reason,
     );
     const facts = JSON.parse(
@@ -79,8 +78,13 @@ describe("Gateway ownership failure diagnostics", () => {
       const missing = observeGatewayStateOwnerLocks({ [lockPath]: expected });
       expect(missing[0]).toMatchObject({ exists: false, errorCode: "ENOENT" });
       const reason = new Error("owner lock was replaced");
-      const diagnostic = createGatewayStateOwnerDiagnostic(
-        { kind: "schema", accepting: true, heartbeat: { locks: changed } },
+      const diagnostic = capture(
+        {
+          kind: "schema",
+          accepting: true,
+          lost: new AbortController(),
+          heartbeat: { diagnostic: () => ({ locks: changed }) },
+        },
         reason,
       );
       expect(diagnostic.cause).toBe(reason);

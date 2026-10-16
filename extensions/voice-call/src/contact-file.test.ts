@@ -2,7 +2,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { findContactByPhone, loadContactsFileAsync, parseContactsFile } from "./contact-file.js";
+import { findContactByPhone, loadContactsFileAsync } from "./contact-file.js";
 
 const contactText = `# 联系人列表
 
@@ -23,8 +23,9 @@ const missing = () =>
 afterEach(() => vi.restoreAllMocks());
 
 describe("agent workspace contact file", () => {
-  it("parses the retained Markdown fields and normalized caller lookup", () => {
-    const contacts = parseContactsFile(contactText);
+  it("parses the retained Markdown fields and normalized caller lookup", async () => {
+    vi.spyOn(fsp, "readFile").mockResolvedValue(contactText);
+    const contacts = await loadContactsFileAsync({ workspaceDir });
     expect(findContactByPhone("+1 (555) 000-0001", contacts)).toEqual({
       name: "演示联系人",
       phone: "+15550000001",

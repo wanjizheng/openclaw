@@ -35,7 +35,7 @@ export function resolveVoiceMessagesDir(): string {
  * Honors `VOICE_CALL_AUDIO_BASE_URL` / `AUDIO_BASE_URL` env overrides; otherwise
  * derives `${publicUrl-origin}/audio` from the voice-call config.
  */
-export function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined {
+function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined {
   const envBase = process.env.VOICE_CALL_AUDIO_BASE_URL?.trim();
   if (envBase) {
     return envBase.replace(/\/+$/, "");
@@ -60,10 +60,7 @@ export function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined
 }
 
 /** Convert a local mp3 file path to a publicly accessible URL. */
-export function localPathToPublicUrl(
-  localPath: string,
-  config: VoiceCallConfig,
-): string | undefined {
+function localPathToPublicUrl(localPath: string, config: VoiceCallConfig): string | undefined {
   const baseUrl = resolveAudioBaseUrl(config);
   if (!baseUrl) {
     return undefined;
@@ -121,7 +118,7 @@ async function synthesizeWithSag(text: string, outputPath: string): Promise<bool
  * Generate an mp3 file for the given text and return its local path.
  * Tries `sag` (ElevenLabs v3) first, falls back to core TTS.
  */
-export async function generateHybridAudioFile(params: {
+async function generateHybridAudioFile(params: {
   text: string;
   voiceConfig: VoiceCallConfig;
   coreConfig: CoreConfig;

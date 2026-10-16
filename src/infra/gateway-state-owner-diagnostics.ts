@@ -52,7 +52,7 @@ export function observeGatewayStateOwnerLocks(locks: Record<string, string>) {
     });
 }
 
-export function createGatewayStateOwnerDiagnostic(
+function createGatewayStateOwnerDiagnostic(
   facts: { kind: string; accepting: boolean; heartbeat?: unknown },
   reason: unknown,
 ) {

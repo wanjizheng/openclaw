@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
-  collectUnauthorizedDestructivePaths,
-  configPathKey,
+  collectUnauthorizedDestructivePathsForWrite,
   parseConfigPathKey,
 } from "./io.destructive-paths.js";
+import { coerceConfig } from "./io.read-helpers.js";
 
 describe("migration destructive path authority", () => {
   it.each([
@@ -50,16 +50,21 @@ describe("migration destructive path authority", () => {
       refused: ['["allowFrom",1]'],
     },
   ])("$name", ({ before, after, authorizedPaths, refused }) => {
-    expect(collectUnauthorizedDestructivePaths({ before, after, authorizedPaths })).toEqual(
-      refused,
-    );
+    expect(
+      collectUnauthorizedDestructivePathsForWrite(
+        { exists: true, parsed: before },
+        coerceConfig({ ...after, meta: { lastTouchedVersion: "2026.10.4" } }),
+        { authorizedDestructivePaths: authorizedPaths, lastTouchedVersionOverride: "2026.10.4" },
+        {},
+      ),
+    ).toEqual(refused);
   });
 });
 
 describe("structural destructive path decoding", () => {
   it("retains dotted keys and numeric indexes without coercion", () => {
     const path = ["channels", "legacy.name", 1];
-    expect(parseConfigPathKey(configPathKey(path))).toEqual(path);
+    expect(parseConfigPathKey(JSON.stringify(path))).toEqual(path);
   });
   it.each(["{}", '"channels"', '["channels",null]', '["channels",-1]', '["channels",1.5]'])(
     "rejects invalid structural paths: %s",

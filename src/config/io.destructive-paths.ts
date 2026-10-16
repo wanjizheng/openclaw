@@ -11,7 +11,7 @@ import type { ConfigFileSnapshot, OpenClawConfig } from "./types.js";
 /** Keys and array indices retain structural identity; dotted strings are never authority. */
 export type ConfigPath = readonly (string | number)[];
 
-export function configPathKey(path: ConfigPath): string {
+function configPathKey(path: ConfigPath): string {
   return JSON.stringify(path);
 }
 
@@ -31,7 +31,7 @@ export function parseConfigPathKey(key: string): ConfigPath {
   return components;
 }
 
-export function configPathHasPrefix(path: ConfigPath, prefix: ConfigPath): boolean {
+function configPathHasPrefix(path: ConfigPath, prefix: ConfigPath): boolean {
   if (prefix.length > path.length) {
     return false;
   }
@@ -44,7 +44,7 @@ export function configPathHasPrefix(path: ConfigPath, prefix: ConfigPath): boole
 }
 
 /** Same UTF-8 model as file-size checks, applied to each changed value. */
-export function approxSerializedSize(value: unknown): number {
+function approxSerializedSize(value: unknown): number {
   if (value === undefined) {
     return 0;
   }
@@ -104,7 +104,7 @@ export function collectDestructiveChanges(
 }
 
 /** Derive exact pruned parents so managed removal never grants siblings authority. */
-export function resolveWriterManagedConfigPathsForWrite(snapshot: unknown): ConfigPath[] {
+function resolveWriterManagedConfigPathsForWrite(snapshot: unknown): ConfigPath[] {
   if (!isRecord(snapshot)) {
     return [];
   }
@@ -119,7 +119,7 @@ export function resolveWriterManagedConfigPathsForWrite(snapshot: unknown): Conf
   return out;
 }
 
-export function collectUnauthorizedDestructivePaths(params: {
+function collectUnauthorizedDestructivePaths(params: {
   before: unknown;
   after: unknown;
   authorizedPaths: readonly ConfigPath[] | undefined;

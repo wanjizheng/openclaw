@@ -24,7 +24,6 @@
  * caller connects.
  */
 
-import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -53,7 +52,7 @@ const DEFAULT_CONTACTS_PATH = path.join(os.homedir(), ".openclaw", "workspace", 
 /**
  * Parse the text of a CONTACT_LIST.md file into an array of contacts.
  */
-export function parseContactsFile(content: string): ParsedContact[] {
+function parseContactsFile(content: string): ParsedContact[] {
   const contacts: ParsedContact[] = [];
 
   // Split on level-2 headings (## …).  The leading \n is consumed as part of
@@ -134,19 +133,6 @@ export function parseContactsFile(content: string): ParsedContact[] {
 // ---------------------------------------------------------------------------
 // Loaders
 // ---------------------------------------------------------------------------
-
-/**
- * Synchronously load contacts from CONTACT_LIST.md.
- * Returns an empty array if the file is missing or unreadable.
- */
-export function loadContactsFileSync(filePath = DEFAULT_CONTACTS_PATH): ParsedContact[] {
-  try {
-    const content = fs.readFileSync(filePath, "utf-8");
-    return parseContactsFile(content);
-  } catch {
-    return [];
-  }
-}
 
 /**
  * Load the effective agent's contacts, retaining the legacy file only when its
