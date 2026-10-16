@@ -82,12 +82,14 @@ describe("bounded Gateway state reads", () => {
         vi.advanceTimersByTime(999);
         expect(() => assertStateDatabaseReadAllowed(databasePath)).not.toThrow();
         vi.advanceTimersByTime(1);
-        expect(() => assertStateDatabaseReadAllowed(databasePath)).toThrow("could not be verified");
+        expect(() => assertStateDatabaseReadAllowed(databasePath)).toThrow(
+          /removed( or |\/)replaced; restart the Gateway\.$/,
+        );
         expect(() =>
           kind === "owner"
             ? assertStateDatabaseAccessAllowed(databasePath)
             : gateway.assertCurrent(),
-        ).toThrow(kind === "owner" ? "could not be verified" : "no longer current");
+        ).toThrow(kind === "owner" ? "restart the Gateway" : "no longer current");
       } finally {
         await gateway.release();
       }

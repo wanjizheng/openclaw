@@ -6,6 +6,10 @@ import {
 } from "../agents/admitted-run-context.js";
 import { callAgentToolGatewayRequest } from "../agents/tools/in-process-gateway.js";
 import { upsertSessionEntryCore } from "../config/sessions/session-accessor.js";
+import {
+  assertOwnedTranscriptWriteCommit,
+  withOwnedSessionTranscriptWrites,
+} from "../config/sessions/transcript-write-context.js";
 import { withPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { setUserProfileRole } from "../state/user-profile-writes.worker.js";
@@ -83,6 +87,62 @@ describe("typed in-process agent authorization", () => {
     startTurn.mockReset();
     waitForTurn.mockReset();
   });
+
+  it.each([false, true])(
+    "launches a different session without the caller's transcript writer (tool authority: %s)",
+    async (toolAuthority) => {
+      const callerTarget = {
+        agentId: "main",
+        storePath: "/synthetic/launch-transcript",
+        sessionKey: "agent:main:dashboard:incognito-caller",
+        sessionId: "caller-session",
+      };
+      const launchedTarget = {
+        ...callerTarget,
+        sessionKey: "agent:main:launched",
+        sessionId: "launched-session",
+      };
+      const context = createContext();
+      const result = { runId: "launched-run", status: "accepted" };
+      startTurn.mockImplementation(async ({ io }) => {
+        await Promise.resolve();
+        expect(() => assertOwnedTranscriptWriteCommit(launchedTarget)).not.toThrow();
+        io.emitAcceptance([true, result, undefined]);
+      });
+      const launch = () =>
+        dispatchGatewayMethodInProcess(
+          "agent",
+          {
+            message: "Run in another session",
+            idempotencyKey: result.runId,
+            sessionKey: launchedTarget.sessionKey,
+          },
+          { forceSyntheticClient: true, resolveGatewayContext: () => context },
+        );
+      await withOwnedSessionTranscriptWrites(
+        {
+          sessionTarget: callerTarget,
+          assertCommitAllowed: () => {},
+          withTranscriptWrite: async (run) => run(),
+        },
+        async () => {
+          expect(() => assertOwnedTranscriptWriteCommit(callerTarget)).not.toThrow();
+          expect(() => assertOwnedTranscriptWriteCommit(launchedTarget)).toThrow(
+            "session writer claim changed before transcript persistence",
+          );
+          await expect(
+            toolAuthority
+              ? withOperatorToolGatewayAuthority(
+                  { operatorRoleActor: { kind: "system" }, scopes: ["operator.write"] },
+                  launch,
+                )
+              : launch(),
+          ).resolves.toEqual(result);
+          expect(() => assertOwnedTranscriptWriteCommit(callerTarget)).not.toThrow();
+        },
+      );
+    },
+  );
 
   it.each([
     ["agent", { message: "owned turn", idempotencyKey: "host-owned" }],

@@ -22,6 +22,7 @@ export type CallManagerContext = {
   provider: VoiceCallProvider | null;
   config: VoiceCallConfig;
   coreSession?: VoiceCallCoreSessionConfig;
+  resolveAgentWorkspaceDir?: (agentId: string) => string;
   storePath: string;
   stateRuntime?: VoiceCallStateRuntime["state"];
   webhookUrl: string | null;

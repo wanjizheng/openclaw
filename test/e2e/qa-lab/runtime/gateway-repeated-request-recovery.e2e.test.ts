@@ -69,7 +69,12 @@ const STALL_GUIDANCE_NEEDLE = "previous turn stopped making progress";
 // This always-on state-machine proof uses the same heartbeat path with QA timings.
 const QA_RECOVERY_BOUND_MS = 30_000;
 const MODEL_REQUEST_ALLOWANCE_SECONDS = 45;
-const ORDINARY_RESPONSE_PAUSE_MS = 8_000;
+// Recovery may abort once cumulative no-progress age, counted from the first
+// retry, reaches the 45-second allowance. This branch does not treat SSE
+// keepalives as request activity, so the stalled fallback still times out 45
+// seconds after it starts. Three 15-second retries put a 45-second window
+// between those points, which always contains one 30-second diagnostic heartbeat.
+const ORDINARY_RESPONSE_PAUSE_MS = 15_000;
 const STALLED_RESPONSE_PAUSE_MS = 90_000;
 const RECOVERY_PROGRESS_INTERVAL_MS = 30_000;
 const HISTORY_RETRY_TIMEOUT_MS = 60_000;
@@ -395,8 +400,8 @@ describe("Gateway repeated-request recovery", () => {
       expect(queued).toMatchObject({ status: "started" });
       expect(typeof queued.runId).toBe("string");
 
-      // Repeated-request recovery owns semantic stagnation independently of the
-      // current provider request's deadline. Observe its settlement before queue drain.
+      // Repeated-request recovery aborts the stalled fallback once cumulative
+      // no-progress age reaches the request allowance. Observe its settlement before queue drain.
       const events = await waitForStability(
         gateway,
         baselineSeq,

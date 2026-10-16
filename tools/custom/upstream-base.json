@@ -1,1 +1,5 @@
-{"version":"2026.10.3","commit":"59cb44796b0f1f0daa0e37af8b1495abb45d9bc1"}
+{
+  "version": "2026.10.4",
+  "commit": "383c124cc32ffee3f8e56f549b88da94d269a4af",
+  "npmIntegrity": "sha512-+FH0StZF1tlTazM7JJGY6JePeJmhFNSRByi2Q3jXPRiLO7o4dJh2xa9Vy4Dk8Cd2ic8B7Zkf5NfEaCCWUkgqnQ=="
+}

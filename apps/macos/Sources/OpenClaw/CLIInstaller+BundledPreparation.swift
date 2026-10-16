@@ -55,8 +55,6 @@ extension CLIInstaller {
             expectedVersion: targetVersion, installedCLI: cli, usesBundledRuntime: false)
         let pending = PostAppUpdateReceiptStore.pending(currentVersion: targetVersion)
             ?? PostAppUpdateReceiptStore.pendingSetupRecovery()
-        let repair = status.isReady && pending?.coreUpdatePending == true
-        if status.isReady, !repair { return cli.prefix.last ?? status.location }
         let found: String
         let required: String
         switch status {
@@ -71,6 +69,10 @@ extension CLIInstaller {
                 message: "The existing Gateway could not be verified. " +
                     "Repair it with its installed CLI, then retry setup.")
         }
+        let versionSatisfied = status.isReady ||
+            Self.satisfiesUpdateTarget(installedVersion: found, targetVersion: required)
+        let repair = versionSatisfied && pending?.coreUpdatePending == true
+        if versionSatisfied, !repair { return cli.prefix.last ?? status.location }
         let checkCurrent: @MainActor @Sendable () async throws -> Void = {
             let hasRuntimePin = try await GatewayLaunchAgentManager.hasRuntimePin(
                 stateDirectory: state, profile: .current)
@@ -118,8 +120,11 @@ extension CLIInstaller {
             throw GatewayHostingError(message: [message, details, "Retry setup to try again."].compactMap(\.self)
                 .joined(separator: " "))
         }
-        guard case let .success(_, installedVersion) = outcome, installedVersion == required else {
-            throw GatewayHostingError(message: "The Node update did not verify the app's exact version; retry setup.")
+        guard case let .success(_, installedVersion) = outcome,
+              Self.satisfiesUpdateTarget(installedVersion: installedVersion, targetVersion: required)
+        else {
+            throw GatewayHostingError(
+                message: "The Node update did not verify a compatible Gateway version; retry setup.")
         }
         guard let completed = PostAppUpdateReceiptStore.completeCoreRepair(currentVersion: required, owner: .gateway),
               !completed.coreUpdatePending

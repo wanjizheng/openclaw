@@ -195,6 +195,16 @@ function recoveryHints(run: ReportInput, nextAction?: string): string[] {
   if (run.reason === UPDATE_FOREIGN_DESTINATION_REASON) {
     return nextAction ? [] : [`Next step: ${UPDATE_DESTINATION_RECOVERY}`];
   }
+  if (
+    run.reason === "state-migrated-no-rollback" ||
+    run.verification.rollbackOutcome?.reason === "state-migrated-no-rollback"
+  ) {
+    return nextAction
+      ? []
+      : [
+          "State may have changed during migration, so rolling back code alone is unsafe. Keep the new installation and backups; inspect openclaw update status and run openclaw doctor before recovery.",
+        ];
+  }
   const hint =
     run.reason && Object.hasOwn(FAILURE_RECOVERY_HINTS, run.reason)
       ? FAILURE_RECOVERY_HINTS[run.reason]
@@ -229,6 +239,13 @@ export function renderUpdateRunReport(
     run.origin.nextAction
       ? { kind: "unavailable" }
       : undefined);
+  const runtimeVerificationRecovered =
+    run.status === "failed" &&
+    currentHealth?.kind === "responding" &&
+    Boolean(run.after.version) &&
+    currentHealth.version === run.after.version &&
+    run.verification.recovery?.serviceRestartSafe === false &&
+    run.verification.recovery.reason === "runtime-verification-failed";
   // Keep the version visible and distinguish Git updates within the same version.
   const before = formatUpdateVersion(run.before);
   const after = formatUpdateVersion(run.after);
@@ -284,8 +301,16 @@ export function renderUpdateRunReport(
   }
   headline = bounded(headline, 500);
   const lines: string[] = [];
-  if (currentHealth && !run.origin.nextAction && !opts.nextAction) {
+  if (
+    currentHealth &&
+    (runtimeVerificationRecovered || (!run.origin.nextAction && !opts.nextAction))
+  ) {
     lines.push(formatUpdateRunCurrentHealth(currentHealth));
+    if (runtimeVerificationRecovered) {
+      lines.push(
+        "The target version is serving; the saved runtime verification failure no longer applies. The recorded update outcome is unchanged.",
+      );
+    }
   }
   if (opts.mode && opts.mode !== "unknown") {
     lines.push(`Update mode: ${opts.mode}`);
@@ -375,7 +400,8 @@ export function renderUpdateRunReport(
   }
   const facts = run.verification;
   const observation = run.steps.findLast((step) => step.step === "gateway recovery verification");
-  const recovery = observation && formatUpdateRunRecovery(facts, observation);
+  const recovery =
+    !runtimeVerificationRecovered && observation && formatUpdateRunRecovery(facts, observation);
   if (recovery) {
     lines.push(`Recorded recovery: ${recovery}.`);
   }
@@ -417,7 +443,10 @@ export function renderUpdateRunReport(
     Object.hasOwn(UPDATE_INSTALL_SKIP_GUIDANCE, run.reason)
       ? UPDATE_INSTALL_SKIP_GUIDANCE[run.reason]
       : undefined;
-  const savedAction = opts.nextAction ?? run.origin.nextAction ?? skipGuidance;
+  const savedAction =
+    opts.nextAction ??
+    (runtimeVerificationRecovered ? undefined : run.origin.nextAction) ??
+    skipGuidance;
   const nextAction =
     savedAction && currentHealth
       ? `${formatUpdateRunCurrentHealth(currentHealth)} ${

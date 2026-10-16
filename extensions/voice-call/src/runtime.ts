@@ -305,6 +305,7 @@ export async function createVoiceCallRuntime(params: {
 
   const provider = await resolveProvider(config);
   if (provider.name === "twilio") {
+    // SAFETY: resolveProvider constructs TwilioProvider for the twilio discriminator checked above.
     (provider as TwilioProvider).setLifecycleGuard(
       () => !params.scheduler.signal.aborted && (params.isCurrent?.() ?? true),
     );
@@ -312,7 +313,9 @@ export async function createVoiceCallRuntime(params: {
   if (stateRuntime) {
     setVoiceCallStateRuntime({ state: stateRuntime });
   }
-  const manager = new CallManager(config, undefined, cfg.session, stateRuntime);
+  const manager = new CallManager(config, undefined, cfg.session, stateRuntime, (agentId) =>
+    agentRuntime.resolveAgentWorkspaceDir(cfg, agentId),
+  );
   const cleanup = createCallCleanup({
     stateRuntime,
     storePath: resolveVoiceCallStoreBase(config),

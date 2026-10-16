@@ -1320,7 +1320,7 @@ function cdpBrowserProcessId(result: unknown): number | null {
   return browser?.id ?? null;
 }
 
-function processCommandUsesHeadlessChrome(command: {
+export function processCommandUsesHeadlessChrome(command: {
   argv: string[] | null;
   text: string;
 }): boolean {

@@ -1,6 +1,6 @@
 // Tests for gateway runtime subscription wiring.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createDeferred } from "../../test/helpers/promise.js";
+import { createDeferred, withinTest } from "../../test/helpers/promise.js";
 import { configureExecutionIdentityAdmissionSink } from "../audit/execution-identity-admission.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
@@ -68,6 +68,7 @@ const agentEventHandlerMocks = vi.hoisted(() => ({
 const transcriptBroadcastMocks = vi.hoisted(() => ({
   useActualHandler: false,
   readMessageById: vi.fn(),
+  lifecycleHandler: undefined as (() => Promise<void>) | undefined,
 }));
 const runtimeConfigState = vi.hoisted(() => ({ value: {} as OpenClawConfig }));
 const observeActivitySummary = vi.hoisted(() =>
@@ -167,6 +168,9 @@ vi.mock("./server-session-events.js", async (importOriginal) => {
       };
     },
     createLifecycleEventBroadcastHandler: () => () => {
+      if (transcriptBroadcastMocks.lifecycleHandler) {
+        return transcriptBroadcastMocks.lifecycleHandler();
+      }
       throw new Error("lifecycle handler failure");
     },
   };
@@ -189,6 +193,7 @@ describe("startGatewayEventSubscriptions", () => {
     auditTestState.stopped = 0;
     transcriptBroadcastMocks.useActualHandler = false;
     transcriptBroadcastMocks.readMessageById.mockReset();
+    transcriptBroadcastMocks.lifecycleHandler = undefined;
     runtimeConfigState.value = {};
     agentEventHandlerMocks.persistLifecycle.mockReset().mockResolvedValue(undefined);
     agentEventHandlerMocks.resolveSession.mockClear();
@@ -900,6 +905,36 @@ describe("startGatewayEventSubscriptions", () => {
       { sessionKey: "agent:work:global", revision: null },
       { sessionKeys: ["global"], agentId: "work" },
     );
+  });
+
+  it("joins accepted lifecycle publication before subscription shutdown", async ({ signal }) => {
+    vi.useFakeTimers({ toFake: ["setImmediate", "clearImmediate"] });
+    const entered = createDeferred();
+    const release = createDeferred();
+    const published = vi.fn();
+    transcriptBroadcastMocks.lifecycleHandler = async () => {
+      entered.resolve();
+      await release.promise;
+      published();
+    };
+    unsubs = startGatewayEventSubscriptions(createParams());
+    emitSessionLifecycleEvent({ sessionKey: "agent:main:main", reason: "subagent-status" });
+    await withinTest(entered.promise, signal);
+    let closed = false;
+    const shutdown = unsubs.agentUnsub().then(() => {
+      closed = true;
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(closed).toBe(false);
+      release.resolve();
+      await withinTest(shutdown, signal);
+      expect(published).toHaveBeenCalledOnce();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await shutdown;
+    }
   });
 
   it("logs lifecycle handler failures", async () => {

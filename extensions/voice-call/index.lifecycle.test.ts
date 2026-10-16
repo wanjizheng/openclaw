@@ -5,6 +5,7 @@ import {
   createTestPluginApi,
   createTestPluginServiceScheduler,
 } from "openclaw/plugin-sdk/plugin-test-api";
+import { createPluginRuntimeMock } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawPluginApi } from "./api.js";
 import type { VoiceCallRuntime } from "./runtime-entry.js";
@@ -73,6 +74,9 @@ function registerVoiceCall(params: {
   let service: VoiceCallService | undefined;
   let toolFactory: VoiceCallToolFactory | undefined;
   const gatewayHandlers = new Map<string, VoiceCallGatewayHandler>();
+  const runtime = createPluginRuntimeMock({
+    tts: { textToSpeechTelephony: vi.fn() },
+  });
   const api = createTestPluginApi({
     id: "voice-call",
     name: "Voice Call",
@@ -82,7 +86,7 @@ function registerVoiceCall(params: {
     registrationMode: params.registrationMode ?? "full",
     config: {},
     pluginConfig: { provider: "mock", ...params.config },
-    runtime: { tts: { textToSpeechTelephony: vi.fn() } } as unknown as OpenClawPluginApi["runtime"],
+    runtime,
     logger: params.logger ?? createLogger(),
     registerGatewayMethod: (method, handler) => {
       gatewayHandlers.set(method, handler);
@@ -105,6 +109,7 @@ function registerVoiceCall(params: {
   }
   const registeredToolFactory = toolFactory;
   return {
+    runtime,
     gatewayHandlers,
     service,
     toolFactory: registeredToolFactory,
@@ -157,6 +162,12 @@ describe("voice-call runtime lifecycle", () => {
     const fullCall = executeCall(full.tool());
     const discoveryCall = executeCall(discovery.tool());
     expect(createVoiceCallRuntime).toHaveBeenCalledTimes(1);
+    const runtimeParams = vi.mocked(createVoiceCallRuntime).mock.calls[0]?.[0];
+    expect(runtimeParams?.agentRuntime).toBe(full.runtime.agent);
+    expect(runtimeParams?.outboundRuntime).toBe(full.runtime.channel.outbound);
+    expect(runtimeParams?.stateRuntime).toBe(full.runtime.state);
+    expect(runtimeParams?.ttsRuntime).toBe(full.runtime.tts);
+    expect(runtimeParams?.isCurrent?.()).toBe(true);
 
     runtimeReady.resolve(fixture.runtime);
     await Promise.all([fullCall, discoveryCall]);
@@ -173,7 +184,10 @@ describe("voice-call runtime lifecycle", () => {
     const generationA = registerVoiceCall({ logger });
 
     expect(generationA.service.start(serviceContext)).toBeUndefined();
+    const runtimeParams = vi.mocked(createVoiceCallRuntime).mock.calls[0]?.[0];
+    expect(runtimeParams?.isCurrent?.()).toBe(true);
     const firstStop = generationA.service.stop?.(serviceContext);
+    expect(runtimeParams?.isCurrent?.()).toBe(false);
     const secondStop = generationA.service.stop?.(serviceContext);
     runtimeReady.resolve(fixture.runtime);
     await Promise.all([firstStop, secondStop]);

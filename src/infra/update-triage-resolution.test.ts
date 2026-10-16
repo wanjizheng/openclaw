@@ -302,11 +302,16 @@ describe("saved update failure resolution", () => {
         ok: false,
         summary: expect.stringContaining('Plugin "codex" data/settings upgrade is unfinished'),
       });
-      expect(result.summary).toContain("Let the current update or repair finish.");
+      expect(result.summary).toContain(
+        marker === "OPENCLAW_UPDATE_POST_CORE_CONVERGENCE"
+          ? 'Run "openclaw doctor --fix" to retry the upgrade.'
+          : "Let the current update or repair finish.",
+      );
+      expect(result.stopReason).toBe(result.summary);
     },
   );
 
-  it.each(["OPENCLAW_UPDATE_IN_PROGRESS", "OPENCLAW_UPDATE_POST_CORE_CONVERGENCE"])(
+  it.each(["OPENCLAW_UPDATE_IN_PROGRESS"])(
     "preserves the caller's %s context in pending migration guidance",
     async (marker) => {
       vi.mocked(readDeferredPluginMigrations).mockReturnValue(
@@ -334,6 +339,35 @@ describe("saved update failure resolution", () => {
       expect(validateDoctor).not.toHaveBeenCalled();
     },
   );
+
+  it("preserves the caller's post-core convergence context in pending migration guidance", async () => {
+    vi.mocked(readDeferredPluginMigrations).mockReturnValue(
+      ["first", "second"].map((pluginId) => ({
+        pluginId,
+        reason: "Package repair deferred.",
+        command: "openclaw update repair",
+      })),
+    );
+    const env = {
+      OPENCLAW_STATE_DIR: "/fixture/state",
+      OPENCLAW_UPDATE_IN_PROGRESS: "1",
+      OPENCLAW_UPDATE_POST_CORE_CONVERGENCE: "1",
+    };
+    const result = await validate(failure(), env);
+
+    expect(result).toMatchObject({
+      ok: false,
+      summary: expect.stringContaining('Run "openclaw update repair"'),
+    });
+    expect(result.summary).toContain('Plugin "first"');
+    expect(result.summary).toContain('Plugin "second"');
+    expect(result.summary.match(/Run "openclaw update repair"/g)).toHaveLength(2);
+    expect(result.summary).toContain('then "openclaw doctor --fix" to retry the upgrade.');
+    expect(result.summary).not.toContain("Let the current update or repair finish.");
+    expect(result.stopReason).toBe(result.summary);
+    expect(readDeferredPluginMigrations).toHaveBeenCalledWith({ env });
+    expect(validateDoctor).not.toHaveBeenCalled();
+  });
 
   it("keeps mixed plugin installation failures unresolved after Doctor and updater completion", async () => {
     failedRun.reason = "post-update-failed";

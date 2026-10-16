@@ -1,3 +1,6 @@
+import fsp from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { describe, expect, it, vi } from "vitest";
@@ -5,6 +8,8 @@ import { VoiceCallConfigSchema } from "./config.js";
 import { CallManager } from "./manager.js";
 import {
   createManagerHarness,
+  createTestStorePath,
+  installVoiceCallStateRuntimeForTests,
   FakeProvider,
   registerTestManagerCleanup,
 } from "./manager.test-harness.js";
@@ -219,5 +224,136 @@ describe("CallManager termination lifecycle", () => {
     expect(secondResult).toBe(firstResult);
     expect(firstResult).toEqual({ success: false, error: "carrier unavailable" });
     expect(provider.hangupCalls).toHaveLength(2);
+  });
+});
+
+describe("CallManager inbound contact greetings", () => {
+  it.each([
+    { scenario: "contact override", contact: "known", expected: "Welcome Alex!" },
+    { scenario: "configured template", contact: "no-greeting", expected: "Hello Alex" },
+    { scenario: "unknown caller", contact: "known", from: "+15550000002", expected: "Hello" },
+    {
+      scenario: "built-in fallback",
+      contact: "empty",
+      greeting: "",
+      expected: "Hello! How can I help you today?",
+    },
+    { scenario: "empty workspace", contact: "empty", expected: "Hello" },
+    { scenario: "unreadable workspace", contact: "EACCES", expected: "Hello" },
+    { scenario: "missing workspace legacy fallback", contact: "ENOENT", expected: "Legacy Alex" },
+    {
+      scenario: "routed agent workspace",
+      contact: "no-greeting",
+      routed: true,
+      expected: "Routed Alex",
+    },
+    {
+      scenario: "older constructor without workspace resolver",
+      contact: "known",
+      resolver: false,
+      expected: "Hello",
+    },
+    {
+      scenario: "workspace resolver failure",
+      contact: "known",
+      resolverError: true,
+      expected: "Hello",
+    },
+  ])("persists and plays $scenario through the inbound entry", async (fixture) => {
+    const workspaceDir = "/synthetic/voice-agent-workspace";
+    const workspaceFile = path.join(workspaceDir, "CONTACT_LIST.md");
+    const legacyFile = path.join(os.homedir(), ".openclaw", "workspace", "CONTACT_LIST.md");
+    const contact = `# Contacts
+
+## Alex
+- 电话: +15550000001
+${fixture.contact === "no-greeting" ? "" : "- 问候语: Welcome {name}!"}
+`;
+    const reads: string[] = [];
+    const originalRead = fsp.readFile;
+    const read = vi.spyOn(fsp, "readFile").mockImplementation(async (...args) => {
+      const file = args[0];
+      if (typeof file !== "string" || (file !== workspaceFile && file !== legacyFile)) {
+        return Reflect.apply(originalRead, fsp, args);
+      }
+      reads.push(file);
+      if (file === legacyFile) {
+        return contact.replace("Welcome {name}!", "Legacy {name}");
+      }
+      if (fixture.contact === "ENOENT" || fixture.contact === "EACCES") {
+        throw Object.assign(new Error("synthetic contact file failure"), { code: fixture.contact });
+      }
+      return fixture.contact === "empty" ? "" : contact;
+    });
+    try {
+      const config = VoiceCallConfigSchema.parse({
+        enabled: true,
+        provider: "plivo",
+        inboundPolicy: "open",
+        fromNumber: "+15550000000",
+        agentId: "main",
+        inboundGreeting: fixture.greeting ?? "Hello {name}",
+        ...(fixture.routed
+          ? {
+              numbers: {
+                "+15550000000": { agentId: "voice-agent", inboundGreeting: "Routed {name}" },
+              },
+            }
+          : {}),
+      });
+      const resolver = vi.fn((agentId: string) => {
+        expect(agentId).toBe(fixture.routed ? "voice-agent" : "main");
+        if (fixture.resolverError) {
+          throw new Error("synthetic resolver failure");
+        }
+        return workspaceDir;
+      });
+      installVoiceCallStateRuntimeForTests();
+      const provider = new FakeProvider();
+      const manager = registerTestManagerCleanup(
+        new CallManager(
+          config,
+          createTestStorePath(),
+          undefined,
+          undefined,
+          fixture.resolver === false ? undefined : resolver,
+        ),
+      );
+      await manager.initialize(provider, "https://example.test/voice");
+      await manager.processEvent({
+        id: "inbound-contact-start",
+        type: "call.initiated",
+        callId: "provider-inbound",
+        providerCallId: "provider-inbound",
+        timestamp: Date.now(),
+        direction: "inbound",
+        from: fixture.from ?? "+15550000001",
+        to: "+15550000000",
+      });
+      const call = manager.getCallByProviderCallId("provider-inbound");
+      expect(call?.metadata?.initialMessage).toBe(fixture.expected);
+      expect(call?.agentId).toBe(fixture.routed ? "voice-agent" : "main");
+      expect((await manager.getCallHistory()).at(-1)?.metadata?.initialMessage).toBe(
+        fixture.expected,
+      );
+      await manager.speakInitialMessage("provider-inbound");
+      expect(provider.playTtsCalls).toEqual([
+        expect.objectContaining({ text: fixture.expected, providerCallId: "provider-inbound" }),
+      ]);
+      const persisted = (await manager.getCallHistory()).at(-1);
+      expect(persisted?.metadata?.initialMessage).toBeUndefined();
+      expect(persisted?.transcript).toContainEqual(
+        expect.objectContaining({ speaker: "bot", text: fixture.expected }),
+      );
+      if (fixture.resolver === false || fixture.resolverError) {
+        expect(reads).toEqual([]);
+      } else {
+        expect(reads).toEqual(
+          fixture.contact === "ENOENT" ? [workspaceFile, legacyFile] : [workspaceFile],
+        );
+      }
+    } finally {
+      read.mockRestore();
+    }
   });
 });

@@ -610,9 +610,9 @@ describe("launchd bootstrap repair", () => {
     );
   });
 
-  it("skips kickstart when already-loaded service is actively running", async () => {
-    state.bootstrapError = "Service already loaded";
-    state.bootstrapCode = 130;
+  it("skips kickstart when operation-in-progress bootstrap finds a running job", async () => {
+    state.bootstrapError = "Bootstrap failed: 37: Operation already in progress";
+    state.bootstrapCode = 37;
 
     const repair = await repairLaunchAgentBootstrap({ env: ENV });
 
@@ -663,8 +663,8 @@ describe("launchd bootstrap repair", () => {
   });
 
   it("returns a typed kickstart failure when already-loaded recovery cannot nudge the service", async () => {
-    state.bootstrapError = "Service already loaded";
-    state.bootstrapCode = 130;
+    state.bootstrapError = "Bootstrap failed: 37: Operation already in progress";
+    state.bootstrapCode = 37;
     state.serviceRunning = false;
     state.kickstartError = "launchctl kickstart failed: permission denied";
     state.kickstartFailuresRemaining = 1;

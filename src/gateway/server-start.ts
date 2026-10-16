@@ -1,6 +1,7 @@
 import { formatErrorMessage } from "../infra/errors.js";
 import { LegacyPluginSdkResourceHost } from "../plugins/legacy-sdk-resource-host.js";
 import { hasRetainedPluginRuntimeCloseError } from "../plugins/runtime-close-error.js";
+import { runOutsideAsyncWorkScope } from "../shared/async-work-scope.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 import { bumpSkillsSnapshotVersion } from "../skills/runtime/refresh-state.js";
@@ -24,8 +25,13 @@ export async function startGatewayServerCore(
   opts: GatewayServerOptions = {},
 ): Promise<GatewayServer> {
   const sdkResourceHost = new LegacyPluginSdkResourceHost();
+  // Join startup through its returned promise without giving resident listeners the boot scope.
+  const start = (signal?: AbortSignal) =>
+    runOutsideAsyncWorkScope(() =>
+      startGatewayServerWithSdkHost(port, opts, sdkResourceHost, signal),
+    );
   return await sdkResourceHost.run(() =>
-    startGatewayServerWithSdkHost(port, opts, sdkResourceHost),
+    opts.startupOperation ? opts.startupOperation(start) : start(),
   );
 }
 
@@ -33,6 +39,7 @@ async function startGatewayServerWithSdkHost(
   port: number,
   opts: GatewayServerOptions,
   sdkResourceHost: LegacyPluginSdkResourceHost,
+  signal?: AbortSignal,
 ): Promise<GatewayServer> {
   const { promise: postReadyWorkBarrier, resolve: releasePostReadyWork } = createDeferredCore();
   const gatewayKernel = await createGatewayKernel(port, opts, {
@@ -47,6 +54,8 @@ async function startGatewayServerWithSdkHost(
     void beginMacOSSystemCaWarmupOnce({ log });
   }
   let startupSettled: Promise<void>;
+  let tailscaleStopping: Promise<void> | undefined;
+  let stopStartingTailscale: (() => void) | undefined;
   const {
     beginClosePrelude,
     closeOnStartupFailure,
@@ -69,10 +78,19 @@ async function startGatewayServerWithSdkHost(
                 backend,
                 controlUiBasePath: gatewayKernel.controlUiBasePath,
                 logTailscale,
+                signal,
               });
-              // The server close handle is not published until this callback settles.
-              // Startup failure therefore owns teardown before normal close can race it.
               gatewayKernel.kernel.setTailscaleCleanup(cleanup);
+              stopStartingTailscale = () => {
+                tailscaleStopping ??= cleanup?.();
+                void tailscaleStopping?.catch(() => {});
+              };
+              // Keep cancellation ownership until the full server close handle is published.
+              signal?.addEventListener("abort", stopStartingTailscale, { once: true });
+              if (signal?.aborted) {
+                stopStartingTailscale();
+                signal.throwIfAborted();
+              }
             },
           }
         : {}),
@@ -94,10 +112,16 @@ async function startGatewayServerWithSdkHost(
       waitForPostReadyWork: () => postReadyWorkBarrier,
     });
     startupSettled = startup.startupSettled;
+    signal?.throwIfAborted();
   } catch (err) {
     // Failed startup must release work whose normal timer was never armed.
     releasePostReadyWork();
     return await rethrowGatewayStartupError(err, closeOnStartupFailure);
+  } finally {
+    if (stopStartingTailscale) {
+      signal?.removeEventListener("abort", stopStartingTailscale);
+    }
+    await tailscaleStopping;
   }
   void startupSettled.then(
     () => {

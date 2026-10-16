@@ -20,7 +20,7 @@ import {
 } from "./config-preflight-snapshot.js";
 import {
   assertNoRetiredOAuthSidecarsBeforeConfigRecovery,
-  listLegacyOAuthSidecarPaths,
+  listReferencedLegacyOAuthSidecarPaths,
 } from "./doctor-auth-legacy-paths.js";
 import { noteDoctorConfigPreflightIssues } from "./doctor-config-analysis.js";
 import {
@@ -70,10 +70,10 @@ async function runDoctorConfigPreflightOperation(
   options: DoctorConfigPreflightOptions,
 ): Promise<DoctorConfigPreflightResult> {
   assertNoRetiredOAuthSidecarsBeforeConfigRecovery({ env: process.env });
-  const { env: inspectionEnv } = readCurrentConfigForResolution();
+  const { config: inspectionConfig, env: inspectionEnv } = readCurrentConfigForResolution();
   assertNoRetiredStateFiles(
     "OAuth credential sidecars",
-    listLegacyOAuthSidecarPaths(inspectionEnv),
+    listReferencedLegacyOAuthSidecarPaths(inspectionEnv, inspectionConfig),
   );
   const stateMigrationsRequested = options.migrateState !== false;
   const skipLegacyParentConfigWrite = shouldSkipLegacyUpdateDoctorConfigWrite(process.env);

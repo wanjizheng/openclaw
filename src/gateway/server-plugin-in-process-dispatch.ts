@@ -1,5 +1,6 @@
 import type { AgentWaitParams } from "../../packages/gateway-protocol/src/index.js";
 import { captureGatewayToolCallerAssertion } from "../agents/tools/gateway-caller-context.js";
+import { runWithoutOwnedSessionTranscriptWrites } from "../config/sessions/transcript-write-context.js";
 import { getPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
 import type { PluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.types.js";
 import { authorizeGatewaySessionCreation } from "./operator-role-policy.js";
@@ -157,10 +158,12 @@ async function withInProcessGatewayDispatch<T>(
         );
       }
     }
-    // A launched agent is autonomous; retaining tool-call AsyncLocalStorage would
-    // leak the human authority into later model-selected work after closure.
-    return method === "agent" && readOperatorToolGatewayAuthority()
-      ? await runOutsideOperatorToolGatewayAuthority(() => run(resolved))
+    // Autonomous turns establish their own transcript writer and must not retain
+    // the caller's tool authority after that invocation closes.
+    return method === "agent"
+      ? await runWithoutOwnedSessionTranscriptWrites(() =>
+          runOutsideOperatorToolGatewayAuthority(() => run(resolved)),
+        )
       : await run(resolved);
   } finally {
     releaseOperatorAuthority?.();

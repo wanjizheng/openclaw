@@ -25,12 +25,16 @@ afterEach(() => {
 });
 
 describe("release evidence API reads", () => {
-  it.each(["sync", "async"])("recovers a 502 followed by 200 (%s)", async (mode) => {
+  // Job-listing 5xx responses fall back to smaller pages instead (covered below), so async
+  // job reads exercise the transient retry budget with a network error.
+  it.each(["sync", "async"])("recovers a transient failure followed by 200 (%s)", async (mode) => {
     const wait = vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
-    const failure = Object.assign(new Error("gh failed"), {
-      stderr: "gh: Server Error (HTTP 502)",
-      stdout: "partial response",
-    });
+    const failure = Object.assign(
+      new Error("gh failed"),
+      mode === "sync"
+        ? { stderr: "gh: Server Error (HTTP 502)", stdout: "partial response" }
+        : { code: "ECONNRESET" },
+    );
     transport.read.mockImplementationOnce(() => {
       throw failure;
     });
@@ -49,11 +53,12 @@ describe("release evidence API reads", () => {
     ).toEqual([2000]);
   });
 
-  it.each(["sync", "async"])("fails after four 502 responses (%s)", async (mode) => {
+  it.each(["sync", "async"])("fails after four transient failures (%s)", async (mode) => {
     const wait = vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");
-    const failure = Object.assign(new Error("gh failed"), {
-      stderr: "gh: Server Error (HTTP 502)",
-    });
+    const failure = Object.assign(
+      new Error("gh failed"),
+      mode === "sync" ? { stderr: "gh: Server Error (HTTP 502)" } : { code: "ECONNRESET" },
+    );
     transport.read.mockImplementation(() => {
       throw failure;
     });
@@ -91,6 +96,37 @@ describe("release evidence API reads", () => {
     expect(transport.read).toHaveBeenCalledOnce();
     expect(wait).not.toHaveBeenCalled();
   });
+
+  it.each([
+    { total: 1000, requireComplete: true, result: 1000 },
+    { total: 1001, requireComplete: true, result: "incomplete or duplicated" },
+    { total: 1001, requireComplete: false, result: 1000 },
+  ])(
+    "keeps the 1,000-job ceiling after falling back to 30-job pages: $total jobs, complete $requireComplete",
+    async ({ total, requireComplete, result }) => {
+      const jobs = Array.from({ length: total }, (_, index) => ({ id: index + 1 }));
+      transport.read.mockImplementation((_bin: string, args: string[]) => {
+        const query = new URLSearchParams((args[1] ?? "").split("?")[1]);
+        const perPage = Number(query.get("per_page"));
+        if (perPage > 30) {
+          throw Object.assign(new Error("gh failed"), { stderr: "gh: Server Error (HTTP 502)" });
+        }
+        const start = (Number(query.get("page")) - 1) * perPage;
+        return JSON.stringify({ total_count: total, jobs: jobs.slice(start, start + perPage) });
+      });
+      const read = createReleaseEvidenceClient("openclaw/openclaw").getRunAttemptJobs("42", 2, {
+        requireComplete,
+      });
+      if (typeof result === "number") {
+        await expect(read).resolves.toEqual(jobs.slice(0, result));
+      } else {
+        await expect(read).rejects.toThrow(result);
+      }
+      // 100 and 50 each fail once; 30-job pages stop once 1,000 jobs are held (34 pages).
+      expect(transport.read).toHaveBeenCalledTimes(2 + 34);
+      expect(transport.sleep).not.toHaveBeenCalled();
+    },
+  );
 
   it("recovers a network error", () => {
     vi.spyOn(Atomics, "wait").mockReturnValue("timed-out");

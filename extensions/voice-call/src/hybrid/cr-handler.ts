@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import type http from "node:http";
 import type { Duplex } from "node:stream";
 import type { PluginServiceSchedulerV1 } from "openclaw/plugin-sdk/plugin-entry";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { type WebSocket, WebSocketServer } from "openclaw/plugin-sdk/websocket-runtime";
 import type { CallManager } from "../manager.js";
 import { TerminalStates } from "../types.js";
@@ -86,10 +87,10 @@ export class HybridCrHandler {
             ? Buffer.concat(data)
             : Buffer.from(data);
         const msg: unknown = JSON.parse(bytes.toString("utf8"));
-        if (!msg || typeof msg !== "object") {
+        if (!isRecord(msg)) {
           return;
         }
-        const value = msg as Record<string, unknown>;
+        const value = msg;
         if (value.type === "setup") {
           if (
             this.closed ||

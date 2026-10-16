@@ -7,7 +7,7 @@ import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/st
 import { resolveProfileStateDir } from "../cli/profile-utils.js";
 import {
   assertNoRetiredOAuthSidecarsBeforeConfigRecovery,
-  listLegacyOAuthSidecarPaths,
+  listReferencedLegacyOAuthSidecarPaths,
 } from "../commands/doctor-auth-legacy-paths.js";
 import { readCurrentConfigForResolution } from "../config/io.runtime.js";
 import type { OpenClawConfigWithLegacyRoster } from "../config/legacy.roster.js";
@@ -316,13 +316,13 @@ function migrateLegacyStateDirRoot(params: StateDirMigrationParams): StateDirMig
   assertNoRetiredStateFiles("JSON delivery queues", listRetiredDeliveryQueueFiles(targetDir));
   const configPath = resolveConfigPath(env, resolveStateDir(env, homedir), homedir);
   assertNoRetiredOAuthSidecarsBeforeConfigRecovery({ env, configPath });
-  const { env: inspectionEnv } = readCurrentConfigForResolution({
+  const { config: inspectionConfig, env: inspectionEnv } = readCurrentConfigForResolution({
     env,
     configPath,
   });
   assertNoRetiredStateFiles(
     "OAuth credential sidecars",
-    listLegacyOAuthSidecarPaths(inspectionEnv, undefined, targetDir),
+    listReferencedLegacyOAuthSidecarPaths(inspectionEnv, inspectionConfig, targetDir),
   );
   const finishMigration = (): StateDirMigrationResult => {
     const legacyIndexPath = resolveLegacyInstalledPluginIndexStorePath({ stateDir: targetDir });
@@ -406,7 +406,7 @@ function migrateLegacyStateDirRoot(params: StateDirMigrationParams): StateDirMig
   assertNoRetiredStateFiles("JSON delivery queues", listRetiredDeliveryQueueFiles(legacyDir));
   assertNoRetiredStateFiles(
     "OAuth credential sidecars",
-    listLegacyOAuthSidecarPaths(inspectionEnv, undefined, legacyDir),
+    listReferencedLegacyOAuthSidecarPaths(inspectionEnv, inspectionConfig, legacyDir),
   );
   if (safeStatSync(targetDir)?.isDirectory()) {
     if (isLegacyDirSymlinkMirror(legacyDir, targetDir)) {

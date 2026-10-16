@@ -11,11 +11,7 @@ const textToSpeech = vi.hoisted(() => vi.fn());
 
 vi.mock("openclaw/plugin-sdk/tts-runtime", () => ({ textToSpeech }));
 
-import {
-  deleteCallAudioFiles,
-  generateHybridAudioFile,
-  generateHybridAudioUrl,
-} from "./audio-pipeline.js";
+import { deleteCallAudioFiles, generateHybridAudioUrl } from "./audio-pipeline.js";
 
 const tempDirs: string[] = [];
 const managedDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -29,7 +25,7 @@ afterEach(() => {
   }
 });
 
-describe("generateHybridAudioFile", () => {
+describe("generateHybridAudioUrl", () => {
   it("makes a private fallback TTS file readable by the public audio server", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "voice-call-audio-"));
     tempDirs.push(root);
@@ -43,15 +39,20 @@ describe("generateHybridAudioFile", () => {
     vi.stubEnv("VOICE_MESSAGES_DIR", outputDir);
     textToSpeech.mockResolvedValue({ success: true, audioPath: privateAudio });
 
-    const result = await generateHybridAudioFile({
+    const result = await generateHybridAudioUrl({
       text: "hello",
-      voiceConfig: {} as VoiceCallConfig,
+      voiceConfig: { publicUrl: "https://example.test/voice" } as VoiceCallConfig,
       coreConfig: {} as CoreConfig,
       callId: "test-call",
     });
 
     expect(result).toBeDefined();
-    expect(fs.statSync(result!).mode & 0o777).toBe(0o644);
+    if (!result) {
+      throw new Error("Expected a public fallback audio URL");
+    }
+    const audioName = decodeURIComponent(path.basename(new URL(result).pathname));
+    expect(new URL(result).origin).toBe("https://example.test");
+    expect(fs.statSync(path.join(outputDir, audioName)).mode & 0o777).toBe(0o644);
   });
 });
 

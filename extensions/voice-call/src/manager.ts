@@ -174,6 +174,7 @@ export class CallManager {
     storePath?: string,
     coreSession?: VoiceCallCoreSessionConfig,
     stateRuntime?: VoiceCallStateRuntime["state"],
+    private readonly resolveAgentWorkspaceDir?: CallManagerContext["resolveAgentWorkspaceDir"],
   ) {
     this.config = config;
     this.coreSession = coreSession;
@@ -473,6 +474,7 @@ export class CallManager {
       provider: this.provider,
       config: this.config,
       coreSession: this.coreSession,
+      resolveAgentWorkspaceDir: this.resolveAgentWorkspaceDir,
       storePath: this.storePath,
       stateRuntime: this.stateRuntime,
       webhookUrl: this.webhookUrl,

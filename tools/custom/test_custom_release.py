@@ -199,11 +199,41 @@ class ReleaseTests(unittest.TestCase):
     def test_service_repair_is_external_for_plugin_and_doctor(self):
         plan = self.plan()
         with patch.object(OWNER, "run", return_value="") as execute:
-            OWNER.cli(plan, "plugins", "install", "npm-pack:/fixture.tgz")
-            OWNER.cli(plan, "doctor", "--fix", "--non-interactive")
+            OWNER.cli(plan, "plugins", "install", "npm-pack:/fixture.tgz", update_phase="package-swap")
+            OWNER.cli(plan, "doctor", "--fix", "--non-interactive", update_phase="post-core")
         for invocation in execute.call_args_list:
-            self.assertEqual(invocation.kwargs["env"]["OPENCLAW_SERVICE_REPAIR_POLICY"], "external")
-            self.assertEqual(invocation.kwargs["env"]["OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE"], "1")
+            env = invocation.kwargs["env"]
+            self.assertEqual(env["OPENCLAW_SERVICE_REPAIR_POLICY"], "external")
+            self.assertEqual(env["OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE"], "1")
+            self.assertEqual(env["OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION"], "0")
+        swap, convergence = [call.kwargs["env"] for call in execute.call_args_list]
+        self.assertEqual(swap["OPENCLAW_UPDATE_IN_PROGRESS"], "1")
+        self.assertNotIn("OPENCLAW_UPDATE_POST_CORE_CONVERGENCE", swap)
+        self.assertEqual(convergence["OPENCLAW_UPDATE_POST_CORE_CONVERGENCE"], "1")
+        self.assertNotIn("OPENCLAW_UPDATE_IN_PROGRESS", convergence)
+
+    def test_cli_clears_inherited_phase_and_activation_markers(self):
+        inherited = {
+            "OPENCLAW_UPDATE_IN_PROGRESS": "1",
+            "OPENCLAW_UPDATE_POST_CORE_CONVERGENCE": "1",
+            "OPENCLAW_UPDATE_DEFER_CONFIGURED_PLUGIN_INSTALL_REPAIR": "1",
+            "OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE": "1",
+            "OPENCLAW_UPDATE_PARENT_SUPPORTS_GATEWAY_RESTART": "1",
+            "OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR": "1",
+            "OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION": "1",
+            "OPENCLAW_COMPATIBILITY_HOST_VERSION": "2026.10.3",
+        }
+        plan = self.plan()
+        with patch.dict(os.environ, inherited), patch.object(OWNER, "run", return_value="") as execute:
+            OWNER.cli(plan, "plugins", "list", "--json")
+            OWNER.cli(plan, "doctor", "--fix", update_phase="post-core")
+        ordinary, convergence = [call.kwargs["env"] for call in execute.call_args_list]
+        self.assertTrue(all(key not in ordinary for key in inherited))
+        self.assertNotIn("OPENCLAW_UPDATE_IN_PROGRESS", convergence)
+        self.assertNotIn("OPENCLAW_UPDATE_DEFER_CONFIGURED_PLUGIN_INSTALL_REPAIR", convergence)
+        self.assertNotIn("OPENCLAW_COMPATIBILITY_HOST_VERSION", convergence)
+        self.assertEqual(convergence["OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION"], "0")
+        self.assertEqual(convergence["OPENCLAW_UPDATE_POST_CORE_CONVERGENCE"], "1")
 
     def test_readiness_has_bounded_timeout_with_injected_clock(self):
         now = [0]
@@ -565,6 +595,52 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(events[:3], ["stop", "npm-pack:" + str(self.root / "voice.tgz"),
                                     "npm-pack:" + str(self.root / "discord.tgz")])
         self.assertEqual(OWNER.read_json(self.root / "native-deployment/transaction.json")["stage"], "rolled-back")
+
+    def test_deploy_converges_after_both_plugins_before_starting_services(self):
+        plan, receipt, records = self.runtime_fixture()
+        for role in ("core", "voice", "discord"):
+            receipt["artifacts"][role]["file"] = role + ".tgz"
+        self.archive("core.tgz", {"package.json": json.dumps({"engines": {"node": ">=24.16.0 <25"}})})
+        receipt_path, plan_path = self.root / "release.json", self.root / "plan.json"
+        OWNER.write_json(receipt_path, receipt)
+        OWNER.write_json(plan_path, plan)
+        events = []
+        query = self.runtime_cli(records)
+        def cli(_plan, *args, **options):
+            if args[:2] == ("plugins", "install"):
+                self.assertEqual(options.get("update_phase"), "package-swap")
+                events.append("install:" + Path(args[2]).name)
+                return ""
+            if args[:1] == ("doctor",):
+                self.assertEqual(events[-2:], ["install:voice.tgz", "install:discord.tgz"])
+                self.assertEqual(options.get("update_phase"), "post-core")
+                events.append("post-core-doctor")
+                return ""
+            self.assertIsNone(options.get("update_phase"))
+            return query(_plan, *args, **options)
+        original_run = OWNER.run
+        def execute(args, **options):
+            if args == ["/fixture/node", "--version"]:
+                return "v24.18.0"
+            if args[0] == "npm" or str(args[0]).endswith("/npm"):
+                return "11.16.0" if args[1:] == ["--version"] else ""
+            return original_run(args, **options)
+        original_process = subprocess.run
+        def process(args, **options):
+            if args[0] == "systemctl":
+                return subprocess.CompletedProcess(args, 0, stdout="active", stderr="")
+            return original_process(args, **options)
+        def service(action, _services):
+            if action == "start":
+                self.assertIn("post-core-doctor", events)
+            events.append(action)
+        with patch.object(OWNER, "verify", return_value=receipt), patch.object(OWNER, "cli", side_effect=cli), \
+             patch.object(OWNER, "run", side_effect=execute), patch.object(OWNER, "service", side_effect=service), \
+             patch.object(OWNER, "assert_services_stopped"), patch.object(OWNER.subprocess, "run", side_effect=process):
+            OWNER.deploy(argparse.Namespace(receipt=str(receipt_path), plan=str(plan_path),
+                transaction=str(self.root / "converged-deployment"), execute_deployment=True))
+        self.assertEqual(OWNER.read_json(self.root / "converged-deployment/transaction.json")["stage"], "verified")
+        self.assertLess(events.index("post-core-doctor"), events.index("start"))
 
     def test_deploy_is_never_implicit(self):
         with self.assertRaisesRegex(OWNER.ReleaseError, "explicit"):

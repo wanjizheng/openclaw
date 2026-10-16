@@ -24,10 +24,10 @@
  * caller connects.
  */
 
-import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { normalizePhoneNumber } from "./allowlist.js";
 
 export type ParsedContact = {
@@ -52,7 +52,7 @@ const DEFAULT_CONTACTS_PATH = path.join(os.homedir(), ".openclaw", "workspace", 
 /**
  * Parse the text of a CONTACT_LIST.md file into an array of contacts.
  */
-export function parseContactsFile(content: string): ParsedContact[] {
+function parseContactsFile(content: string): ParsedContact[] {
   const contacts: ParsedContact[] = [];
 
   // Split on level-2 headings (## …).  The leading \n is consumed as part of
@@ -135,19 +135,6 @@ export function parseContactsFile(content: string): ParsedContact[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Synchronously load contacts from CONTACT_LIST.md.
- * Returns an empty array if the file is missing or unreadable.
- */
-export function loadContactsFileSync(filePath = DEFAULT_CONTACTS_PATH): ParsedContact[] {
-  try {
-    const content = fs.readFileSync(filePath, "utf-8");
-    return parseContactsFile(content);
-  } catch {
-    return [];
-  }
-}
-
-/**
  * Load the effective agent's contacts, retaining the legacy file only when its
  * workspace file is absent. Empty or unreadable workspace files remain isolated.
  * Explicit file paths retain their original behavior.
@@ -164,7 +151,8 @@ export async function loadContactsFileAsync(
     if (
       typeof source !== "string" &&
       filePath !== DEFAULT_CONTACTS_PATH &&
-      (error as NodeJS.ErrnoException).code === "ENOENT"
+      isRecord(error) &&
+      error.code === "ENOENT"
     ) {
       return loadContactsFileAsync(DEFAULT_CONTACTS_PATH);
     }

@@ -64,10 +64,12 @@ it("refuses expired ownership before submitting a read even when the monitor tic
     const unexpectedTask = queueTask();
     unexpectedTask.result.resolve(emptyReply);
     await expect(executeExistingOpenClawStateRead(options, { type: "fleet.list" })).rejects.toThrow(
-      /could not be verified|Shared-state read and cleanup failed/,
+      /restart the Gateway|Shared-state read and cleanup failed/,
     );
     expect(mock.runTask).toHaveBeenCalledTimes(submittedBefore);
-    expect(() => assertStateDatabaseAccessAllowed(pathname)).toThrow("could not be verified");
+    expect(() => assertStateDatabaseAccessAllowed(pathname)).toThrow(
+      /lock removed\/replaced; restart the Gateway\.$/,
+    );
   } finally {
     owner.release();
   }
@@ -100,7 +102,7 @@ it("refuses an already queued read at dispatch when ownership expires before the
       () => undefined,
     );
     dispatch.resolve();
-    await expect(task.captured).rejects.toThrow("could not be verified");
+    await expect(task.captured).rejects.toThrow(/lock removed\/replaced; restart the Gateway\.$/);
     expect(await settled).toHaveProperty("error");
     expect(received).not.toHaveBeenCalled();
   } finally {

@@ -18,6 +18,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { OpenClawConfig as CoreConfig } from "openclaw/plugin-sdk/config-contracts";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { VoiceCallConfig } from "../config.js";
 
 /** Resolve the directory where hybrid mode writes generated mp3 files. */
@@ -34,7 +35,7 @@ export function resolveVoiceMessagesDir(): string {
  * Honors `VOICE_CALL_AUDIO_BASE_URL` / `AUDIO_BASE_URL` env overrides; otherwise
  * derives `${publicUrl-origin}/audio` from the voice-call config.
  */
-export function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined {
+function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined {
   const envBase = process.env.VOICE_CALL_AUDIO_BASE_URL?.trim();
   if (envBase) {
     return envBase.replace(/\/+$/, "");
@@ -59,10 +60,7 @@ export function resolveAudioBaseUrl(config: VoiceCallConfig): string | undefined
 }
 
 /** Convert a local mp3 file path to a publicly accessible URL. */
-export function localPathToPublicUrl(
-  localPath: string,
-  config: VoiceCallConfig,
-): string | undefined {
+function localPathToPublicUrl(localPath: string, config: VoiceCallConfig): string | undefined {
   const baseUrl = resolveAudioBaseUrl(config);
   if (!baseUrl) {
     return undefined;
@@ -120,7 +118,7 @@ async function synthesizeWithSag(text: string, outputPath: string): Promise<bool
  * Generate an mp3 file for the given text and return its local path.
  * Tries `sag` (ElevenLabs v3) first, falls back to core TTS.
  */
-export async function generateHybridAudioFile(params: {
+async function generateHybridAudioFile(params: {
   text: string;
   voiceConfig: VoiceCallConfig;
   coreConfig: CoreConfig;
@@ -143,13 +141,7 @@ export async function generateHybridAudioFile(params: {
 
     // Fallback: plugin-sdk textToSpeech (best effort)
     try {
-      const ttsRuntime = (await import("openclaw/plugin-sdk/tts-runtime")) as {
-        textToSpeech?: (input: {
-          text: string;
-          cfg: unknown;
-          channel: string;
-        }) => Promise<{ success: boolean; audioPath?: string }>;
-      };
+      const ttsRuntime = await import("openclaw/plugin-sdk/tts-runtime");
       if (typeof ttsRuntime.textToSpeech === "function") {
         const ttsResult = await ttsRuntime.textToSpeech({
           text: params.text,
@@ -222,7 +214,7 @@ export async function deleteCallAudioFiles(
       }
     }
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+    if (!isRecord(error) || error.code !== "ENOENT") {
       failures.push(error);
     }
   }
@@ -242,7 +234,7 @@ export async function deleteCallAudioFiles(
       try {
         await fsp.unlink(path.join(directory, name));
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        if (!isRecord(error) || error.code !== "ENOENT") {
           failures.push(error);
         }
       }

@@ -769,7 +769,15 @@ final class PostUpdateController: NSObject, NSWindowDelegate {
         case .ready:
             gatewayUpdateIncomplete ? .repair : .none
         case let .incompatible(_, found, required):
-            CLIInstallPrompter.isManagedUpgrade(found: found, required: required) ? .update : .none
+            if CLIInstallPrompter.isManagedUpgrade(found: found, required: required) {
+                .update
+            } else if gatewayUpdateIncomplete,
+                      CLIInstaller.satisfiesUpdateTarget(installedVersion: found, targetVersion: required)
+            {
+                .repair
+            } else {
+                .none
+            }
         case .missing, .unusable:
             .install
         }
@@ -1156,7 +1164,8 @@ extension PostUpdateController {
     {
         switch outcome {
         case let .success(_, installedVersion):
-            guard installedVersion == targetVersion else {
+            guard CLIInstaller.satisfiesUpdateTarget(installedVersion: installedVersion, targetVersion: targetVersion)
+            else {
                 self.fail(
                     message: String(localized: "Gateway verification failed."),
                     details: String(localized: "The managed runtime does not match the updated Mac app."))
@@ -1348,9 +1357,11 @@ extension PostUpdateController {
             }
         }
         let runtimeStatus = await CLIInstaller.managedStatus(
-            expectedVersion: receipt.toVersion, installedCLI: verifiedCLI, usesBundledRuntime: false)
+            expectedVersion: nil, installedCLI: verifiedCLI, usesBundledRuntime: false)
         guard AppStateStore.shared.connectionMode == connectionMode else { return .deferred }
-        guard case .ready = runtimeStatus else {
+        guard case let .ready(_, installedVersion) = runtimeStatus,
+              CLIInstaller.satisfiesUpdateTarget(installedVersion: installedVersion, targetVersion: receipt.toVersion)
+        else {
             self.fail(
                 message: String(localized: "Gateway verification failed."),
                 details: String(localized: "The managed runtime does not match the updated Mac app."))

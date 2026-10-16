@@ -11,10 +11,10 @@ checks the receipt against the registry tarball, then verifies the official tag
 and available release branch. Numeric npm revisions retain their exact identity
 and use the base version's Git anchor.
 
-~~~
+```
 tools/custom/release-integrate-and-build.sh \
-  --out "$HOME/.openclaw-custom-releases/prepare-2026.10.3"
-~~~
+  --out "$HOME/.openclaw-custom-releases/prepare-2026.10.4"
+```
 
 Preparation clones into the output directory, creates releasecandidate/v..., and
 replays only previous official source -> customization HEAD. It never uses the
@@ -31,11 +31,11 @@ host defaults differ. There is no Node 25 fallback.
 
 ## Package the isolated review tree
 
-~~~
+```
 python3 tools/custom/custom-release.py stage \
   --repo "$PWD" --allow-dirty-review \
   --out "$HOME/.openclaw-custom-releases/review-packages"
-~~~
+```
 
 releasecandidate/ branches are accepted normally. An upgrade/ review branch
 requires the explicit dirty-review flag. This records the complete source
@@ -49,10 +49,10 @@ packagers; no source package.json overlay or manually copied dist is used.
 build-source.json with the same HEAD and source hash. A commit match alone does
 not establish dirty-build freshness.
 
-~~~
+```
 python3 tools/custom/custom-release.py verify \
   --receipt /absolute/packages/release.json --check-source
-~~~
+```
 
 The release contract is `openclaw.custom-release.v2`: exactly three roles are
 required: core=`openclaw`, voice=`@openclaw/voice-call`, and
@@ -92,13 +92,13 @@ configuration must select the reviewed custom packages. Deployment validates the
 configuration after installation; failure triggers rollback before old services
 restart.
 
-~~~
+```
 python3 tools/custom/custom-release.py deploy \
   --receipt /absolute/packages/release.json \
   --plan /absolute/private/deploy-plan.json \
   --transaction /absolute/private/transaction \
   --execute-deployment
-~~~
+```
 
 Deployment stops both services and verifies they stopped, then archives the full
 core installation/dependencies, state (SQLite/WAL/SHM), external roots, binary
@@ -118,7 +118,12 @@ local-source trust class; custom naming never implies official/ClawHub trust. Bo
 custom plugin tarballs use managed npm-pack: installation; no registry fallback
 is allowed. Plugin install and Doctor receive
 OPENCLAW_SERVICE_REPAIR_POLICY=external and cannot activate services. Services
-must remain stopped through migration. After config validation the tool starts
+must remain stopped through migration. Plugin installation uses the explicit
+package-swap phase. After both custom packages are verified, the final Doctor
+runs with the native post-core-convergence marker, with Gateway activation and
+service repair forbidden. Ordinary catalog/readiness calls clear inherited
+update-phase markers. No second external Doctor handoff is required.
+After config validation the tool starts
 services and waits for the readiness deadline. Success requires matching
 core/CLI/Gateway identities and CLI physical root/source/member hashes for both
 plugins. The Gateway plugins.list RPC returns projected catalog metadata and
@@ -140,10 +145,10 @@ services. Restored archive bytes and metadata are compared before restart,
 including both managed plugin generations. Failed rollback retains journal/checkpoints and reports failure.
 Recover a killed transaction explicitly:
 
-~~~
+```
 python3 tools/custom/custom-release.py recover \
   --transaction /absolute/private/transaction --execute-deployment
-~~~
+```
 
 Recovery restores the saved generation; it never reinstalls, rebuilds, migrates
 again or publishes. Verified/rolled-back transactions are idempotent no-ops.
@@ -155,9 +160,9 @@ authorizes deployment, publication or service actions.
 
 ## Verification boundary
 
-~~~
+```
 python3 tools/custom/test_custom_release.py -v
-~~~
+```
 
 Synthetic tests cover exact baseline selection, source branch isolation, numeric
 revision anchors, Node bounds, hash tampering refusal, full state/dependency

@@ -1,3 +1,7 @@
+import type http from "node:http";
+import { normalizeStringEntries } from "openclaw/plugin-sdk/string-coerce-runtime";
+import { getHeader } from "./http-headers.js";
+
 // Voice Call plugin module normalizes proxy IP representations.
 export function normalizeProxyIp(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
@@ -15,4 +19,26 @@ export function normalizeProxyIp(value: string | undefined): string | undefined 
     }
   }
   return normalized;
+}
+
+export function resolveForwardedClientIp(
+  request: http.IncomingMessage,
+  normalizedTrustedProxyIps: ReadonlySet<string>,
+): string | undefined {
+  const forwardedFor = getHeader(request.headers, "x-forwarded-for");
+  if (forwardedFor) {
+    const forwardedIps = normalizeStringEntries(forwardedFor.split(","));
+    if (forwardedIps.length > 0) {
+      for (let index = forwardedIps.length - 1; index >= 0; index -= 1) {
+        const hop = forwardedIps[index];
+        if (!normalizedTrustedProxyIps.has(normalizeProxyIp(hop) ?? "")) {
+          return hop;
+        }
+      }
+      return forwardedIps[0];
+    }
+  }
+
+  const realIp = getHeader(request.headers, "x-real-ip")?.trim();
+  return realIp || undefined;
 }

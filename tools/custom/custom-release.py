@@ -239,14 +239,32 @@ def assert_services_stopped(services):
         if result.stdout.strip() not in ("inactive", "failed"):
             raise ReleaseError("A managed service has not fully stopped.")
 
-def cli(plan, *args, capture=False):
+def cli(plan, *args, capture=False, update_phase=None):
+    if update_phase not in (None, "package-swap", "post-core"):
+        raise ReleaseError("Unknown custom deployment update phase.")
     entry = Path(plan["prefix"]) / "lib/node_modules/openclaw/openclaw.mjs"
     env = {**os.environ, "OPENCLAW_STATE_DIR": plan["stateDir"], "OPENCLAW_CONFIG_PATH": plan["configPath"],
-           "OPENCLAW_UPDATE_IN_PROGRESS": "1",
-           "OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE": "1",
            "OPENCLAW_SERVICE_REPAIR_POLICY": "external",
            "PATH": str(Path(plan["nodeExecutable"]).parent) + os.pathsep
                    + str(Path(plan.get("npmExecutable", "npm")).parent) + os.pathsep + os.environ["PATH"]}
+    # This owner supplies the complete swap -> convergence lifecycle. Do not
+    # inherit a parent invocation's phase or permission to activate services.
+    for marker in (
+        "OPENCLAW_UPDATE_IN_PROGRESS", "OPENCLAW_UPDATE_POST_CORE_CONVERGENCE",
+        "OPENCLAW_UPDATE_DEFER_CONFIGURED_PLUGIN_INSTALL_REPAIR",
+        "OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE",
+        "OPENCLAW_UPDATE_PARENT_SUPPORTS_GATEWAY_RESTART",
+        "OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR",
+        "OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION",
+        "OPENCLAW_COMPATIBILITY_HOST_VERSION",
+    ):
+        env.pop(marker, None)
+    if update_phase:
+        env["OPENCLAW_UPDATE_PARENT_SUPPORTS_DOCTOR_CONFIG_WRITE"] = "1"
+        env["OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_SERVICE_REPAIR"] = "0"
+        env["OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION"] = "0"
+        env["OPENCLAW_UPDATE_POST_CORE_CONVERGENCE" if update_phase == "post-core"
+            else "OPENCLAW_UPDATE_IN_PROGRESS"] = "1"
     return run([plan["nodeExecutable"], str(entry), *args], env=env, capture=capture)
 
 def find_plugin(value, plugin_id):
@@ -465,7 +483,7 @@ def deploy(args):
             update_journal(transaction, journal, "core-installed")
             for role in PLUGIN_IDS:
                 plugin = receipt_path.parent / receipt["artifacts"][role]["file"]
-                cli(plan, "plugins", "install", "npm-pack:" + str(plugin), "--force", "--no-enable", "--accept-capabilities")
+                cli(plan, "plugins", "install", "npm-pack:" + str(plugin), "--force", "--no-enable", "--accept-capabilities", update_phase="package-swap")
                 # Check the native install result before doctor or service start.
                 catalog = json.loads(cli(plan, "plugins", "list", "--json", capture=True))
                 record = find_plugin(catalog, PLUGIN_IDS[role])
@@ -474,7 +492,7 @@ def deploy(args):
                 validate_plugin_files(plan, record, role, receipt)
                 update_journal(transaction, journal, role + "-installed")
             assert_services_stopped(plan["services"])
-            cli(plan, "doctor", "--fix", "--non-interactive")
+            cli(plan, "doctor", "--fix", "--non-interactive", update_phase="post-core")
             assert_services_stopped(plan["services"])
             cli(plan, "config", "validate", "--json", capture=True)
             service("daemon-reload", [])

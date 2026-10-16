@@ -27,6 +27,7 @@ import {
   implicitMentionKindWhen,
   resolveInboundMentionDecision,
 } from "../channel-mention-gating.js";
+import { createPluginAgentIdentityRuntimeMock } from "./plugin-runtime-agent-identity-mock.js";
 import { createPluginGatewayRuntimeMock } from "./plugin-runtime-gateway-mock.js";
 import {
   mergePluginRuntimeMockOverrides,
@@ -517,17 +518,7 @@ export function createPluginRuntimeMock(overrides: PluginRuntimeMockOverrides = 
       resolveAgentWorkspaceDir: vi.fn<PluginRuntime["agent"]["resolveAgentWorkspaceDir"]>(
         () => "/tmp/workspace",
       ),
-      resolveAgentIdentity: vi.fn<PluginRuntime["agent"]["resolveAgentIdentity"]>(() => ({
-        name: "test-agent",
-      })),
-      resolveAgentDisplayIdentity: vi.fn<PluginRuntime["agent"]["resolveAgentDisplayIdentity"]>(
-        async ({ agentId }) => ({
-          agentId: agentId ?? "main",
-          name: "test-agent",
-          avatar: "T",
-          nameSource: "agent",
-        }),
-      ),
+      ...createPluginAgentIdentityRuntimeMock(),
       resolveSessionCatalogCreateTarget: vi.fn<
         PluginRuntime["agent"]["resolveSessionCatalogCreateTarget"]
       >(resolveAgentCatalogCreateTarget),

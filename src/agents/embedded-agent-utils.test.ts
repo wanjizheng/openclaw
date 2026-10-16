@@ -3,7 +3,8 @@
  * Verifies visible text extraction, reasoning formatting, and thinking-tag promotion.
  */
 import type { AssistantMessage } from "openclaw/plugin-sdk/llm";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import * as codeRegions from "../shared/text/code-regions.js";
 import {
   createAssistantVisibleStreamText,
   extractEmbeddedAssistantText,
@@ -101,6 +102,40 @@ describe("createAssistantVisibleStreamText", () => {
       text: "OpenClaw runtime control is useful",
       delta: "OpenClaw runtime control is useful",
     });
+  });
+
+  it("bounds Markdown parse work after quoted tool XML in token-sized deltas", () => {
+    const quoted = "<tool_call>exec<arg_key>command</arg_key><arg_value>ls</arg_value></tool_call>";
+    const source = `\`\`\`xml\n${quoted}\n\`\`\`\n\n${"Explanation.\n\n- Item\n\n```python\nprint('hello')\n```\n\n".repeat(128)}`;
+    const regions = vi.spyOn(codeRegions, "findCodeRegions");
+    try {
+      const stream = createAssistantVisibleStreamText();
+      for (let offset = 0; offset < source.length; offset += 4) {
+        stream.append(source.slice(offset, offset + 4));
+      }
+      expect(stream.text).toBe(source.trimEnd());
+      const parsedCharacters = regions.mock.calls.reduce(
+        (total, [parsed]) => total + parsed.length,
+        0,
+      );
+      expect(parsedCharacters).toBeLessThan(source.length * 8);
+    } finally {
+      regions.mockRestore();
+    }
+  });
+
+  it("still hides leaked tool XML split across deltas after a quoted example", () => {
+    const source =
+      '```xml\n<tool_call>{"name":"quoted"}</tool_call>\n```\n\nBefore\n<tool_call>{"name":"exec","arguments":{"command":"ls"}}</tool_call>\nAfter';
+    for (const size of [1, 3, 4, 7]) {
+      const stream = createAssistantVisibleStreamText();
+      for (let offset = 0; offset < source.length; offset += size) {
+        stream.append(source.slice(offset, offset + size));
+      }
+      expect(stream.text).toContain('<tool_call>{"name":"quoted"}</tool_call>');
+      expect(stream.text).not.toContain('"exec"');
+      expect(stream.text).toContain("After");
+    }
   });
 
   it("keeps interleaved streams independent when one is replaced", () => {

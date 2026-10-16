@@ -827,6 +827,19 @@ it.each(["synchronous", "discovery"] as const)(
         writer.exec("UPDATE held SET value='later'");
         expect(current()).toEqual(["later", "later"]);
         expect(read()).toBe("first");
+        writer.exec("UPDATE held SET value='composite'");
+        const prepare = vi.spyOn(sqliteReadOnly, "prepareSqliteReadOnlyLocationSync");
+        try {
+          expect(
+            withSynchronousArtifactPreservingStateSnapshot(() => [read(), ...current()], {
+              current: options,
+            }),
+          ).toEqual(["composite", "composite", "composite"]);
+          expect(prepare).toHaveBeenCalledOnce();
+        } finally {
+          prepare.mockRestore();
+        }
+        expect(read()).toBe("first");
         const foreign = createOptions(path.join(root, "foreign"));
         openOpenClawStateDatabase(foreign).db.exec(
           "CREATE TABLE held(value TEXT); INSERT INTO held VALUES ('committed');",

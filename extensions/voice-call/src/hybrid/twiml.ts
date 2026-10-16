@@ -21,7 +21,7 @@ const ESCAPE_MAP: Record<string, string> = {
   "'": "&apos;",
 };
 
-export function escapeXml(str: string): string {
+function escapeXml(str: string): string {
   return str.replace(ESCAPE_RE, (ch) => ESCAPE_MAP[ch] ?? ch);
 }
 
@@ -44,7 +44,7 @@ export type ConversationRelayOptions = {
   welcomeGreeting?: string;
 };
 
-export function buildConversationRelayElement(opts: ConversationRelayOptions): string {
+function buildConversationRelayElement(opts: ConversationRelayOptions): string {
   const language = opts.language ?? "multi";
   const ttsProvider = opts.ttsProvider ?? "ElevenLabs";
   const voice = opts.voice ?? "bhJUNIXWQQ94l8eI2VUf";
@@ -56,15 +56,6 @@ export function buildConversationRelayElement(opts: ConversationRelayOptions): s
     ? ` welcomeGreeting="${escapeXml(opts.welcomeGreeting)}"`
     : "";
   return `<ConversationRelay url="${escapeXml(opts.wsUrl)}" language="${escapeXml(language)}" ttsProvider="${escapeXml(ttsProvider)}" voice="${escapeXml(voice)}" transcriptionProvider="${escapeXml(transcriptionProvider)}" speechModel="${escapeXml(speechModel)}" interruptible="${interruptible}" dtmfDetection="${dtmfDetection}"${greetingAttr} />`;
-}
-
-export function buildConversationRelayTwiml(opts: ConversationRelayOptions): string {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect${opts.actionUrl ? ` action="${escapeXml(opts.actionUrl)}" method="POST"` : ""}>
-    ${buildConversationRelayElement(opts)}
-  </Connect>
-</Response>`;
 }
 
 /**

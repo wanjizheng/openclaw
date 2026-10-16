@@ -1115,7 +1115,15 @@ export async function runGatewayLoop(params: {
         peekGatewayRestartReason,
         scheduleGatewayRestart,
       } = eagerLifecycleRuntime;
-      const restartIntent = consumeGatewayRestartIntentPayloadSync();
+      let restartIntent: ReturnType<typeof consumeGatewayRestartIntentPayloadSync> = null;
+      let intentReadFailed = false;
+      let intentReadError: unknown;
+      try {
+        restartIntent = consumeGatewayRestartIntentPayloadSync();
+      } catch (err) {
+        intentReadFailed = true;
+        intentReadError = err;
+      }
       if (restartIntent) {
         abortPendingChannelReloads();
         const authorized = consumeGatewayRestartAuthorization();
@@ -1136,6 +1144,16 @@ export async function runGatewayLoop(params: {
         return;
       }
       const authorized = consumeGatewayRestartAuthorization();
+      if (intentReadFailed) {
+        // A fenced state database cannot supply the durable intent; an
+        // authorized local restart must still proceed so ownership recovers.
+        if (!authorized) {
+          throw intentReadError;
+        }
+        gatewayLog.warn(
+          `Restart intent could not be read; continuing the authorized local restart: ${formatErrorMessage(intentReadError)}`,
+        );
+      }
       if (!authorized) {
         markGatewayRestartHandled();
         if (!isGatewayRestartExternallyAllowed()) {

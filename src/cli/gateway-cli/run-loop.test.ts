@@ -2014,6 +2014,7 @@ describe("runGatewayLoop", () => {
   });
 
   it("catches SIGUSR2 handler errors even when token cleanup throws (#83131)", async () => {
+    consumeGatewayRestartAuthorization.mockReturnValueOnce(false);
     consumeGatewayRestartIntentPayloadSync.mockImplementationOnce(() => {
       throw new Error("lifecycle module corrupted");
     });
@@ -2037,6 +2038,33 @@ describe("runGatewayLoop", () => {
       expect(rollbackGatewayRestartSignalAdmission).toHaveBeenCalledOnce();
       expect(close).not.toHaveBeenCalled();
       expect(start).toHaveBeenCalledTimes(1);
+
+      sigterm();
+      await expect(exited).resolves.toBe(0);
+    });
+  });
+
+  it("continues an authorized SIGUSR2 restart when the restart intent cannot be read", async () => {
+    consumeGatewayRestartIntentPayloadSync.mockImplementationOnce(() => {
+      throw new Error("owner lock was removed or replaced; restart the Gateway");
+    });
+
+    await withIsolatedSignals(async ({ captureSignal }) => {
+      const { close, start, exited } = await createSignaledLoopHarness();
+      const restartSignal = captureSignal("SIGUSR2");
+      const sigterm = captureSignal("SIGTERM");
+
+      restartSignal();
+      await waitForLoopCondition(
+        () => start.mock.calls.length === 2,
+        "authorized SIGUSR2 did not restart after intent read failure",
+      );
+
+      expect(gatewayLog.warn).toHaveBeenCalledWith(
+        "Restart intent could not be read; continuing the authorized local restart: owner lock was removed or replaced; restart the Gateway",
+      );
+      expect(gatewayLog.error).not.toHaveBeenCalled();
+      expect(close).toHaveBeenCalledWith(expect.objectContaining({ reason: "gateway restarting" }));
 
       sigterm();
       await expect(exited).resolves.toBe(0);

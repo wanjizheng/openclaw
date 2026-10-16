@@ -2,11 +2,10 @@ import crypto from "node:crypto";
 import type { IncomingMessage } from "node:http";
 import { expectDefined } from "openclaw/plugin-sdk/expect-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
-import { createTestPluginServiceScheduler } from "openclaw/plugin-sdk/plugin-test-api";
 import type { RealtimeTranscriptionProviderPlugin } from "openclaw/plugin-sdk/realtime-transcription";
 import * as webhookRequestGuards from "openclaw/plugin-sdk/webhook-request-guards";
-import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { VoiceCallConfigSchema, resolveVoiceCallConfig, type VoiceCallConfig } from "./config.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { VoiceCallConfig } from "./config.js";
 import type { CallManager } from "./manager.js";
 import type { MediaStreamConfig } from "./media-stream.js";
 import type { VoiceCallProvider } from "./providers/base.js";
@@ -16,6 +15,14 @@ import { TwilioProvider } from "./providers/twilio.js";
 import type { CallRecord } from "./types.js";
 import { createWebhookReplayCache, reserveWebhookReplay } from "./webhook-replay.js";
 import { VoiceCallWebhookServer } from "./webhook.js";
+import {
+  automaticReplyManagerStub,
+  createCall,
+  createConfig,
+  createManager,
+  createServer,
+  type WebhookServerArgs,
+} from "./webhook.test-helpers.js";
 import type { RealtimeCallHandler } from "./webhook/realtime-handler.js";
 
 const mocks = vi.hoisted(() => {
@@ -92,66 +99,6 @@ type TwilioProviderTestDouble = VoiceCallProvider &
     | "hasRegisteredStream"
     | "clearTtsQueue"
   >;
-
-type VoiceCallConfigInput = Parameters<typeof resolveVoiceCallConfig>[0];
-
-const createConfig = (overrides: VoiceCallConfigInput = {}): VoiceCallConfig => {
-  const config = VoiceCallConfigSchema.parse({
-    ...overrides,
-    serve: { ...overrides.serve, port: overrides.serve?.port || 1 },
-  });
-  config.serve.port = overrides.serve?.port ?? 0;
-  return config;
-};
-
-const createCall = (startedAt: number): CallRecord => ({
-  callId: "call-1",
-  agentId: "main",
-  providerCallId: "provider-call-1",
-  provider: "mock",
-  direction: "outbound",
-  state: "initiated",
-  from: "+15550001234",
-  to: "+15550005678",
-  startedAt,
-  transcript: [],
-  processedEventIds: [],
-});
-
-const automaticReplyManagerStub = {
-  updateCallMetadata: async (
-    call: CallRecord,
-    update: (metadata: CallRecord["metadata"]) => CallRecord["metadata"],
-  ) => {
-    call.metadata = update(call.metadata);
-  },
-  createAutoResponseGuard: () => ({ isCurrent: () => true, release: () => {} }),
-  invalidateAutoResponse: () => {},
-};
-
-const createManager = (calls: CallRecord[]) => {
-  const endCall = vi.fn(async () => ({ success: true }));
-  const processEvent = vi.fn<CallManager["processEvent"]>(async () => ({ kind: "processed" }));
-  const manager = {
-    ...automaticReplyManagerStub,
-    getActiveCalls: () => calls,
-    endCall,
-    processEvent,
-  } as unknown as CallManager;
-
-  return { manager, endCall, processEvent };
-};
-
-type WebhookServerArgs =
-  ConstructorParameters<typeof VoiceCallWebhookServer> extends [unknown, ...infer Args]
-    ? Args
-    : never;
-
-function createServer(...args: WebhookServerArgs) {
-  const server = new VoiceCallWebhookServer(createTestPluginServiceScheduler(), ...args);
-  onTestFinished(() => server.stop());
-  return server;
-}
 
 function createCapturingLogger() {
   const messages: string[] = [];

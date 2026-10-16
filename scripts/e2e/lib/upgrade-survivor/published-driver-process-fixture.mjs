@@ -81,7 +81,17 @@ if (role === "npm") {
   assert.equal(config.agents.ownership, "explicit");
   assert.equal(Object.hasOwn(config.agents, "list"), false);
   assert.deepEqual(Object.keys(config.agents.entries), ["main", "second"]);
+  const orphanSidecar = path.join(
+    process.env.OPENCLAW_STATE_DIR,
+    "credentials/auth-profiles",
+    `${"e".repeat(32)}.json`,
+  );
   if (args[0] === "doctor") {
+    assert.equal(
+      fs.existsSync(orphanSidecar),
+      false,
+      "Baseline Doctor cannot admit retired sidecars",
+    );
     trace("doctor");
   } else if (args[0] === "gateway" && args[1] === "install") {
     const unit = path.join(process.env.HOME, ".config/systemd/user/openclaw-gateway.service");
@@ -127,6 +137,7 @@ if (role === "npm") {
       },
     });
   } else if (args[0] === "update") {
+    assert.equal(fs.existsSync(orphanSidecar), true, "Update must exercise the retained sidecar");
     if (mode === "interrupt" || mode === "timeout") {
       const child = spawn(process.execPath, ["/proof/fixture.mjs", "child"], {
         env: process.env,

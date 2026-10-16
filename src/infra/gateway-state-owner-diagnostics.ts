@@ -7,11 +7,11 @@ export type DiagnosticOwner = {
   accepting: boolean;
   heartbeat?: { diagnostic(): unknown };
   lost: { signal: AbortSignal };
-  failureDiagnostic?: Error;
+  failureDiagnostic?: ReturnType<typeof createGatewayStateOwnerDiagnostic>;
 };
 
 /** Freeze evidence before retirement changes accepting or stops the heartbeat. */
-export function capture(owner: DiagnosticOwner, reason: unknown): Error {
+export function capture(owner: DiagnosticOwner, reason: unknown) {
   return (owner.failureDiagnostic ??= createGatewayStateOwnerDiagnostic(
     { kind: owner.kind, accepting: owner.accepting, heartbeat: owner.heartbeat?.diagnostic() },
     reason,
@@ -21,7 +21,7 @@ export function capture(owner: DiagnosticOwner, reason: unknown): Error {
 export function unavailable(databasePath: string, owner: DiagnosticOwner): Error {
   const cause = capture(owner, owner.lost.signal.reason);
   return new Error(
-    `OpenClaw state ownership at ${databasePath} could not be verified; retry after maintenance finishes. ${cause.message}`,
+    `OpenClaw state ownership at ${databasePath} could not be verified; retry after maintenance finishes. ${cause.originalReason?.message ?? "Restart the Gateway."}`,
     { cause },
   );
 }
@@ -52,7 +52,7 @@ export function observeGatewayStateOwnerLocks(locks: Record<string, string>) {
     });
 }
 
-export function createGatewayStateOwnerDiagnostic(
+function createGatewayStateOwnerDiagnostic(
   facts: { kind: string; accepting: boolean; heartbeat?: unknown },
   reason: unknown,
 ) {
@@ -81,5 +81,5 @@ export function createGatewayStateOwnerDiagnostic(
     },
   );
   diagnostic.name = "GatewayStateOwnerDiagnosticError";
-  return Object.assign(diagnostic, { code: "GATEWAY_STATE_OWNER_UNVERIFIED" });
+  return Object.assign(diagnostic, { code: "GATEWAY_STATE_OWNER_UNVERIFIED", originalReason });
 }
